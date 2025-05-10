@@ -4,18 +4,10 @@ import builtins
 from io import open as io_open
 import os
 import sys
-import importlib.util
 import numpy as np
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext as _build_ext
 
-# Check if PyTorch is installed
-if importlib.util.find_spec("torch") is None:
-    print("\033[91mError: PyTorch is required but not installed.\033[0m")
-    print("\033[93mPlease install PyTorch first using instructions from:")
-    print("https://pytorch.org/get-started/locally/\033[0m")
-    print("\033[93mAfter installing PyTorch, you can install this package again.\033[0m")
-    sys.exit(1)
 
 # Define macros for cython
 macros = []
