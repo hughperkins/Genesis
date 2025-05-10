@@ -110,7 +110,6 @@ def init(
     global ti_float
     global np_float
     global tc_float
-    print("torch", torch)
     if precision == "32":
         ti_float = ti.f32
         np_float = np.float32
