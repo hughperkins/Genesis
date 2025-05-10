@@ -1,4 +1,3 @@
-# import taichi while suppressing its output
 import os
 import sys
 import site
@@ -8,6 +7,21 @@ import logging as _logging
 import traceback
 from platform import system
 from unittest.mock import patch
+
+try:
+    import torch
+except ImportError:
+    print("")
+    print("Torch is not installed. Please install torch then try again.")
+    print("Note that torch is intentionally left out of the requirements.txt, because")
+    print("there are so many different ways to install torch, which are very system dependent.")
+    print("Please refer to https://pytorch.org/get-started/locally/ for installation instructions.")
+    print("")
+    sys.exit(-1)
+
+
+# import taichi while suppressing its output
+
 
 _ti_outputs = []
 
@@ -19,14 +33,6 @@ def fake_print(*args, **kwargs):
 
 with patch("builtins.print", fake_print):
     import taichi as ti
-
-try:
-    import torch
-except ImportError as e:
-    raise ImportError(
-        "'torch' module not available. Please install pytorch manually: https://pytorch.org/get-started/locally/"
-    ) from e
-import numpy as np
 
 from .constants import GS_ARCH, TI_ARCH
 from .constants import backend as gs_backend
@@ -104,6 +110,7 @@ def init(
     global ti_float
     global np_float
     global tc_float
+    print("torch", torch)
     if precision == "32":
         ti_float = ti.f32
         np_float = np.float32
