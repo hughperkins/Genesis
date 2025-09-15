@@ -225,6 +225,10 @@ class SAPCoupler(RBC):
             if self._enable_fem_self_tet_contact:
                 self.fem_self_tet_contact = FEMSelfTetContactHandler(self.sim)
                 self.contact_handlers.append(self.fem_self_tet_contact)
+            # print("self.contact_handlers", self.contact_handlers)
+            self.contact_handlers = [self.contact_handlers[1]]
+            for ch in self.contact_handlers:
+                print("ch", type(ch))
 
             self._init_fem_fields()
 
@@ -438,10 +442,8 @@ class SAPCoupler(RBC):
     def update_contact(self, i_step: ti.i32) -> tuple[bool, bool]:
         has_contact = False
         overflow = False
-        for contact in ti.static(self.contact_handlers):
-            overflow |= contact.detection(i_step)
-            has_contact |= contact.n_contact_pairs[None] > 0
-            contact.compute_jacobian()
+        # self.contact_handlers[0].detection(i_step)
+        FEMSelfTetContactHandler.detection(self.contact_handlers[0], i_step)
         return has_contact, overflow
 
     def couple(self, i_step):
@@ -2433,143 +2435,18 @@ class FEMSelfTetContactHandler(FEMContactHandler):
 
     @ti.func
     def compute_pairs(self, i_step: ti.i32):
-        """
-        Computes the FEM self contact pairs and their properties.
-        Intersection code reference:
-        https://github.com/RobotLocomotion/drake/blob/8c3a249184ed09f0faab3c678536d66d732809ce/geometry/proximity/field_intersection.cc#L87
-        """
-        overflow = False
-        sap_info = ti.static(self.contact_pairs.sap_info)
-        normal_signs = ti.Vector([1.0, -1.0, 1.0, -1.0], dt=gs.ti_float)  # make normal point outward
-        self.n_contact_pairs[None] = 0
-        result_count = ti.min(self.n_contact_candidates[None], self.max_contact_candidates)
-        for i_c in range(result_count):
-            i_b = self.contact_candidates[i_c].batch_idx
-            i_e0 = self.contact_candidates[i_c].geom_idx0
-            i_e1 = self.contact_candidates[i_c].geom_idx1
-            intersection_code0 = self.contact_candidates[i_c].intersection_code0
-            distance0 = self.contact_candidates[i_c].distance0
-            intersected_edges0 = self.coupler.MarchingTetsEdgeTable[intersection_code0]
-
-            tet_vertices0 = ti.Matrix.zero(gs.ti_float, 3, 4)  # 4 vertices of tet 0
-            tet_pressures0 = ti.Vector.zero(gs.ti_float, 4)  # pressures at the vertices of tet 0
-            tet_vertices1 = ti.Matrix.zero(gs.ti_float, 3, 4)  # 4 vertices of tet 1
-            for i in ti.static(range(4)):
-                i_v = self.fem_solver.elements_i[i_e0].el2v[i]
-                tet_vertices0[:, i] = self.fem_solver.elements_v[i_step, i_v, i_b].pos
-                tet_pressures0[i] = self.coupler.fem_pressure[i_v]
-            for i in ti.static(range(4)):
-                i_v = self.fem_solver.elements_i[i_e1].el2v[i]
-                tet_vertices1[:, i] = self.fem_solver.elements_v[i_step, i_v, i_b].pos
-
-            polygon_vertices = ti.Matrix.zero(gs.ti_float, 3, 8)  # maximum 8 vertices
-            polygon_n_vertices = gs.ti_int(0)
-            clipped_vertices = ti.Matrix.zero(gs.ti_float, 3, 8)  # maximum 8 vertices
-            clipped_n_vertices = gs.ti_int(0)
-            for i in range(4):
+        for _ in range(1):
+            intersected_edges0 = self.coupler.MarchingTetsEdgeTable[0]
+            for i in range(1):
                 if intersected_edges0[i] >= 0:
-                    edge = self.coupler.TetEdges[intersected_edges0[i]]
-                    pos_v0 = tet_vertices0[:, edge[0]]
-                    pos_v1 = tet_vertices0[:, edge[1]]
-                    d_v0 = distance0[edge[0]]
-                    d_v1 = distance0[edge[1]]
-                    t = d_v0 / (d_v0 - d_v1)
-                    polygon_vertices[:, polygon_n_vertices] = pos_v0 + t * (pos_v1 - pos_v0)
-                    polygon_n_vertices += 1
-            # Intersects the polygon with the four halfspaces of the four triangles
-            # of the tetrahedral element1.
-            for face in range(4):
-                clipped_n_vertices = 0
-                x = tet_vertices1[:, (face + 1) % 4]
-                normal = (tet_vertices1[:, (face + 2) % 4] - x).cross(
-                    tet_vertices1[:, (face + 3) % 4] - x
-                ) * normal_signs[face]
-                normal /= normal.norm()
-
-                distances = ti.Vector.zero(gs.ti_float, 8)
-                for i in range(polygon_n_vertices):
-                    distances[i] = (polygon_vertices[:, i] - x).dot(normal)
-
-                for i in range(polygon_n_vertices):
-                    j = (i + 1) % polygon_n_vertices
-                    if distances[i] <= 0.0:
-                        clipped_vertices[:, clipped_n_vertices] = polygon_vertices[:, i]
-                        clipped_n_vertices += 1
-                        if distances[j] > 0.0:
-                            wa = distances[j] / (distances[j] - distances[i])
-                            wb = 1.0 - wa
-                            clipped_vertices[:, clipped_n_vertices] = (
-                                wa * polygon_vertices[:, i] + wb * polygon_vertices[:, j]
-                            )
-                            clipped_n_vertices += 1
-                    elif distances[j] <= 0.0:
-                        wa = distances[j] / (distances[j] - distances[i])
-                        wb = 1.0 - wa
-                        clipped_vertices[:, clipped_n_vertices] = (
-                            wa * polygon_vertices[:, i] + wb * polygon_vertices[:, j]
-                        )
-                        clipped_n_vertices += 1
-                polygon_n_vertices = clipped_n_vertices
-                polygon_vertices = clipped_vertices
-
-                if polygon_n_vertices < 3:
-                    # If the polygon has less than 3 vertices, it is not a valid contact
-                    break
-
-            if polygon_n_vertices < 3:
-                continue
-
-            # compute centroid and area of the polygon
-            total_area = 0.0
-            total_area_weighted_centroid = ti.Vector.zero(gs.ti_float, 3)
-            for i in range(2, polygon_n_vertices):
-                accumulate_area_centroid(polygon_vertices, i, total_area, total_area_weighted_centroid)
-
-            if total_area < self.eps:
-                continue
-            centroid = total_area_weighted_centroid / total_area
-            barycentric0 = tet_barycentric(centroid, tet_vertices0)
-            barycentric1 = tet_barycentric(centroid, tet_vertices1)
-            tangent0 = polygon_vertices[:, 0] - centroid
-            tangent0 /= tangent0.norm()
-            tangent1 = self.contact_candidates[i_c].normal.cross(tangent0)
-
-            pressure = barycentric0.dot(tet_pressures0)
-            g0 = self.coupler.fem_pressure_gradient[i_b, i_e0].dot(self.contact_candidates[i_c].normal)
-            g1 = -self.coupler.fem_pressure_gradient[i_b, i_e1].dot(self.contact_candidates[i_c].normal)
-            # FIXME This is an approximated value, different from Drake, which actually calculates the distance
-            deformable_phi0 = -pressure / g0 - pressure / g1
-
-            if deformable_phi0 > gs.EPS:
-                continue
-
-            i_p = ti.atomic_add(self.n_contact_pairs[None], 1)
-            if i_p < self.max_contact_pairs:
-                self.contact_pairs[i_p].batch_idx = i_b
-                self.contact_pairs[i_p].normal = self.contact_candidates[i_c].normal
-                self.contact_pairs[i_p].tangent0 = tangent0
-                self.contact_pairs[i_p].tangent1 = tangent1
-                self.contact_pairs[i_p].geom_idx0 = i_e0
-                self.contact_pairs[i_p].geom_idx1 = i_e1
-                self.contact_pairs[i_p].barycentric0 = barycentric0
-                self.contact_pairs[i_p].barycentric1 = barycentric1
-
-                deformable_g = self.coupler._hydroelastic_stiffness
-                deformable_k = total_area * deformable_g
-                sap_info[i_p].k = deformable_k
-                sap_info[i_p].phi0 = deformable_phi0
-                sap_info[i_p].mu = ti.sqrt(
-                    self.fem_solver.elements_i[i_e0].friction_mu * self.fem_solver.elements_i[i_e1].friction_mu
-                )
-            else:
-                overflow = True
-        return overflow
+                    ...
+        return False
 
     @ti.func
     def detection(self, f: ti.i32):
         overflow = False
         overflow |= self.coupler.fem_surface_tet_bvh.query(self.coupler.fem_surface_tet_aabb.aabbs)
-        overflow |= self.compute_candidates(f)
+        # overflow |= self.compute_candidates(f)
         overflow |= self.compute_pairs(f)
         return overflow
 
