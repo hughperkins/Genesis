@@ -440,11 +440,19 @@ class SAPCoupler(RBC):
 
     @ti.kernel
     def update_contact(self, i_step: ti.i32) -> tuple[bool, bool]:
-        has_contact = False
-        overflow = False
-        # self.contact_handlers[0].detection(i_step)
-        FEMSelfTetContactHandler.detection(self.contact_handlers[0], i_step)
-        return has_contact, overflow
+        for _ in ti.ndrange(1):
+            query_stack = ti.Vector.zero(ti.i32, 1)
+            for stack_depth in range(1):
+                node_idx = query_stack[stack_depth]
+                node = self.contact_handlers[0].coupler.fem_surface_tet_bvh.nodes[0, node_idx]
+                if self.contact_handlers[0].coupler.fem_surface_tet_aabb.aabbs[0, 0].intersects(node.bound):
+                    ...
+        for _ in range(1):
+            intersected_edges0 = self.contact_handlers[0].coupler.MarchingTetsEdgeTable[0]
+            for i in range(1):
+                if intersected_edges0[i] >= 0:
+                    ...
+        return False, False
 
     def couple(self, i_step):
         if self.has_contact:
@@ -2444,11 +2452,19 @@ class FEMSelfTetContactHandler(FEMContactHandler):
 
     @ti.func
     def detection(self, f: ti.i32):
-        overflow = False
-        overflow |= self.coupler.fem_surface_tet_bvh.query(self.coupler.fem_surface_tet_aabb.aabbs)
-        # overflow |= self.compute_candidates(f)
-        overflow |= self.compute_pairs(f)
-        return overflow
+        for _ in ti.ndrange(1):
+            query_stack = ti.Vector.zero(ti.i32, 1)
+            for stack_depth in range(1):
+                node_idx = query_stack[stack_depth]
+                node = self.coupler.fem_surface_tet_bvh.nodes[0, node_idx]
+                if self.coupler.fem_surface_tet_aabb.aabbs[0, 0].intersects(node.bound):
+                    ...
+        for _ in range(1):
+            intersected_edges0 = self.coupler.MarchingTetsEdgeTable[0]
+            for i in range(1):
+                if intersected_edges0[i] >= 0:
+                    ...
+        return False
 
     @ti.func
     def compute_Jx(self, i_p, x):
