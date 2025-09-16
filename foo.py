@@ -2,7 +2,7 @@ import numpy as np
 
 import genesis as gs
 
-gs.init(backend=gs.metal, precision="32")
+gs.init(backend=gs.metal, precision="32", debug=True)
 
 scene = gs.Scene(
     fem_options=gs.options.FEMOptions(

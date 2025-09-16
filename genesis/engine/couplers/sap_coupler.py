@@ -440,6 +440,7 @@ class SAPCoupler(RBC):
 
     @ti.kernel
     def update_contact(self, i_step: ti.i32) -> tuple[bool, bool]:
+        # print("update contact")
         for _ in ti.ndrange(1):
             query_stack = ti.Vector.zero(ti.i32, 1)
             for stack_depth in range(1):
