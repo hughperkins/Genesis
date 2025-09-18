@@ -436,7 +436,7 @@ class SAPCoupler(RBC):
 
     @ti.kernel
     def update_contact(self, i_step: ti.i32) -> tuple[ti.i32, ti.i32]:
-        self.contact_handlers[0].detection(0)
+        self.contact_handlers[0].n_contact_pairs[None] = 1
         has_contact = self.contact_handlers[0].n_contact_pairs[None] > 0
         overflow = False
         for i_b in ti.ndrange(1):
@@ -2177,31 +2177,6 @@ class FEMFloorTetContactHandler(FEMContactHandler):
     @ti.func
     def detection(self, f: ti.i32):
         overflow = False
-        # Compute contact pairs
-        self.n_contact_candidates[None] = 0
-        # TODO Check surface element only instead of all elements
-        for i_b, i_e in ti.ndrange(self.fem_solver._B, self.fem_solver.n_elements):
-            intersection_code = ti.int32(0)
-            distance = ti.Vector.zero(gs.ti_float, 4)
-            for i in ti.static(range(4)):
-                i_v = self.fem_solver.elements_i[i_e].el2v[i]
-                pos_v = self.fem_solver.elements_v[f, i_v, i_b].pos
-                distance[i] = pos_v.z - self.fem_solver.floor_height
-                if distance[i] > 0.0:
-                    intersection_code |= 1 << i
-
-            # check if the element intersect with the floor
-            if intersection_code != 0 and intersection_code != 15:
-                i_c = ti.atomic_add(self.n_contact_candidates[None], 1)
-                if i_c < self.max_contact_candidates:
-                    self.contact_candidates[i_c].batch_idx = i_b
-                    self.contact_candidates[i_c].geom_idx = i_e
-                    self.contact_candidates[i_c].intersection_code = intersection_code
-                    self.contact_candidates[i_c].distance = distance
-                else:
-                    overflow = True
-
-        sap_info = ti.static(self.contact_pairs.sap_info)
         self.n_contact_pairs[None] = 1
 
         return overflow
