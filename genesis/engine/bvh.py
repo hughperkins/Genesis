@@ -447,33 +447,19 @@ class LBVH(RBC):
 
     @ti.func
     def query(self, aabbs: ti.template()):
-        """
-        Query the BVH for intersections with the given AABBs.
-
-        The results are stored in the query_result field.
-        """
         self.query_result_count[None] = 0
         overflow = False
-
-        n_querys = aabbs.shape[1]
-        for i_b, i_q in ti.ndrange(self.n_batches, n_querys):
-            query_stack = ti.Vector.zero(ti.i32, 64)
+        for i_b, i_q in ti.ndrange(self.n_batches, 1):
             stack_depth = 1
-
             while stack_depth > 0:
                 stack_depth -= 1
-                node_idx = query_stack[stack_depth]
-                node = self.nodes[i_b, node_idx]
+                node = self.nodes[i_b, 0]
                 if aabbs[i_b, i_q].intersects(node.bound):
-                    if node.left == -1 and node.right == -1:
-                        i_a = ti.i32(self.morton_codes[i_b, node_idx - (self.n_aabbs - 1)][1])
-                        if self.filter(i_a, i_q):
-                            continue
-                        idx = ti.atomic_add(self.query_result_count[None], 1)
-                        if idx >= self.max_query_results:
-                            overflow = True
+                    idx = ti.atomic_add(self.query_result_count[None], 1)
+                    if idx >= self.max_query_results:
+                        overflow = True
 
-        return overflow
+        return False
 
 
 @ti.data_oriented
