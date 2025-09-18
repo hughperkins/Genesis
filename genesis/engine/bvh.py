@@ -446,18 +446,12 @@ class LBVH(RBC):
         return is_done
 
     @ti.func
-    def query(self, aabbs: ti.template()):
-        self.query_result_count[None] = 0
+    # def query(self, aabbs: ti.template()):
+    def query(self):
         overflow = False
-        for i_b, i_q in ti.ndrange(self.n_batches, 1):
-            stack_depth = 1
-            while stack_depth > 0:
-                stack_depth -= 1
-                node = self.nodes[i_b, 0]
-                if aabbs[i_b, i_q].intersects(node.bound):
-                    idx = ti.atomic_add(self.query_result_count[None], 1)
-                    if idx >= self.max_query_results:
-                        overflow = True
+        for i_b in ti.ndrange(self.n_batches):
+            if self.query_result_count[None] >= self.max_query_results:
+                overflow = True
 
         return False
 
