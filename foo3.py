@@ -21,6 +21,7 @@ scene.add_entity(
 )
 
 scene.build()
+print(type(scene.sim.coupler.contact_handlers[0]))
 print(type(scene.sim.coupler.contact_handlers[1]))
 has_contact, _overflow = scene.sim._coupler.update_contact(0)
 print("has_contact:", has_contact, "- num contacts:", scene.sim._coupler.contact_handlers[0].n_contact_pairs.to_numpy())

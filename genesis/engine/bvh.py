@@ -446,14 +446,11 @@ class LBVH(RBC):
         return is_done
 
     @ti.func
-    # def query(self, aabbs: ti.template()):
     def query(self):
         overflow = False
-        for i_b in ti.ndrange(self.n_batches):
+        for i_b in ti.ndrange(1):
             if self.query_result_count[None] >= self.max_query_results:
                 overflow = True
-
-        return False
 
 
 @ti.data_oriented

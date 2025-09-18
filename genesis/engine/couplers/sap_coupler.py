@@ -438,7 +438,12 @@ class SAPCoupler(RBC):
     def update_contact(self, i_step: ti.i32) -> tuple[ti.i32, ti.i32]:
         self.contact_handlers[0].detection(0)
         has_contact = self.contact_handlers[0].n_contact_pairs[None] > 0
-        self.contact_handlers[1].coupler.fem_surface_tet_bvh.query()
+        overflow = False
+        for i_b in ti.ndrange(1):
+            if (
+                self.contact_handlers[1].coupler.fem_surface_tet_bvh.query_result_count[None] >=
+                self.contact_handlers[1].coupler.fem_surface_tet_bvh.max_query_results):
+                overflow = True
         return has_contact, False
 
     def couple(self, i_step):
