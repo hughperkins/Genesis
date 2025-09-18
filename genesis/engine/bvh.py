@@ -464,27 +464,14 @@ class LBVH(RBC):
                 stack_depth -= 1
                 node_idx = query_stack[stack_depth]
                 node = self.nodes[i_b, node_idx]
-                # Check if the AABB intersects with the node's bounding box
                 if aabbs[i_b, i_q].intersects(node.bound):
-                    # If it's a leaf node, add the AABB index to the query results
                     if node.left == -1 and node.right == -1:
                         i_a = ti.i32(self.morton_codes[i_b, node_idx - (self.n_aabbs - 1)][1])
-                        # Check if the filter condition is met
                         if self.filter(i_a, i_q):
                             continue
                         idx = ti.atomic_add(self.query_result_count[None], 1)
-                        if idx < self.max_query_results:
-                            self.query_result[idx] = gs.ti_ivec3(i_b, i_a, i_q)  # Store the AABB index
-                        else:
+                        if idx >= self.max_query_results:
                             overflow = True
-                    else:
-                        # Push children onto the stack
-                        if node.right != -1:
-                            query_stack[stack_depth] = node.right
-                            stack_depth += 1
-                        if node.left != -1:
-                            query_stack[stack_depth] = node.left
-                            stack_depth += 1
 
         return overflow
 

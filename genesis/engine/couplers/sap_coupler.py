@@ -434,15 +434,22 @@ class SAPCoupler(RBC):
         if ti.static(self.rigid_solver.is_active()):
             func_update_all_verts(self.rigid_solver)
 
+    # @ti.kernel
+    # def update_contact(self, i_step: ti.i32) -> tuple[bool, bool]:
+    #     has_contact = False
+    #     overflow = False
+    #     for contact in ti.static(self.contact_handlers):
+    #         overflow |= contact.detection(i_step)
+    #         has_contact |= contact.n_contact_pairs[None] > 0
+    #         contact.compute_jacobian()
+    #     return has_contact, overflow
+
     @ti.kernel
-    def update_contact(self, i_step: ti.i32) -> tuple[bool, bool]:
-        has_contact = False
-        overflow = False
-        for contact in ti.static(self.contact_handlers):
-            overflow |= contact.detection(i_step)
-            has_contact |= contact.n_contact_pairs[None] > 0
-            contact.compute_jacobian()
-        return has_contact, overflow
+    def update_contact(self, i_step: ti.i32) -> tuple[ti.i32, ti.i32]:
+        self.contact_handlers[0].detection(0)
+        has_contact = self.contact_handlers[0].n_contact_pairs[None] > 0
+        self.contact_handlers[1].coupler.fem_surface_tet_bvh.query(self.contact_handlers[1].coupler.fem_surface_tet_aabb.aabbs)
+        return has_contact, False
 
     def couple(self, i_step):
         if self.has_contact:
@@ -2569,8 +2576,8 @@ class FEMSelfTetContactHandler(FEMContactHandler):
     def detection(self, f: ti.i32):
         overflow = False
         overflow |= self.coupler.fem_surface_tet_bvh.query(self.coupler.fem_surface_tet_aabb.aabbs)
-        overflow |= self.compute_candidates(f)
-        overflow |= self.compute_pairs(f)
+        # overflow |= self.compute_candidates(f)
+        # overflow |= self.compute_pairs(f)
         return overflow
 
     @ti.func
