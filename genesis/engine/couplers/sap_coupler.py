@@ -2202,64 +2202,7 @@ class FEMFloorTetContactHandler(FEMContactHandler):
                     overflow = True
 
         sap_info = ti.static(self.contact_pairs.sap_info)
-        self.n_contact_pairs[None] = 0
-        # Compute pair from candidates
-        result_count = ti.min(self.n_contact_candidates[None], self.max_contact_candidates)
-        for i_c in range(result_count):
-            candidate = self.contact_candidates[i_c]
-            i_b = candidate.batch_idx
-            i_e = candidate.geom_idx
-            intersection_code = candidate.intersection_code
-            intersected_edges = self.coupler.MarchingTetsEdgeTable[intersection_code]
-
-            tet_vertices = ti.Matrix.zero(gs.ti_float, 3, 4)  # 4 vertices
-            tet_pressures = ti.Vector.zero(gs.ti_float, 4)  # pressures at the vertices
-            for i in ti.static(range(4)):
-                i_v = self.fem_solver.elements_i[i_e].el2v[i]
-                tet_vertices[:, i] = self.fem_solver.elements_v[f, i_v, i_b].pos
-                tet_pressures[i] = self.coupler.fem_pressure[i_v]
-
-            polygon_vertices = ti.Matrix.zero(gs.ti_float, 3, 4)  # 3 or 4 vertices
-            total_area = gs.EPS  # avoid division by zero
-            total_area_weighted_centroid = ti.Vector.zero(gs.ti_float, 3)
-            for i in ti.static(range(4)):
-                if intersected_edges[i] >= 0:
-                    edge = self.coupler.TetEdges[intersected_edges[i]]
-                    pos_v0 = tet_vertices[:, edge[0]]
-                    pos_v1 = tet_vertices[:, edge[1]]
-                    d_v0 = candidate.distance[edge[0]]
-                    d_v1 = candidate.distance[edge[1]]
-                    t = d_v0 / (d_v0 - d_v1)
-                    polygon_vertices[:, i] = pos_v0 + t * (pos_v1 - pos_v0)
-
-                    # Compute triangle area and centroid
-                    if ti.static(i >= 2):
-                        accumulate_area_centroid(polygon_vertices, i, total_area, total_area_weighted_centroid)
-
-            centroid = total_area_weighted_centroid / total_area
-
-            # Compute barycentric coordinates
-            barycentric = tet_barycentric(centroid, tet_vertices)
-            pressure = barycentric.dot(tet_pressures)
-
-            deformable_g = self.coupler._hydroelastic_stiffness
-            rigid_g = self.coupler.fem_pressure_gradient[i_b, i_e].z
-            # TODO A better way to handle corner cases where pressure and pressure gradient are ill defined
-            if total_area < self.eps or rigid_g < self.eps:
-                continue
-            g = 1.0 / (1.0 / deformable_g + 1.0 / rigid_g)  # harmonic average
-            rigid_k = total_area * g
-            rigid_phi0 = -pressure / g
-            i_p = ti.atomic_add(self.n_contact_pairs[None], 1)
-            if i_p < self.max_contact_pairs:
-                self.contact_pairs[i_p].batch_idx = i_b
-                self.contact_pairs[i_p].geom_idx = i_e
-                self.contact_pairs[i_p].barycentric = barycentric
-                sap_info[i_p].k = rigid_k
-                sap_info[i_p].phi0 = rigid_phi0
-                sap_info[i_p].mu = self.fem_solver.elements_i[i_e].friction_mu
-            else:
-                overflow = True
+        self.n_contact_pairs[None] = 1
 
         return overflow
 
