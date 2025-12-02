@@ -2588,25 +2588,26 @@ def func_box_normal_from_collision_normal(
     Among the 6 faces of the box, find the one of which normal is closest to the [dir].
     """
     # Every box face normal
-    normals = ti.Vector(
-        [1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0],
-        dt=gs.ti_float,
-    )
+    # normals = ti.Vector(
+    #     [1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0],
+    #     dt=gs.ti_float,
+    # )
 
     # Get local collision normal
-    g_quat = geoms_state.quat[i_g, i_b]
-    local_dir = gu.ti_transform_by_quat(dir, gu.ti_inv_quat(g_quat))
-    local_dir = local_dir.normalized()
+    # g_quat = geoms_state.quat[i_g, i_b]
+    # local_dir = gu.ti_transform_by_quat(dir, gu.ti_inv_quat(g_quat))
+    # local_dir = local_dir.normalized()
 
     # Determine the closest face normal
     flag = RETURN_CODE.FAIL
-    for i in range(6):
-        n = gs.ti_vec3(normals[3 * i + 0], normals[3 * i + 1], normals[3 * i + 2])
-        if local_dir.dot(n) > gjk_info.contact_face_tol[None]:
-            flag = RETURN_CODE.SUCCESS
-            gjk_state.contact_normals[i_b, 0].normal = n
-            gjk_state.contact_normals[i_b, 0].id = i
-            break
+    # for i in range(6):
+    #     # n = gs.ti_vec3(normals[3 * i + 0], normals[3 * i + 1], normals[3 * i + 2])
+    #     _w = gjk_info.contact_face_tol[None]
+        # if local_dir.dot(n) > _w:
+        #     flag = RETURN_CODE.SUCCESS
+        #     gjk_state.contact_normals[i_b, 0].normal = n
+        #     gjk_state.contact_normals[i_b, 0].id = i
+        #     break
 
     return flag
 
@@ -2700,17 +2701,19 @@ def func_find_aligned_faces(
     """
     Find if any two faces from [contact_faces] are aligned.
     """
-    res = gs.ti_ivec2(0, 0)
-    flag = RETURN_CODE.FAIL
+    # res = gs.ti_ivec2(0, 0)
+    # flag = RETURN_CODE.FAIL
 
-    for i, j in ti.ndrange(nv, nw):
-        ni = gjk_state.contact_faces[i_b, i].normal1
-        nj = gjk_state.contact_faces[i_b, j].normal2
-        if ni.dot(nj) < -gjk_info.contact_face_tol[None]:
-            res[0] = i
-            res[1] = j
-            flag = RETURN_CODE.SUCCESS
-            break
+    # for i, j in ti.ndrange(nv, nw):
+    #     ni = gjk_state.contact_faces[i_b, i].normal1
+    #     nj = gjk_state.contact_faces[i_b, j].normal2
+    #     _v = ni.dot(nj)
+        # _w = gjk_info.contact_face_tol[None]
+        # if _v < - _w:
+        #     res[0] = i
+        #     res[1] = j
+        #     flag = RETURN_CODE.SUCCESS
+        #     break
 
     return res, flag
 

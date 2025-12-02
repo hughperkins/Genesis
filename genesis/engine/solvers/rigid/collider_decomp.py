@@ -1572,90 +1572,32 @@ def func_narrow_phase_convex_vs_convex(
     support_field_info: array_class.SupportFieldInfo,
     errno: array_class.V_ANNOTATION,
 ):
-    """
-    NOTE: for a single non-batched scene with a lot of collisioin pairs, it will be faster if we also parallelize over `self.n_collision_pairs`.
-    However, parallelize over both B and collision_pairs (instead of only over B) leads to significantly slow performance for batched scene.
-    We can treat B=0 and B>0 separately, but we will end up with messier code.
-    Therefore, for a big non-batched scene, users are encouraged to simply use `gs.cpu` backend.
-    Updated NOTE & TODO: For a HUGE scene with numerous bodies, it's also reasonable to run on GPU. Let's save this for later.
-    Update2: Now we use n_broad_pairs instead of n_collision_pairs, so we probably need to think about how to handle non-batched large scene better.
-    """
-    _B = collider_state.active_buffer.shape[1]
-
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        for i_pair in range(collider_state.n_broad_pairs[i_b]):
-            i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
-            i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
-
-            if geoms_info.type[i_ga] > geoms_info.type[i_gb]:
-                i_ga, i_gb = i_gb, i_ga
-
-            if (
-                geoms_info.is_convex[i_ga]
-                and geoms_info.is_convex[i_gb]
-                and not geoms_info.type[i_gb] == gs.GEOM_TYPE.TERRAIN
-                and not (
-                    static_rigid_sim_config.box_box_detection
-                    and geoms_info.type[i_ga] == gs.GEOM_TYPE.BOX
-                    and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX
-                )
-            ):
-                if ti.static(sys.platform == "darwin"):
-                    func_convex_convex_contact(
-                        i_ga=i_ga,
-                        i_gb=i_gb,
-                        i_b=i_b,
-                        links_state=links_state,
-                        links_info=links_info,
-                        geoms_state=geoms_state,
-                        geoms_info=geoms_info,
-                        geoms_init_AABB=geoms_init_AABB,
-                        verts_info=verts_info,
-                        faces_info=faces_info,
-                        edges_info=edges_info,
-                        rigid_global_info=rigid_global_info,
-                        static_rigid_sim_config=static_rigid_sim_config,
-                        collider_state=collider_state,
-                        collider_info=collider_info,
-                        collider_static_config=collider_static_config,
-                        mpr_state=mpr_state,
-                        mpr_info=mpr_info,
-                        gjk_state=gjk_state,
-                        gjk_info=gjk_info,
-                        gjk_static_config=gjk_static_config,
-                        sdf_info=sdf_info,
-                        support_field_info=support_field_info,
-                        errno=errno,
-                    )
-                else:
-                    if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
-                        func_convex_convex_contact(
-                            i_ga=i_ga,
-                            i_gb=i_gb,
-                            i_b=i_b,
-                            links_state=links_state,
-                            links_info=links_info,
-                            geoms_state=geoms_state,
-                            geoms_info=geoms_info,
-                            geoms_init_AABB=geoms_init_AABB,
-                            verts_info=verts_info,
-                            faces_info=faces_info,
-                            edges_info=edges_info,
-                            rigid_global_info=rigid_global_info,
-                            static_rigid_sim_config=static_rigid_sim_config,
-                            collider_state=collider_state,
-                            collider_info=collider_info,
-                            collider_static_config=collider_static_config,
-                            mpr_state=mpr_state,
-                            mpr_info=mpr_info,
-                            gjk_state=gjk_state,
-                            gjk_info=gjk_info,
-                            gjk_static_config=gjk_static_config,
-                            sdf_info=sdf_info,
-                            support_field_info=support_field_info,
-                            errno=errno,
-                        )
+    func_convex_convex_contact(
+        i_ga=0,
+        i_gb=0,
+        i_b=0,
+        links_state=links_state,
+        links_info=links_info,
+        geoms_state=geoms_state,
+        geoms_info=geoms_info,
+        geoms_init_AABB=geoms_init_AABB,
+        verts_info=verts_info,
+        faces_info=faces_info,
+        edges_info=edges_info,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+        collider_state=collider_state,
+        collider_info=collider_info,
+        collider_static_config=collider_static_config,
+        mpr_state=mpr_state,
+        mpr_info=mpr_info,
+        gjk_state=gjk_state,
+        gjk_info=gjk_info,
+        gjk_static_config=gjk_static_config,
+        sdf_info=sdf_info,
+        support_field_info=support_field_info,
+        errno=errno,
+    )
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -2340,454 +2282,27 @@ def func_convex_convex_contact(
     support_field_info: array_class.SupportFieldInfo,
     errno: array_class.V_ANNOTATION,
 ):
-    if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
-        if ti.static(sys.platform == "darwin"):
-            func_plane_box_contact(
-                i_ga=i_ga,
-                i_gb=i_gb,
-                i_b=i_b,
-                geoms_state=geoms_state,
-                geoms_info=geoms_info,
-                geoms_init_AABB=geoms_init_AABB,
-                verts_info=verts_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-                collider_state=collider_state,
-                collider_info=collider_info,
-                collider_static_config=collider_static_config,
-                errno=errno,
-            )
-    else:
-        EPS = rigid_global_info.EPS[None]
-
-        # Disabling multi-contact for pairs of decomposed geoms would speed up simulation but may cause physical
-        # instabilities in the few cases where multiple contact points are actually need. Increasing the tolerance
-        # criteria to get rid of redundant contact points seems to be a better option.
-        multi_contact = (
-            static_rigid_sim_config.enable_multi_contact
-            # and not (self._solver.geoms_info[i_ga].is_decomposed and self._solver.geoms_info[i_gb].is_decomposed)
-            and geoms_info.type[i_ga] != gs.GEOM_TYPE.SPHERE
-            and geoms_info.type[i_ga] != gs.GEOM_TYPE.ELLIPSOID
-            and geoms_info.type[i_gb] != gs.GEOM_TYPE.SPHERE
-            and geoms_info.type[i_gb] != gs.GEOM_TYPE.ELLIPSOID
-        )
-
-        tolerance = func_compute_tolerance(
-            i_ga, i_gb, i_b, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
-        )
-        diff_pos_tolerance = func_compute_tolerance(
-            i_ga, i_gb, i_b, collider_info.diff_pos_tolerance[None], geoms_info, geoms_init_AABB
-        )
-        diff_normal_tolerance = collider_info.diff_normal_tolerance[None]
-
-        # Backup state before local perturbation
-        ga_pos, ga_quat = geoms_state.pos[i_ga, i_b], geoms_state.quat[i_ga, i_b]
-        gb_pos, gb_quat = geoms_state.pos[i_gb, i_b], geoms_state.quat[i_gb, i_b]
-
-        # Pre-allocate some buffers
-        is_col_0 = False
-        penetration_0 = gs.ti_float(0.0)
-        normal_0 = ti.Vector.zero(gs.ti_float, 3)
-        contact_pos_0 = ti.Vector.zero(gs.ti_float, 3)
-
-        is_col = False
-        penetration = gs.ti_float(0.0)
-        normal = ti.Vector.zero(gs.ti_float, 3)
-        contact_pos = ti.Vector.zero(gs.ti_float, 3)
-
-        n_con = gs.ti_int(0)
-        axis_0 = ti.Vector.zero(gs.ti_float, 3)
-        axis_1 = ti.Vector.zero(gs.ti_float, 3)
-        qrot = ti.Vector.zero(gs.ti_float, 4)
-
-        i_pair = collider_info.collision_pair_idx[(i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)]
-        for i_detection in range(5):
-            try_sdf = False
-            prefer_sdf = False
-
-            if multi_contact and is_col_0:
-                # Perturbation axis must not be aligned with the principal axes of inertia the geometry,
-                # otherwise it would be more sensitive to ill-conditionning.
-                axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
-                qrot = gu.ti_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
-                func_rotate_frame(i_ga, contact_pos_0, qrot, i_b, geoms_state, geoms_info)
-                func_rotate_frame(i_gb, contact_pos_0, gu.ti_inv_quat(qrot), i_b, geoms_state, geoms_info)
-
-            if (multi_contact and is_col_0) or (i_detection == 0):
-                if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE:
-                    plane_dir = ti.Vector(
-                        [geoms_info.data[i_ga][0], geoms_info.data[i_ga][1], geoms_info.data[i_ga][2]], dt=gs.ti_float
-                    )
-                    plane_dir = gu.ti_transform_by_quat(plane_dir, geoms_state.quat[i_ga, i_b])
-                    normal = -plane_dir.normalized()
-
-                    v1 = mpr.support_driver(
-                        geoms_state,
-                        geoms_info,
-                        collider_state,
-                        collider_info,
-                        collider_static_config,
-                        support_field_info,
-                        normal,
-                        i_gb,
-                        i_b,
-                    )
-                    penetration = normal.dot(v1 - geoms_state.pos[i_ga, i_b])
-                    contact_pos = v1 - 0.5 * penetration * normal
-                    is_col = penetration > 0.0
-                else:
-                    ### MPR, MJ_MPR
-                    if ti.static(
-                        collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MPR, CCD_ALGORITHM_CODE.MJ_MPR)
-                    ):
-                        # Try using MPR before anything else
-                        is_mpr_updated = False
-                        is_mpr_guess_direction_available = True
-                        normal_ws = collider_state.contact_cache.normal[i_pair, i_b]
-                        for i_mpr in range(2):
-                            if i_mpr == 1:
-                                # Try without warm-start if no contact was detected using it.
-                                # When penetration depth is very shallow, MPR may wrongly classify two geometries as not
-                                # in contact while they actually are. This helps to improve contact persistence without
-                                # increasing much the overall computational cost since the fallback should not be
-                                # triggered very often.
-                                is_mpr_guess_direction_available = (ti.abs(normal_ws) > EPS).any()
-                                if (i_detection == 0) and not is_col and is_mpr_guess_direction_available:
-                                    normal_ws = ti.Vector.zero(gs.ti_float, 3)
-                                    is_mpr_updated = False
-
-                            if not is_mpr_updated:
-                                is_col, normal, penetration, contact_pos = mpr.func_mpr_contact(
-                                    geoms_state,
-                                    geoms_info,
-                                    geoms_init_AABB,
-                                    rigid_global_info,
-                                    static_rigid_sim_config,
-                                    collider_state,
-                                    collider_info,
-                                    collider_static_config,
-                                    mpr_state,
-                                    mpr_info,
-                                    support_field_info,
-                                    i_ga,
-                                    i_gb,
-                                    i_b,
-                                    normal_ws,
-                                )
-                                is_mpr_updated = True
-
-                        # Fallback on SDF if collision is detected by MPR but no collision direction was cached and the
-                        # initial penetration is already quite large, because the contact information provided by MPR
-                        # may be unreliable in such a case.
-                        if ti.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MPR):
-                            if is_col and penetration > tolerance:
-                                # MPR cannot handle collision detection for fully enclosed geometries. Falling back to
-                                # SDF. Note that SDF does not take into account to direction of interest. As such, it
-                                # cannot be used reliably for anything else than the point of deepest penetration.
-                                prefer_sdf = (
-                                    collider_info.mc_tolerance[None] * penetration
-                                    >= collider_info.mpr_to_sdf_overlap_ratio[None] * tolerance
-                                )
-                                if prefer_sdf or not is_mpr_guess_direction_available:
-                                    try_sdf = True
-
-                    ### GJK, MJ_GJK
-                    elif ti.static(
-                        collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
-                    ):
-                        if ti.static(static_rigid_sim_config.requires_grad):
-                            diff_gjk.func_gjk_contact(
-                                links_state,
-                                links_info,
-                                geoms_state,
-                                geoms_info,
-                                geoms_init_AABB,
-                                verts_info,
-                                faces_info,
-                                rigid_global_info,
-                                static_rigid_sim_config,
-                                collider_state,
-                                collider_static_config,
-                                gjk_state,
-                                gjk_info,
-                                support_field_info,
-                                i_ga,
-                                i_gb,
-                                i_b,
-                                diff_pos_tolerance,
-                                diff_normal_tolerance,
-                            )
-                        else:
-                            gjk.func_gjk_contact(
-                                geoms_state,
-                                geoms_info,
-                                verts_info,
-                                faces_info,
-                                rigid_global_info,
-                                static_rigid_sim_config,
-                                collider_state,
-                                collider_static_config,
-                                gjk_state,
-                                gjk_info,
-                                gjk_static_config,
-                                support_field_info,
-                                i_ga,
-                                i_gb,
-                                i_b,
-                            )
-
-                        is_col = gjk_state.is_col[i_b] == 1
-                        penetration = gjk_state.penetration[i_b]
-                        n_contacts = gjk_state.n_contacts[i_b]
-
-                        if is_col:
-                            if ti.static(static_rigid_sim_config.requires_grad):
-                                for i_c in range(n_contacts):
-                                    func_add_diff_contact_input(
-                                        i_ga,
-                                        i_gb,
-                                        i_b,
-                                        i_c,
-                                        gjk_state,
-                                        collider_state,
-                                        collider_info,
-                                    )
-                                    func_add_contact(
-                                        i_ga,
-                                        i_gb,
-                                        gjk_state.normal[i_b, i_c],
-                                        gjk_state.contact_pos[i_b, i_c],
-                                        gjk_state.diff_penetration[i_b, i_c],
-                                        i_b,
-                                        geoms_state,
-                                        geoms_info,
-                                        collider_state,
-                                        collider_info,
-                                        errno,
-                                    )
-                                break
-                            else:
-                                if gjk_state.multi_contact_flag[i_b]:
-                                    # Since we already found multiple contact points, add the discovered contact points
-                                    # and stop multi-contact search.
-                                    for i_c in range(n_contacts):
-                                        # Ignore contact points if the number of contacts exceeds the limit.
-                                        if i_c < ti.static(collider_static_config.n_contacts_per_pair):
-                                            contact_pos = gjk_state.contact_pos[i_b, i_c]
-                                            normal = gjk_state.normal[i_b, i_c]
-                                            if ti.static(static_rigid_sim_config.requires_grad):
-                                                penetration = gjk_state.diff_penetration[i_b, i_c]
-                                            func_add_contact(
-                                                i_ga,
-                                                i_gb,
-                                                normal,
-                                                contact_pos,
-                                                penetration,
-                                                i_b,
-                                                geoms_state,
-                                                geoms_info,
-                                                collider_state,
-                                                collider_info,
-                                                errno,
-                                            )
-
-                                    break
-                                else:
-                                    contact_pos = gjk_state.contact_pos[i_b, 0]
-                                    normal = gjk_state.normal[i_b, 0]
-
-                if ti.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MPR):
-                    if try_sdf:
-                        # Note that SDF may detect different collision points depending on geometry ordering. Because of
-                        # this, it is necessary to run it twice and take the contact information associated with the
-                        # point of deepest penetration.
-                        is_col_a = False
-                        is_col_b = False
-                        normal_a = ti.Vector.zero(gs.ti_float, 3)
-                        normal_b = ti.Vector.zero(gs.ti_float, 3)
-                        penetration_b = gs.ti_float(0.0)
-                        penetration_a = gs.ti_float(0.0)
-                        contact_pos_a = ti.Vector.zero(gs.ti_float, 3)
-                        contact_pos_b = ti.Vector.zero(gs.ti_float, 3)
-                        i_va = collider_state.contact_cache.i_va_ws[0, i_pair, i_b]
-                        i_vb = collider_state.contact_cache.i_va_ws[1, i_pair, i_b]
-                        for i_sdf in range(2):
-                            is_col_i, normal_i, penetration_i, contact_pos_i, i_vi = func_contact_convex_convex_sdf(
-                                i_ga if i_sdf == 0 else i_gb,
-                                i_gb if i_sdf == 0 else i_ga,
-                                i_b,
-                                i_va if i_sdf == 0 else i_vb,
-                                geoms_state,
-                                geoms_info,
-                                verts_info,
-                                collider_info,
-                                collider_static_config,
-                                sdf_info,
-                                rigid_global_info,
-                                # FIXME: The specialized edge collision detection subrountine is not reliable
-                                enable_edge_detection_fallback=False,
-                            )
-                            if not is_col_i:
-                                is_col_i, normal_i, penetration_i, contact_pos_i = func_contact_edge_sdf(
-                                    i_ga,
-                                    i_gb,
-                                    i_b,
-                                    geoms_state,
-                                    geoms_info,
-                                    verts_info,
-                                    edges_info,
-                                    rigid_global_info,
-                                    collider_static_config,
-                                    sdf_info,
-                                )
-                            if i_sdf == 0:
-                                is_col_a = is_col_i
-                                normal_a = normal_i
-                                penetration_a = penetration_i
-                                contact_pos_a = contact_pos_i
-                                i_va = i_vi
-                            else:
-                                is_col_b = is_col_i
-                                normal_b = -normal_i
-                                penetration_b = penetration_i
-                                contact_pos_b = contact_pos_i
-                                i_vb = i_vi
-
-                        if is_col_a and (
-                            not is_col_b or penetration_a >= max(penetration_b, (not prefer_sdf) * penetration)
-                        ):
-                            normal = normal_a
-                            penetration = penetration_a
-                            contact_pos = contact_pos_a
-                            collider_state.contact_cache.i_va_ws[0, i_pair, i_b] = i_va
-                        elif is_col_b and (
-                            not is_col_a or penetration_b > max(penetration_a, (not prefer_sdf) * penetration)
-                        ):
-                            normal = normal_b
-                            penetration = penetration_b
-                            contact_pos = contact_pos_b
-                            collider_state.contact_cache.i_va_ws[1, i_pair, i_b] = i_vb
-                        elif not is_col_a and not is_col_b:
-                            is_col = False
-
-            if i_detection == 0:
-                is_col_0, normal_0, penetration_0, contact_pos_0 = is_col, normal, penetration, contact_pos
-                if is_col_0:
-                    func_add_contact(
-                        i_ga,
-                        i_gb,
-                        normal_0,
-                        contact_pos_0,
-                        penetration_0,
-                        i_b,
-                        geoms_state,
-                        geoms_info,
-                        collider_state,
-                        collider_info,
-                        errno,
-                    )
-                    if multi_contact:
-                        # Perturb geom_a around two orthogonal axes to find multiple contacts
-                        axis_0, axis_1 = func_contact_orthogonals(
-                            i_ga,
-                            i_gb,
-                            normal,
-                            i_b,
-                            links_state,
-                            links_info,
-                            geoms_state,
-                            geoms_info,
-                            geoms_init_AABB,
-                            rigid_global_info,
-                            static_rigid_sim_config,
-                        )
-                        n_con = 1
-
-                    if ti.static(
-                        collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MPR, CCD_ALGORITHM_CODE.GJK)
-                    ):
-                        collider_state.contact_cache.normal[i_pair, i_b] = normal
-                else:
-                    # Clear collision normal cache if not in contact
-                    collider_state.contact_cache.i_va_ws[0, i_pair, i_b] = -1
-                    collider_state.contact_cache.i_va_ws[1, i_pair, i_b] = -1
-                    collider_state.contact_cache.normal[i_pair, i_b] = ti.Vector.zero(gs.ti_float, 3)
-
-            elif multi_contact and is_col_0 > 0 and is_col > 0:
-                if ti.static(collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MPR, CCD_ALGORITHM_CODE.GJK)):
-                    # 1. Project the contact point on both geometries
-                    # 2. Revert the effect of small rotation
-                    # 3. Update contact point
-                    contact_point_a = (
-                        gu.ti_transform_by_quat(
-                            (contact_pos - 0.5 * penetration * normal) - contact_pos_0,
-                            gu.ti_inv_quat(qrot),
-                        )
-                        + contact_pos_0
-                    )
-                    contact_point_b = (
-                        gu.ti_transform_by_quat(
-                            (contact_pos + 0.5 * penetration * normal) - contact_pos_0,
-                            qrot,
-                        )
-                        + contact_pos_0
-                    )
-                    contact_pos = 0.5 * (contact_point_a + contact_point_b)
-
-                    # First-order correction of the normal direction.
-                    # The way the contact normal gets twisted by applying perturbation of geometry poses is
-                    # unpredictable as it depends on the final portal discovered by MPR. Alternatively, let compute
-                    # the mininal rotation that makes the corrected twisted normal as closed as possible to the
-                    # original one, up to the scale of the perturbation, then apply first-order Taylor expension of
-                    # Rodrigues' rotation formula.
-                    twist_rotvec = ti.math.clamp(
-                        normal.cross(normal_0),
-                        -collider_info.mc_perturbation[None],
-                        collider_info.mc_perturbation[None],
-                    )
-                    normal += twist_rotvec.cross(normal)
-
-                    # Make sure that the penetration is still positive before adding contact point.
-                    # Note that adding some negative tolerance improves physical stability by encouraging persistent
-                    # contact points and thefore more continuous contact forces, without changing the mean-field
-                    # dynamics since zero-penetration contact points should not induce any force.
-                    penetration = normal.dot(contact_point_b - contact_point_a)
-
-                elif ti.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MJ_GJK):
-                    # Only change penetration to the initial one, because the normal vector could change abruptly
-                    # under MuJoCo's GJK-EPA.
-                    penetration = penetration_0
-
-                # Discard contact point is repeated
-                repeated = False
-                for i_c in range(n_con):
-                    if not repeated:
-                        idx_prev = collider_state.n_contacts[i_b] - 1 - i_c
-                        prev_contact = collider_state.contact_data.pos[idx_prev, i_b]
-                        if (contact_pos - prev_contact).norm() < tolerance:
-                            repeated = True
-
-                if not repeated:
-                    if penetration > -tolerance:
-                        penetration = ti.max(penetration, 0.0)
-                        func_add_contact(
-                            i_ga,
-                            i_gb,
-                            normal,
-                            contact_pos,
-                            penetration,
-                            i_b,
-                            geoms_state,
-                            geoms_info,
-                            collider_state,
-                            collider_info,
-                            errno,
-                        )
-                        n_con = n_con + 1
-
-            geoms_state.pos[i_ga, i_b] = ga_pos
-            geoms_state.quat[i_ga, i_b] = ga_quat
-            geoms_state.pos[i_gb, i_b] = gb_pos
-            geoms_state.quat[i_gb, i_b] = gb_quat
+    diff_gjk.func_gjk_contact(
+        links_state,
+        links_info,
+        geoms_state,
+        geoms_info,
+        geoms_init_AABB,
+        verts_info,
+        faces_info,
+        rigid_global_info,
+        static_rigid_sim_config,
+        collider_state,
+        collider_static_config,
+        gjk_state,
+        gjk_info,
+        support_field_info,
+        i_ga,
+        i_gb,
+        i_b,
+        0,
+        0,
+    )
 
 
 @ti.func
