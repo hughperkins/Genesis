@@ -6700,7 +6700,7 @@ def func_load_adjoint_cache(
         rigid_global_info.qpos[i_q, i_b] = rigid_adjoint_cache.qpos[f, i_q, i_b]
 
 
-@ti.kernel(fastcache=gs.use_fastcache)
+@ti.kernel
 def kernel_prepare_backward_substep(
     f: ti.int32,
     links_state: array_class.LinksState,
@@ -6720,37 +6720,6 @@ def kernel_prepare_backward_substep(
     rigid_adjoint_cache: array_class.RigidAdjointCache,
     static_rigid_sim_config: ti.template(),
 ):
-    # Load the current state from adjoint cache
-    func_load_adjoint_cache(
-        f=f,
-        dofs_state=dofs_state,
-        rigid_global_info=rigid_global_info,
-        rigid_adjoint_cache=rigid_adjoint_cache,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
-
-    # If mujoco compatibility is disabled, update the cartesian space and save the results to adjoint cache. This is
-    # because the cartesian space is overwritten later by other kernels if mujoco compatibility was disabled.
-    if not static_rigid_sim_config.enable_mujoco_compatibility:
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_b in range(links_state.pos.shape[1]):
-            func_update_cartesian_space(
-                i_b=i_b,
-                links_state=links_state,
-                links_info=links_info,
-                joints_state=joints_state,
-                joints_info=joints_info,
-                dofs_state=dofs_state,
-                dofs_info=dofs_info,
-                geoms_state=geoms_state,
-                geoms_info=geoms_info,
-                entities_info=entities_info,
-                rigid_global_info=rigid_global_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-                force_update_fixed_geoms=False,
-            )
-
-        # Save results of [update_cartesian_space] to adjoint cache
         func_copy_cartesian_space(
             src_dofs_state=dofs_state,
             src_links_state=links_state,
@@ -6847,55 +6816,8 @@ def func_copy_cartesian_space(
     dst_geoms_state: array_class.GeomsState,
     static_rigid_sim_config: ti.template(),
 ):
-    # Copy outputs of [kernel_update_cartesian_space] among [dofs, links, joints, geoms] states. This is used to restore
-    # the outputs that were overwritten if we disabled mujoco compatibility for backward pass.
-
-    # dofs state
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_dofs_state.pos.shape)):
-        # pos, cdof_ang, cdof_vel, cdofvel_ang, cdofvel_vel, cdofd_ang, cdofd_vel
-        dst_dofs_state.pos[I] = src_dofs_state.pos[I]
-        dst_dofs_state.cdof_ang[I] = src_dofs_state.cdof_ang[I]
-        dst_dofs_state.cdof_vel[I] = src_dofs_state.cdof_vel[I]
-        dst_dofs_state.cdofvel_ang[I] = src_dofs_state.cdofvel_ang[I]
-        dst_dofs_state.cdofvel_vel[I] = src_dofs_state.cdofvel_vel[I]
-        dst_dofs_state.cdofd_ang[I] = src_dofs_state.cdofd_ang[I]
-        dst_dofs_state.cdofd_vel[I] = src_dofs_state.cdofd_vel[I]
-
-    # links state
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_links_state.pos.shape)):
-        # pos, quat, root_COM, mass_sum, i_pos, i_quat, cinr_inertial, cinr_pos, cinr_quat, cinr_mass, j_pos, j_quat,
-        # cd_vel, cd_ang
-        dst_links_state.pos[I] = src_links_state.pos[I]
-        dst_links_state.quat[I] = src_links_state.quat[I]
-        dst_links_state.root_COM[I] = src_links_state.root_COM[I]
-        dst_links_state.mass_sum[I] = src_links_state.mass_sum[I]
-        dst_links_state.i_pos[I] = src_links_state.i_pos[I]
-        dst_links_state.i_quat[I] = src_links_state.i_quat[I]
-        dst_links_state.cinr_inertial[I] = src_links_state.cinr_inertial[I]
-        dst_links_state.cinr_pos[I] = src_links_state.cinr_pos[I]
-        dst_links_state.cinr_quat[I] = src_links_state.cinr_quat[I]
-        dst_links_state.cinr_mass[I] = src_links_state.cinr_mass[I]
-        dst_links_state.j_pos[I] = src_links_state.j_pos[I]
-        dst_links_state.j_quat[I] = src_links_state.j_quat[I]
-        dst_links_state.cd_vel[I] = src_links_state.cd_vel[I]
-        dst_links_state.cd_ang[I] = src_links_state.cd_ang[I]
-
-    # joints state
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_joints_state.xanchor.shape)):
-        # xanchor, xaxis
-        dst_joints_state.xanchor[I] = src_joints_state.xanchor[I]
-        dst_joints_state.xaxis[I] = src_joints_state.xaxis[I]
-
-    # geoms state
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_geoms_state.pos.shape)):
-        # pos, quat, verts_updated
-        dst_geoms_state.pos[I] = src_geoms_state.pos[I]
-        dst_geoms_state.quat[I] = src_geoms_state.quat[I]
-        dst_geoms_state.verts_updated[I] = src_geoms_state.verts_updated[I]
+    I = (0, 0)
+    dst_dofs_state.pos[I] = src_dofs_state.pos[I]
 
 
 @ti.kernel(fastcache=gs.use_fastcache)

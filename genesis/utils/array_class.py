@@ -351,27 +351,7 @@ def get_contact_data(solver, max_contact_pairs, requires_grad):
 
 @DATA_ORIENTED
 class StructDiffContactInput(metaclass=BASE_METACLASS):
-    ### Non-differentiable input data
-    # Geom id of the two geometries
     geom_a: V_ANNOTATION
-    geom_b: V_ANNOTATION
-    # Local positions of the 3 vertices from the two geometries that define the face on the Minkowski difference
-    local_pos1_a: V_ANNOTATION
-    local_pos1_b: V_ANNOTATION
-    local_pos1_c: V_ANNOTATION
-    local_pos2_a: V_ANNOTATION
-    local_pos2_b: V_ANNOTATION
-    local_pos2_c: V_ANNOTATION
-    # Local positions of the 1 vertex from the two geometries that define the support point for the face above
-    w_local_pos1: V_ANNOTATION
-    w_local_pos2: V_ANNOTATION
-    # Reference id of the contact point, which is needed for the backward pass
-    ref_id: V_ANNOTATION
-    # Flag whether the contact data can be computed in numerically stable way in both the forward and backward passes
-    valid: V_ANNOTATION
-    ### Differentiable input data
-    # Reference penetration depth, which is needed for computing the weight of the contact point
-    ref_penetration: V_ANNOTATION
 
 
 def get_diff_contact_input(solver, max_contacts_per_pair, is_active):
@@ -379,18 +359,6 @@ def get_diff_contact_input(solver, max_contacts_per_pair, is_active):
     shape = maybe_shape((_B, max_contacts_per_pair), is_active and solver._requires_grad)
     return StructDiffContactInput(
         geom_a=V(dtype=gs.ti_int, shape=shape),
-        geom_b=V(dtype=gs.ti_int, shape=shape),
-        local_pos1_a=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        local_pos1_b=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        local_pos1_c=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        local_pos2_a=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        local_pos2_b=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        local_pos2_c=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        w_local_pos1=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        w_local_pos2=V_VEC(3, dtype=gs.ti_float, shape=shape),
-        ref_id=V(dtype=gs.ti_int, shape=shape),
-        valid=V(dtype=gs.ti_int, shape=shape),
-        ref_penetration=V(dtype=gs.ti_float, shape=shape, needs_grad=True),
     )
 
 
@@ -883,159 +851,23 @@ def get_witness(solver, max_contacts_per_pair, is_active):
 @DATA_ORIENTED
 class StructGJKState(metaclass=BASE_METACLASS):
     support_mesh_prev_vertex_id: V_ANNOTATION
-    simplex_vertex: StructMDVertex
-    simplex_buffer: StructGJKSimplexBuffer
-    simplex: StructGJKSimplex
-    simplex_vertex_intersect: StructMDVertex
-    simplex_buffer_intersect: StructGJKSimplexBuffer
-    nsimplex: V_ANNOTATION
-    last_searched_simplex_vertex_id: V_ANNOTATION
-    polytope: StructEPAPolytope
-    polytope_verts: StructMDVertex
-    polytope_faces: StructEPAPolytopeFace
-    polytope_faces_map: V_ANNOTATION
-    polytope_horizon_data: StructEPAPolytopeHorizonData
-    polytope_horizon_stack: StructEPAPolytopeHorizonData
-    contact_faces: StructContactFace
-    contact_normals: StructContactNormal
-    contact_halfspaces: StructContactHalfspace
-    contact_clipped_polygons: V_ANNOTATION
-    multi_contact_flag: V_ANNOTATION
-    witness: StructWitness
-    n_witness: V_ANNOTATION
-    n_contacts: V_ANNOTATION
-    contact_pos: V_ANNOTATION
-    normal: V_ANNOTATION
-    is_col: V_ANNOTATION
-    penetration: V_ANNOTATION
-    distance: V_ANNOTATION
-    # Differentiable contact detection
-    diff_contact_input: StructDiffContactInput
-    n_diff_contact_input: V_ANNOTATION
-    diff_penetration: V_ANNOTATION
 
 
 def get_gjk_state(solver, static_rigid_sim_config, gjk_info, is_active):
     _B = solver._B
-    enable_mujoco_compatibility = static_rigid_sim_config.enable_mujoco_compatibility
-    polytope_max_faces = gjk_info.polytope_max_faces[None]
-    max_contacts_per_pair = gjk_info.max_contacts_per_pair[None]
-    max_contact_polygon_verts = gjk_info.max_contact_polygon_verts[None]
-    requires_grad = solver._static_rigid_sim_config.requires_grad
-
-    # FIXME: Define GJKState and MujocoCompatGJKState that derives from the former but defines additional attributes
     return StructGJKState(
-        # GJK simplex
         support_mesh_prev_vertex_id=V(dtype=gs.ti_int, shape=(_B, 2)),
-        simplex_vertex=get_gjk_simplex_vertex(solver, is_active),
-        simplex_buffer=get_gjk_simplex_buffer(solver, is_active),
-        simplex=get_gjk_simplex(solver, is_active),
-        last_searched_simplex_vertex_id=V(dtype=gs.ti_int, shape=(_B,)),
-        simplex_vertex_intersect=get_gjk_simplex_vertex(solver, is_active),
-        simplex_buffer_intersect=get_gjk_simplex_buffer(solver, is_active),
-        nsimplex=V(dtype=gs.ti_int, shape=(_B,)),
-        # EPA polytope
-        polytope=get_epa_polytope(solver, is_active),
-        polytope_verts=get_epa_polytope_vertex(solver, gjk_info, is_active),
-        polytope_faces=get_epa_polytope_face(solver, polytope_max_faces, is_active),
-        polytope_faces_map=V(dtype=gs.ti_int, shape=(_B, polytope_max_faces)),
-        polytope_horizon_data=get_epa_polytope_horizon_data(solver, 6 + gjk_info.epa_max_iterations[None], is_active),
-        polytope_horizon_stack=get_epa_polytope_horizon_data(solver, polytope_max_faces * 3, is_active),
-        # Multi-contact detection (MuJoCo compatibility)
-        contact_faces=get_contact_face(solver, max_contact_polygon_verts, is_active),
-        contact_normals=get_contact_normal(solver, max_contact_polygon_verts, is_active),
-        contact_halfspaces=get_contact_halfspace(solver, max_contact_polygon_verts, is_active),
-        contact_clipped_polygons=V_VEC(3, dtype=gs.ti_float, shape=(_B, 2, max_contact_polygon_verts)),
-        multi_contact_flag=V(dtype=gs.ti_bool, shape=(_B,)),
-        # Final results
-        witness=get_witness(solver, max_contacts_per_pair, is_active),
-        n_witness=V(dtype=gs.ti_int, shape=(_B,)),
-        n_contacts=V(dtype=gs.ti_int, shape=(_B,)),
-        contact_pos=V_VEC(3, dtype=gs.ti_float, shape=(_B, max_contacts_per_pair)),
-        normal=V_VEC(3, dtype=gs.ti_float, shape=(_B, max_contacts_per_pair)),
-        is_col=V(dtype=gs.ti_bool, shape=(_B,)),
-        penetration=V(dtype=gs.ti_float, shape=(_B,)),
-        distance=V(dtype=gs.ti_float, shape=(_B,)),
-        diff_contact_input=get_diff_contact_input(solver, max(max_contacts_per_pair, 1), is_active),
-        n_diff_contact_input=V(dtype=gs.ti_int, shape=(_B,)),
-        diff_penetration=V(dtype=gs.ti_float, shape=maybe_shape((_B, max_contacts_per_pair), requires_grad)),
     )
 
 
 @DATA_ORIENTED
 class StructGJKInfo(metaclass=BASE_METACLASS):
     max_contacts_per_pair: V_ANNOTATION
-    max_contact_polygon_verts: V_ANNOTATION
-    # Maximum number of iterations for GJK and EPA algorithms
-    gjk_max_iterations: V_ANNOTATION
-    epa_max_iterations: V_ANNOTATION
-    FLOAT_MIN: V_ANNOTATION
-    FLOAT_MIN_SQ: V_ANNOTATION
-    FLOAT_MAX: V_ANNOTATION
-    FLOAT_MAX_SQ: V_ANNOTATION
-    # Tolerance for stopping GJK and EPA algorithms when they converge (only for non-discrete geometries).
-    tolerance: V_ANNOTATION
-    # If the distance between two objects is smaller than this value, we consider them colliding.
-    collision_eps: V_ANNOTATION
-    # In safe GJK, we do not allow degenerate simplex to happen, because it becomes the main reason of EPA errors.
-    # To prevent degeneracy, we throw away the simplex that has smaller degeneracy measure (e.g. colinearity,
-    # coplanarity) than this threshold.
-    simplex_max_degeneracy_sq: V_ANNOTATION
-    polytope_max_faces: V_ANNOTATION
-    # Threshold for reprojection error when we compute the witness points from the polytope. In computing the
-    # witness points, we project the origin onto the polytope faces and compute the barycentric coordinates of the
-    # projected point. To confirm the projection is valid, we compute the projected point using the barycentric
-    # coordinates and compare it with the original projected point. If the difference is larger than this threshold,
-    # we consider the projection invalid, because it means numerical errors are too large.
-    polytope_max_reprojection_error: V_ANNOTATION
-    # Tolerance for normal alignment between (face-face) or (edge-face). The normals should align within this
-    # tolerance to be considered as a valid parallel contact.
-    contact_face_tol: V_ANNOTATION
-    contact_edge_tol: V_ANNOTATION
-    # Epsilon values for differentiable contact. [eps_boundary] denotes the maximum distance between the face
-    # and the support point in the direction of the face normal. If this distance is 0, the face is on the
-    # boundary of the Minkowski difference. For [eps_distance], the distance between the origin and the face
-    # should not exceed this eps value plus the default EPA depth. For [eps_affine], the affine coordinates
-    # of the origin's projection onto the face should not violate [0, 1] range by this eps value.
-    # FIXME: Adjust these values based on the case study.
-    diff_contact_eps_boundary: V_ANNOTATION
-    diff_contact_eps_distance: V_ANNOTATION
-    diff_contact_eps_affine: V_ANNOTATION
-    # The minimum norm of the normal to be considered as a valid normal in the differentiable formulation.
-    diff_contact_min_normal_norm: V_ANNOTATION
-    # The minimum penetration depth to be considered as a valid contact in the differentiable formulation.
-    # The contact with penetration depth smaller than this value is ignored in the differentiable formulation.
-    # This should be large enough to be safe from numerical errors, because in the backward pass, the computed
-    # penetration depth could be different from the forward pass due to the numerical errors. If this value is
-    # too small, the non-zero penetration depth could be falsely computed to 0 in the backward pass and thus
-    # produce nan values for the contact normal.
-    diff_contact_min_penetration: V_ANNOTATION
 
 
 def get_gjk_info(**kwargs):
     return StructGJKInfo(
         max_contacts_per_pair=V_SCALAR_FROM(dtype=gs.ti_int, value=kwargs["max_contacts_per_pair"]),
-        max_contact_polygon_verts=V_SCALAR_FROM(dtype=gs.ti_int, value=kwargs["max_contact_polygon_verts"]),
-        gjk_max_iterations=V_SCALAR_FROM(dtype=gs.ti_int, value=kwargs["gjk_max_iterations"]),
-        epa_max_iterations=V_SCALAR_FROM(dtype=gs.ti_int, value=kwargs["epa_max_iterations"]),
-        FLOAT_MIN=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["FLOAT_MIN"]),
-        FLOAT_MIN_SQ=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["FLOAT_MIN"] ** 2),
-        FLOAT_MAX=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["FLOAT_MAX"]),
-        FLOAT_MAX_SQ=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["FLOAT_MAX"] ** 2),
-        tolerance=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["tolerance"]),
-        collision_eps=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["collision_eps"]),
-        simplex_max_degeneracy_sq=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["simplex_max_degeneracy_sq"]),
-        polytope_max_faces=V_SCALAR_FROM(dtype=gs.ti_int, value=kwargs["polytope_max_faces"]),
-        polytope_max_reprojection_error=V_SCALAR_FROM(
-            dtype=gs.ti_float, value=kwargs["polytope_max_reprojection_error"]
-        ),
-        contact_face_tol=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["contact_face_tol"]),
-        contact_edge_tol=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["contact_edge_tol"]),
-        diff_contact_eps_boundary=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["diff_contact_eps_boundary"]),
-        diff_contact_eps_distance=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["diff_contact_eps_distance"]),
-        diff_contact_eps_affine=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["diff_contact_eps_affine"]),
-        diff_contact_min_normal_norm=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["diff_contact_min_normal_norm"]),
-        diff_contact_min_penetration=V_SCALAR_FROM(dtype=gs.ti_float, value=kwargs["diff_contact_min_penetration"]),
     )
 
 
@@ -1821,44 +1653,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
 @ti.data_oriented
 class DataManager:
     def __init__(self, solver):
-        self.rigid_global_info = get_rigid_global_info(solver)
-
-        self.dofs_info = get_dofs_info(solver)
         self.dofs_state = get_dofs_state(solver)
-        self.links_info = get_links_info(solver)
-        self.links_state = get_links_state(solver)
-        self.joints_info = get_joints_info(solver)
-        self.joints_state = get_joints_state(solver)
-        self.geoms_info = get_geoms_info(solver)
-        self.geoms_state = get_geoms_state(solver)
-
-        self.verts_info = get_verts_info(solver)
-        self.faces_info = get_faces_info(solver)
-        self.edges_info = get_edges_info(solver)
-
-        self.free_verts_state = get_free_verts_state(solver)
-        self.fixed_verts_state = get_fixed_verts_state(solver)
-
-        self.vverts_info = get_vverts_info(solver)
-        self.vfaces_info = get_vfaces_info(solver)
-
-        self.vgeoms_info = get_vgeoms_info(solver)
-        self.vgeoms_state = get_vgeoms_state(solver)
-
-        self.equalities_info = get_equalities_info(solver)
-
-        self.entities_info = get_entities_info(solver)
-        self.entities_state = get_entities_state(solver)
-
-        if solver._static_rigid_sim_config.requires_grad:
-            # Data structures required for backward pass
-            self.dofs_state_adjoint_cache = get_dofs_state(solver)
-            self.links_state_adjoint_cache = get_links_state(solver)
-            self.joints_state_adjoint_cache = get_joints_state(solver)
-            self.geoms_state_adjoint_cache = get_geoms_state(solver)
-
-        self.rigid_adjoint_cache = get_rigid_adjoint_cache(solver)
-        self.errno = V_SCALAR_FROM(dtype=gs.ti_int, value=0)
 
 
 DofsState = StructDofsState if gs.use_ndarray else ti.template()
