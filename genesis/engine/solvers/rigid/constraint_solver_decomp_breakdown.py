@@ -7,7 +7,8 @@ import genesis.engine.solvers.rigid.constraint_solver_decomp as constraint_solve
 import pickle, os
 import sys
 # sys.path.append("tools")
-from genesis.utils import params_pickler
+# from genesis.utils import params_pickler
+from taichi_play.pickles import params_pickler
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
