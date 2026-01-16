@@ -4,6 +4,11 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.engine.solvers.rigid.constraint_solver_decomp as constraint_solver_decomp
 
+import pickle, os
+import sys
+# sys.path.append("tools")
+from genesis.utils import params_pickler
+
 
 @ti.kernel(fastcache=gs.use_fastcache)
 def _kernel_solve_body_decomposed(
@@ -282,6 +287,13 @@ def func_solve_decomposed_macrokernels(
             static_rigid_sim_config,
         )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
+            pickle_filepath = f"pull/params-it{_it}.pkl"
+            # print("dumping params")
+            python_objs = self.convert_to_python_objs(params)
+            python_objs = params_pickler.convert_to_python_objs(params)
+            with open(pickle_filepath, "wb") as fh:
+                pickle.dump(python_objs, fh)
+            os.system(f"ls -lh {pickle_filepath}")
             _kernel_newton_only_nt_hessian_incremental(
                 entities_info,
                 constraint_state,
