@@ -23,8 +23,23 @@ def convert_to_python_objs(params):
         print(res)
         res["data"] = params.detach().cpu()
         return res
-    # elif hasattr(params, "_is_taichi_class"):
-    #     print("is data oriented")
+    elif hasattr(params, "_data_oriented"):
+        print("is data oriented")
+        res_fields = {}
+        res = {
+            "classname": params.__class__.__name__,
+            "classpath": f"{params.__class__.__module__}.{params.__class__.__qualname__}",
+            "classtype": "data_oriented",
+        }
+        res["fields"] = res_fields
+        for k in dir(params):
+            if k.startswith("_"):
+                continue
+            print('k', k)
+            field_name = k
+            field_val = getattr(params, k)
+            res_fields[field_name] = convert_to_python_objs(field_val)
+        return res
     elif dataclasses.is_dataclass(params):
         print("is py dataclass")
         res_fields = {}
@@ -58,6 +73,7 @@ def convert_to_python_objs(params):
         print("res", res_)
         return res
     else:
+        print('dir(params)', dir(params))
         raise Exception("unhandled type", type(params))
 
 
