@@ -72,6 +72,25 @@ def convert_to_python_objs(params):
         del res_["data"]
         print("res", res_)
         return res
+    elif isinstance(params, (ti.ScalarField, ti.MatrixField)):
+        print("got field")
+        res = {
+            "classname": params.__class__.__name__,
+            "classtype": "field",
+            "shape": params.shape,
+            "element_type": str(params.dtype),
+            "element_shape": (),
+            "ndim": 0,
+            "data": params.to_numpy()
+        }
+        if isinstance(params, (ti.MatrixField)):
+            print('dir params', dir(params))
+            res["element_shape"] = (params.m, params.n)
+            res["ndim"] = params.ndim
+        res_ = dict(res)
+        del res_["data"]
+        print("res", res_)
+        return res
     else:
         print('dir(params)', dir(params))
         raise Exception("unhandled type", type(params))
