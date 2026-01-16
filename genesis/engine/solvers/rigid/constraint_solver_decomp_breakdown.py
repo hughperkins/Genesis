@@ -287,6 +287,12 @@ def func_solve_decomposed_macrokernels(
             static_rigid_sim_config,
         )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
+            params = (
+                entities_info,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
             pickle_filepath = f"pull/params-it{_it}.pkl"
             # print("dumping params")
             python_objs = params_pickler.convert_to_python_objs(params)
