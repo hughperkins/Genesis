@@ -35,7 +35,7 @@ def convert_to_python_objs(params):
         for k in dir(params):
             if k.startswith("_"):
                 continue
-            print('k', k)
+            # print('k', k)
             field_name = k
             field_val = getattr(params, k)
             res_fields[field_name] = convert_to_python_objs(field_val)
