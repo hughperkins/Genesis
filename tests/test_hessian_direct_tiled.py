@@ -13,27 +13,11 @@ from genesis.engine.solvers.rigid.constraint.solver import (
 from .utils import assert_allclose
 
 
-@pytest.fixture
-def backend():
-    """Test on GPU backend as func_hessian_direct_tiled is GPU-specific."""
-    return gs.gpu
-
-
-@pytest.fixture(params=[
-    # (n_constraints, n_dofs, batch_size)
-    (8, 16, 2),    # Small case
-    (16, 32, 4),   # Medium case
-    (32, 64, 2),   # Large case - fits in single block
-    (48, 80, 2),   # Requires tiling
-])
-def problem_size(request):
-    """Different problem sizes to test."""
-    return request.param
-
-
 def create_test_constraint_state(n_constraints, n_dofs, batch_size):
-    """Create a minimal ConstraintState for testing."""
+    """Create a minimal ConstraintState for testing.
     
+    Note: Genesis must be initialized (gs.init()) before calling this function.
+    """
     # Create the data structures
     constraint_state = array_class.StructConstraintState(
         n_constraints=array_class.V(dtype=gs.ti_int, shape=(batch_size,)),
@@ -104,7 +88,10 @@ def create_test_constraint_state(n_constraints, n_dofs, batch_size):
 
 
 def create_test_rigid_global_info(n_dofs, batch_size):
-    """Create a minimal RigidGlobalInfo for testing."""
+    """Create a minimal RigidGlobalInfo for testing.
+    
+    Note: Genesis must be initialized (gs.init()) before calling this function.
+    """
     
     # Create minimal placeholder fields
     rigid_global_info = array_class.StructRigidGlobalInfo(
@@ -143,7 +130,10 @@ def create_test_rigid_global_info(n_dofs, batch_size):
 
 
 def create_test_entities_info(n_dofs, batch_size):
-    """Create a minimal EntitiesInfo for testing."""
+    """Create a minimal EntitiesInfo for testing.
+    
+    Note: Genesis must be initialized (gs.init()) before calling this function.
+    """
     
     entities_info = array_class.StructEntitiesInfo(
         batch_idx=array_class.V(dtype=gs.ti_int, shape=(1,)),
@@ -214,13 +204,16 @@ def initialize_test_data(
 
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.gpu])
+@pytest.mark.parametrize("problem_size", [
+    # (n_constraints, n_dofs, batch_size)
+    (8, 16, 2),    # Small case
+    (16, 32, 4),   # Medium case
+    (32, 64, 2),   # Large case - fits in single block
+    (48, 80, 2),   # Requires tiling
+])
 def test_func_hessian_direct_tiled(backend, problem_size):
     """Test that func_hessian_direct_tiled produces the same results as func_hessian_direct_batch."""
     n_constraints, n_dofs, batch_size = problem_size
-    
-    # Skip if backend is not GPU
-    if backend != gs.gpu:
-        pytest.skip("func_hessian_direct_tiled is GPU-only")
     
     # Create test data structures
     constraint_state_tiled = create_test_constraint_state(n_constraints, n_dofs, batch_size)
@@ -288,8 +281,6 @@ def test_func_hessian_direct_tiled(backend, problem_size):
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_func_hessian_direct_tiled_edge_cases(backend):
     """Test edge cases like zero constraints or all inactive constraints."""
-    if backend != gs.gpu:
-        pytest.skip("func_hessian_direct_tiled is GPU-only")
     
     n_constraints, n_dofs, batch_size = 16, 32, 2
     
