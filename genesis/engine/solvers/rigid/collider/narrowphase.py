@@ -919,6 +919,39 @@ def func_convex_convex_contact(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
+def func_build_global_collision_queue(
+    collider_state: array_class.ColliderState,
+):
+    """
+    Build a flattened global collision queue from per-environment collision pairs.
+
+    This creates a compact, dense list of all collision pairs across all environments,
+    enabling strided parallel processing where each thread processes work items at
+    thread_idx + num_envs * iteration.
+
+    The queue stores tuples of (i_pair, i_b) where:
+    - i_pair: Index into broad_collision_pairs for this environment
+    - i_b: Environment index
+
+    Updates:
+    - collider_state.global_collision_queue: Flattened list of collision work items
+    - collider_state.n_total_collisions: Total number of collisions across all environments
+    """
+    _B = collider_state.n_broad_pairs.shape[0]
+
+    # Build flattened collision queue
+    offset = 0
+    for i_b in range(_B):
+        n_pairs = collider_state.n_broad_pairs[i_b]
+        for i_pair in range(n_pairs):
+            collider_state.global_collision_queue[offset] = ti.Vector([i_pair, i_b], dt=gs.ti_int)
+            offset += 1
+
+    # Store total collision count
+    collider_state.n_total_collisions[None] = offset
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
 def func_narrow_phase_convex_vs_convex(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
