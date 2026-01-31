@@ -26,6 +26,7 @@ from . import support_field
 from .mpr import MPR
 from .gjk import GJK
 from .support_field import SupportField
+from .collider_diag_timings import ColliderDiagTimings
 
 # Import and re-export from submodules for backward compatibility
 from .broadphase import (
@@ -81,6 +82,7 @@ NEUTRAL_COLLISION_RES_REL = 0.05
 
 class Collider:
     def __init__(self, rigid_solver: "RigidSolver"):
+        self.collider_diag_timings = ColliderDiagTimings()
         self._solver = rigid_solver
 
         self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
@@ -459,6 +461,7 @@ class Collider:
             self._solver._errno,
         )
         if self._collider_static_config.has_convex_convex:
+            self.collider_diag_timings.before_call()
             func_narrow_phase_convex_vs_convex(
                 self._solver.links_state,
                 self._solver.links_info,
@@ -483,6 +486,7 @@ class Collider:
                 self._gjk._gjk_state.diff_contact_input,
                 self._solver._errno,
             )
+            self.collider_diag_timings.after_call()
         if self._collider_static_config.has_convex_specialization:
             func_narrow_phase_convex_specializations(
                 self._solver.geoms_state,
