@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import numpy as np
@@ -403,12 +404,22 @@ class RigidOptions(Options):
     # Experimental options mainly intended for debug purpose and unit tests
     enable_multi_contact: bool = True
     enable_mujoco_compatibility: bool = False
+    enable_gjk_promotion: bool = True
 
     # GJK collision detection
     use_gjk_collision: Optional[bool] = None
 
     def __init__(self, **data):
         super().__init__(**data)
+        if "GS_GJK" in os.environ:
+            self.use_gjk_collision = os.environ["GS_GJK"] == "1"
+            print("set self.use_gjk_collision", self.use_gjk_collision)
+        if "GS_MULTI" in os.environ:
+            self.enable_multi_contact = os.environ["GS_MULTI"] == "1"
+            print("set self.enable_multi_contact", self.enable_multi_contact)
+        if "GS_GJK_PROMOTION" in os.environ:
+            self.enable_gjk_promotion = os.environ["GS_GJK_PROMOTION"] == "1"
+            print("set self.enable_gjk_promotion", self.enable_gjk_promotion)
 
 
 class MPMOptions(Options):
