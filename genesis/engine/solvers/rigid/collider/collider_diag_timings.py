@@ -18,7 +18,7 @@ class ColliderDiagTimings:
         self.cum_time += elapsed
         self.count += 1
 
-        if time.time() - self.last_print >= 5.0:
+        if time.time() - self.last_print >= 3.0:
             it_time_us = self.cum_time / self.count * 1e6
             print(f"It time {it_time_us:.1f}us")
             self.count = 0
