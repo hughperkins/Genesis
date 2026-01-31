@@ -1838,6 +1838,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     enable_heterogeneous: bool
     enable_mujoco_compatibility: bool
     enable_multi_contact: bool
+    enable_gjk_promotion: bool
     enable_joint_limit: bool
     box_box_detection: bool
     sparse_solve: bool

@@ -416,6 +416,7 @@ class RigidSolver(Solver):
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
+            enable_gjk_promotion=self._options.enable_gjk_promotion,
         )
 
         if self.is_active:
