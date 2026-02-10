@@ -1,13 +1,13 @@
-import math
 import dataclasses
+import math
+from enum import IntEnum
 from functools import partial
-from typing_extensions import dataclass_transform  # Made it into standard lib from Python 3.12
 
 import gstaichi as ti
 import numpy as np
+from typing_extensions import dataclass_transform  # Made it into standard lib from Python 3.12
 
 import genesis as gs
-
 
 if not gs._initialized:
     gs.raise_exception("Genesis hasn't been initialized. Did you call `gs.init()`?")
@@ -71,6 +71,18 @@ def V_SCALAR_FROM(dtype, value):
     data = V(dtype=dtype, shape=())
     data.fill(value)
     return data
+
+
+# =========================================== ErrorCode ===========================================
+
+
+class ErrorCode(IntEnum):
+    SUCCESS = 0b000000000000000000000000000000000
+    OVERFLOW_CANDIDATE_CONTACTS = 0b00000000000000000000000000000001
+    OVERFLOW_COLLISION_PAIRS = 0b00000000000000000000000000000010
+    OVERFLOW_HIBERNATION_ISLANDS = 0b00000000000000000000000000000100
+    INVALID_FORCE_NAN = 0b00000000000000000000000000001000
+    INVALID_ACC_NAN = 0b00000000000000000000000000010000
 
 
 # =========================================== RigidGlobalInfo ===========================================
@@ -208,6 +220,7 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     quad_gauss: V_ANNOTATION
     quad: V_ANNOTATION
     candidates: V_ANNOTATION
+    eq_sum: V_ANNOTATION
     ls_it: V_ANNOTATION
     ls_result: V_ANNOTATION
     # Optional CG fields
@@ -282,6 +295,7 @@ def get_constraint_state(constraint_solver, solver):
         cg_pg_dot_pMg=V(dtype=gs.ti_float, shape=(_B,)),
         quad_gauss=V(dtype=gs.ti_float, shape=(3, _B)),
         candidates=V(dtype=gs.ti_float, shape=(12, _B)),
+        eq_sum=V(dtype=gs.ti_float, shape=(3, _B)),
         Ma=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
         Ma_ws=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
         grad=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
@@ -481,9 +495,15 @@ def get_contact_island_state(solver, collider):
     max_contact_pairs = max(collider._collider_info.max_contact_pairs[None], 1)
     n_entities = max(solver.n_entities, 1)
 
+    # When hibernation is enabled, the island construction adds edges for hibernated entity chains
+    # in addition to contact edges. The chain construction is cyclic (last entity links back to first),
+    # so worst case: each entity contributes one hibernation edge, totaling n_entities hibernation edges.
+    max_hibernation_edges = n_entities if solver._use_hibernation else 0
+    max_edges = max_contact_pairs + max_hibernation_edges
+
     return StructContactIslandState(
-        ci_edges=V(dtype=gs.ti_int, shape=(max_contact_pairs, 2, _B)),
-        edge_id=V(dtype=gs.ti_int, shape=(max_contact_pairs * 2, _B)),
+        ci_edges=V(dtype=gs.ti_int, shape=(max_edges, 2, _B)),
+        edge_id=V(dtype=gs.ti_int, shape=(max_edges * 2, _B)),
         constraint_list=V(dtype=gs.ti_int, shape=(max_contact_pairs, _B)),
         constraint_id=V(dtype=gs.ti_int, shape=(max_contact_pairs * 2, _B)),
         entity_edge=get_agg_list(solver),
@@ -1900,6 +1920,28 @@ class DataManager:
         self.errno = V(dtype=gs.ti_int, shape=(solver._B,))
 
 
+# =========================================== ViewerRaycastResult ===========================================
+
+
+@DATA_ORIENTED
+class StructViewerRaycastResult(metaclass=BASE_METACLASS):
+    distance: V_ANNOTATION
+    geom_idx: V_ANNOTATION
+    hit_point: V_ANNOTATION
+    normal: V_ANNOTATION
+    env_idx: V_ANNOTATION
+
+
+def get_viewer_raycast_result():
+    return StructViewerRaycastResult(
+        distance=V(dtype=gs.ti_float, shape=()),
+        geom_idx=V(dtype=gs.ti_int, shape=()),
+        hit_point=V_VEC(3, dtype=gs.ti_float, shape=()),
+        normal=V_VEC(3, dtype=gs.ti_float, shape=()),
+        env_idx=V(dtype=gs.ti_int, shape=()),
+    )
+
+
 DofsState = StructDofsState if gs.use_ndarray else ti.template()
 DofsInfo = StructDofsInfo if gs.use_ndarray else ti.template()
 GeomsState = StructGeomsState if gs.use_ndarray else ti.template()
@@ -1933,3 +1975,4 @@ SDFInfo = StructSDFInfo if gs.use_ndarray else ti.template()
 ContactIslandState = StructContactIslandState if gs.use_ndarray else ti.template()
 DiffContactInput = StructDiffContactInput if gs.use_ndarray else ti.template()
 RigidAdjointCache = StructRigidAdjointCache if gs.use_ndarray else ti.template()
+RaycastResult = StructViewerRaycastResult if gs.use_ndarray else ti.template()
