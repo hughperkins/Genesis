@@ -65,6 +65,11 @@ def _kernel_update_constraint(
             )
 
 
+import os
+enable_parallel_hessian = os.environ.get("GS_SOLVER_HESSIAN_PARALLEL", "1") == "1"
+print('enable_parallel_hessian', enable_parallel_hessian, "control using GS_SOLVER_HESSIAN_PARALLEL")
+
+
 @ti.kernel(fastcache=gs.use_fastcache)
 def _kernel_newton_only_nt_hessian_incremental(
     entities_info: array_class.EntitiesInfo,
@@ -74,7 +79,7 @@ def _kernel_newton_only_nt_hessian_incremental(
 ):
     """Step 4: Newton Hessian update (Newton only)"""
     solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
-    if ti.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
+    if ti.static(static_rigid_sim_config.enable_tiled_cholesky_hessian and enable_parallel_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
