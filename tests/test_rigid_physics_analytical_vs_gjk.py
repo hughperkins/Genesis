@@ -412,9 +412,19 @@ class AnalyticalVsGJKSceneCreator:
         spec.loader.exec_module(narrowphase_modified)
         from genesis.engine.solvers.rigid.collider import narrowphase
 
+        # Store the original to clear its cache
+        original_func = narrowphase.func_convex_convex_contact
+
         self.monkeypatch.setattr(
             narrowphase, "func_convex_convex_contact", narrowphase_modified.func_convex_convex_contact
         )
+
+        # CRITICAL: Clear materialized kernel cache on BOTH the original AND the new function
+        # The original might have cached kernels, and we need to ensure the new one starts fresh
+        if hasattr(original_func, 'materialized_kernels'):
+            original_func.materialized_kernels.clear()
+        if hasattr(narrowphase_modified.func_convex_convex_contact, 'materialized_kernels'):
+            narrowphase_modified.func_convex_convex_contact.materialized_kernels.clear()
 
         # Scene 2: Force GJK for sphere-capsule (using modified narrowphase)
         self.scene_gjk = gs.Scene(
@@ -509,16 +519,40 @@ def test_sphere_capsule_vs_gjk(sphere_pos, capsule_pos, capsule_euler, should_co
     scene_analytical.step()
     scene_gjk.step()
 
+    # DEBUG: Check actual positions and states
+    print(f"\n=== DEBUG for {description} ===")
+    print(f"Expected sphere pos: {sphere_pos}, radius: {sphere_radius}")
+    print(f"Expected capsule pos: {capsule_pos}, euler: {capsule_euler}, radius: {capsule_radius}, half_length: {capsule_half_length}")
+    
     # Verify errno values to ensure correct code path was used
-    print(f"\nTest: {description}")
+    print(f"Test: {description}")
 
     scene_creator.checks_after()
+
+    print(f"Analytical errno: {scene_analytical._sim.rigid_solver._errno[0]} (bit 16: {(scene_analytical._sim.rigid_solver._errno[0] & (1 << 16)) != 0})")
+    print(f"GJK errno: {scene_gjk._sim.rigid_solver._errno[0]} (bit 16: {(scene_gjk._sim.rigid_solver._errno[0] & (1 << 16)) != 0})")
 
     contacts_analytical = scene_analytical.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
     contacts_gjk = scene_gjk.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
 
     has_collision_analytical = contacts_analytical is not None and len(contacts_analytical["geom_a"]) > 0
     has_collision_gjk = contacts_gjk is not None and len(contacts_gjk["geom_a"]) > 0
+
+    print(f"Analytical collision: {has_collision_analytical}")
+    if has_collision_analytical:
+        print(f"  Penetration: {contacts_analytical['penetration'][0]}")
+        print(f"  Normal: {contacts_analytical['normal'][0]}")
+        print(f"  Position: {contacts_analytical['position'][0]}")
+    
+    print(f"GJK collision: {has_collision_gjk}")
+    if has_collision_gjk:
+        print(f"  Penetration: {contacts_gjk['penetration'][0]}")
+        print(f"  Normal: {contacts_gjk['normal'][0]}")
+        print(f"  Position: {contacts_gjk['position'][0]}")
+    else:
+        print(f"  NO COLLISION DETECTED BY GJK!")
+    
+    print("=== END DEBUG ===\n")
     assert has_collision_analytical == should_collide
 
     # First check that both methods agree on whether there's a collision
