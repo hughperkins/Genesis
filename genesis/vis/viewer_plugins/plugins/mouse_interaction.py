@@ -55,6 +55,12 @@ class MouseInteractionPlugin(RaycasterViewerPlugin):
         self._surface_normal: np.ndarray | None = None
         self._plane_rotation_angle: float = 0.0
 
+        # Cached state computed on the main thread for thread-safe access in on_draw().
+        # Quadrants kernels (raycasting, field reads) must not run on the viewer thread.
+        self._cached_closest_hit: "RayHit | None" = None
+        self._cached_held_link_pos: np.ndarray | None = None
+        self._cached_held_link_quat: np.ndarray | None = None
+
     def build(self, viewer, camera: "Node", scene: "Scene"):
         super().build(viewer, camera, scene)
         self._prev_mouse_screen_pos = (self.viewer._viewport_size[0] // 2, self.viewer._viewport_size[1] // 2)
@@ -128,8 +134,18 @@ class MouseInteractionPlugin(RaycasterViewerPlugin):
     def update_on_sim_step(self) -> None:
         super().update_on_sim_step()
 
+        # Cache raycast and link state on the main thread so on_draw() (which may run
+        # on the viewer thread) never invokes Quadrants kernels.
+        mouse_ray: Ray = self._screen_position_to_ray(*self._prev_mouse_screen_pos)
+        if self._raycaster is not None and self._raycaster.bvh is not None:
+            self._cached_closest_hit = self._raycaster.cast(mouse_ray[0], mouse_ray[1])
+        else:
+            self._cached_closest_hit = None
+
         if self._held_link:
-            mouse_ray: Ray = self._screen_position_to_ray(*self._prev_mouse_screen_pos)
+            self._cached_held_link_pos = tensor_to_array(self._held_link.get_pos())
+            self._cached_held_link_quat = tensor_to_array(self._held_link.get_quat())
+
             assert self._mouse_drag_plane is not None
             ray_hit: RayHit = plane_raycast(*self._mouse_drag_plane, mouse_ray)
 
@@ -153,15 +169,16 @@ class MouseInteractionPlugin(RaycasterViewerPlugin):
         if self.scene._visualizer is not None and self.scene._visualizer.is_built:
             self.scene.clear_debug_objects()
             mouse_ray: Ray = self._screen_position_to_ray(*self._prev_mouse_screen_pos)
-            closest_hit: RayHit = self._raycaster.cast(mouse_ray[0], mouse_ray[1])
 
             if self._held_link:
                 assert self._mouse_drag_plane is not None
                 assert self._held_point_local is not None
 
-                # Draw held point
-                link_pos = tensor_to_array(self._held_link.get_pos())
-                link_quat = tensor_to_array(self._held_link.get_quat())
+                # Use cached link state (Quadrants field reads are not thread-safe)
+                link_pos = self._cached_held_link_pos
+                link_quat = self._cached_held_link_quat
+                if link_pos is None or link_quat is None:
+                    return
                 held_point_world = gu.transform_by_trans_quat(self._held_point_local, link_pos, link_quat)
 
                 plane_hit: RayHit | None = plane_raycast(*self._mouse_drag_plane, mouse_ray)
@@ -177,7 +194,6 @@ class MouseInteractionPlugin(RaycasterViewerPlugin):
                         radius=0.005,
                         color=self.color,
                     )
-                    # draw the mouse drag plane as a flat box around the mouse position
                     plane_normal, _plane_dist = self._mouse_drag_plane
                     self._draw_plane(
                         plane_normal,
@@ -187,10 +203,11 @@ class MouseInteractionPlugin(RaycasterViewerPlugin):
                     )
 
             else:
-                if closest_hit is not None:
+                # Use cached raycast result (Quadrants kernels are not thread-safe)
+                if self._cached_closest_hit is not None:
                     self.scene.draw_debug_arrow(
-                        closest_hit.position,
-                        closest_hit.normal * 0.25,
+                        self._cached_closest_hit.position,
+                        self._cached_closest_hit.normal * 0.25,
                         color=self.color,
                     )
 
