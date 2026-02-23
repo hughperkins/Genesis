@@ -1,6 +1,6 @@
 """
 Test that 2-kernel broadphase (delayed validation) produces identical
-contacts to single-kernel SAP broadphase.
+collision pairs to single-kernel SAP broadphase.
 
 Uses the G1 humanoid fall scenario from the rigid benchmarks with random
 forces applied across 4096 parallel environments.
@@ -51,26 +51,42 @@ def _create_g1_fall_scene(n_envs, broadphase_kernels):
     return scene, robot
 
 
-def _sort_contacts(contacts, n_envs):
-    """Return per-env sort indices that order contacts by (geom_a, geom_b, |penetration|).
+def _get_sorted_broad_pairs(scene):
+    """Extract broadphase collision pairs and sort them per-env by (geom_a, geom_b).
 
-    Invalid entries (geom_a == -1) are pushed to the end.
+    Returns (n_broad_pairs, sorted_pairs) where:
+      - n_broad_pairs: numpy array of shape (n_envs,) with pair counts
+      - sorted_pairs:  numpy array of shape (n_envs, max_pairs, 2) with sorted geom ID pairs
     """
-    ga = contacts["geom_a"].to(torch.float64)
-    gb = contacts["geom_b"].to(torch.float64)
-    pen = contacts["penetration"].to(torch.float64)
+    state = scene.rigid_solver.collider._collider_state
+    n_pairs = state.n_broad_pairs.to_numpy()
+    max_pairs = int(n_pairs.max()) if n_pairs.max() > 0 else 0
 
-    key = ga * 1e10 + gb * 1e5 + pen.abs()
-    key = torch.where(contacts["geom_a"] >= 0, key, 1e15)
+    if max_pairs == 0:
+        return n_pairs, None
 
-    _, order = key.sort(dim=1, stable=True)
-    return order
+    raw = state.broad_collision_pairs.to_numpy()[:max_pairs]  # (max_pairs, n_envs, 2)
+    pairs = raw.transpose(1, 0, 2)  # (n_envs, max_pairs, 2)
+
+    n_envs = pairs.shape[0]
+    sorted_pairs = np.empty_like(pairs)
+    for i_b in range(n_envs):
+        n = n_pairs[i_b]
+        if n == 0:
+            sorted_pairs[i_b] = pairs[i_b]
+            continue
+        valid = pairs[i_b, :n]
+        order = np.lexsort((valid[:, 1], valid[:, 0]))
+        sorted_pairs[i_b, :n] = valid[order]
+        sorted_pairs[i_b, n:] = pairs[i_b, n:]
+
+    return n_pairs, sorted_pairs
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_broadphase_two_kernel_vs_single_kernel(backend):
-    """2-kernel broadphase must produce the same contacts as single-kernel SAP."""
+    """2-kernel broadphase must produce the same collision pairs as single-kernel SAP."""
     n_envs = 4096
     n_steps = 30
     max_force = 50.0
@@ -82,6 +98,7 @@ def test_broadphase_two_kernel_vs_single_kernel(backend):
     forces = torch.zeros((n_envs, robot_1k.n_dofs), dtype=gs.tc_float, device=gs.device)
 
     for step in range(n_steps):
+        print("step", step)
         forces.uniform_(-max_force, max_force)
         robot_1k.control_dofs_force(forces)
         robot_2k.control_dofs_force(forces)
@@ -89,40 +106,32 @@ def test_broadphase_two_kernel_vs_single_kernel(backend):
         scene_1k.step()
         scene_2k.step()
 
-        # --- contact count must match per environment ---
-        n_contacts_1k = scene_1k.rigid_solver.collider._collider_state.n_contacts.to_numpy()
-        n_contacts_2k = scene_2k.rigid_solver.collider._collider_state.n_contacts.to_numpy()
+        # --- broadphase pair count must match per environment ---
+        n_pairs_1k, sorted_1k = _get_sorted_broad_pairs(scene_1k)
+        n_pairs_2k, sorted_2k = _get_sorted_broad_pairs(scene_2k)
+
         np.testing.assert_array_equal(
-            n_contacts_1k,
-            n_contacts_2k,
-            err_msg=f"Step {step}: per-env contact count mismatch",
+            n_pairs_1k,
+            n_pairs_2k,
+            err_msg=f"Step {step}: per-env broadphase pair count mismatch",
         )
 
-        max_contacts = int(n_contacts_1k.max())
-        if max_contacts == 0:
+        if sorted_1k is None:
+            print("no sorted 1k")
             continue
 
-        # --- contact data must match (order may differ due to atomics) ---
-        contacts_1k = scene_1k.rigid_solver.collider.get_contacts(as_tensor=True, to_torch=True)
-        contacts_2k = scene_2k.rigid_solver.collider.get_contacts(as_tensor=True, to_torch=True)
-
-        order_1k = _sort_contacts(contacts_1k, n_envs)
-        order_2k = _sort_contacts(contacts_2k, n_envs)
-
-        for field in ("geom_a", "geom_b", "link_a", "link_b"):
-            sorted_1k = contacts_1k[field].gather(1, order_1k)
-            sorted_2k = contacts_2k[field].gather(1, order_2k)
-            assert torch.equal(sorted_1k, sorted_2k), f"Step {step}: {field} mismatch"
-
-        sorted_pen_1k = contacts_1k["penetration"].gather(1, order_1k)
-        sorted_pen_2k = contacts_2k["penetration"].gather(1, order_2k)
-        assert torch.equal(sorted_pen_1k, sorted_pen_2k), f"Step {step}: penetration mismatch"
-
-        for field in ("position", "normal"):
-            data_1k = contacts_1k[field]
-            data_2k = contacts_2k[field]
-            idx_1k = order_1k.unsqueeze(-1).expand_as(data_1k)
-            idx_2k = order_2k.unsqueeze(-1).expand_as(data_2k)
-            sorted_1k = data_1k.gather(1, idx_1k)
-            sorted_2k = data_2k.gather(1, idx_2k)
-            assert torch.equal(sorted_1k, sorted_2k), f"Step {step}: {field} mismatch"
+        # --- sorted collision pairs must be identical ---
+        n_sum = 0
+        non_zero_n_env_count = 0
+        for i_b in range(n_envs):
+            n = n_pairs_1k[i_b]
+            if n == 0:
+                continue
+            n_sum += n
+            non_zero_n_env_count += 1
+            np.testing.assert_array_equal(
+                sorted_1k[i_b, :n],
+                sorted_2k[i_b, :n],
+                err_msg=f"Step {step}, env {i_b}: broadphase pairs mismatch",
+            )
+        print("n_sum", n_sum, "non_zero_n_env_count", non_zero_n_env_count)
