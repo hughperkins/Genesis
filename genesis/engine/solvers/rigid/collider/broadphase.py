@@ -564,7 +564,7 @@ def func_broad_phase_validate_candidates(
         ):
             continue
 
-        if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, geoms_state, geoms_info):
+        if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
             if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
                 i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -989,7 +989,7 @@ def func_broad_phase_sap_sweep_only(
                         ):
                             continue
 
-                        if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, geoms_state, geoms_info):
+                        if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
                             # Clear collision normal cache if not in contact
                             if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
                                 i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
@@ -1044,7 +1044,7 @@ def func_broad_phase_sap_sweep_only(
                             ):
                                 continue
 
-                            if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, geoms_state, geoms_info):
+                            if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
                                 # Clear collision normal cache if not in contact
                                 if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
                                     i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
@@ -1078,7 +1078,7 @@ def func_broad_phase_sap_sweep_only(
                                 ):
                                     continue
 
-                                if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, geoms_state, geoms_info):
+                                if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
                                     # Clear collision normal cache if not in contact
                                     i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
