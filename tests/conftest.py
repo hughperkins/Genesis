@@ -650,7 +650,7 @@ def initialize_genesis(request, monkeypatch, tmp_path, backend, precision, perfo
         yield
     finally:
         gs.destroy()
-        # Double garbage collection is over-zealous since Quadrants 2.2.1 but let's do it anyway
+        # Double garbage collection is over-zealous since gstaichi 2.2.1 but let's do it anyway
         gc.collect()
         gc.collect()
 
