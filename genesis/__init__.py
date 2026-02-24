@@ -81,6 +81,8 @@ def init(
     if precision not in ("32", "64"):
         raise_exception(f"Unsupported precision type: ~~<{precision}>~~")
 
+    backend = qd.python
+
     # Get device and backend
     global device
     if backend is None and debug:

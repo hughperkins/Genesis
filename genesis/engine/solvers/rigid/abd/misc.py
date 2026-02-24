@@ -170,7 +170,7 @@ def kernel_init_dof_fields(
     qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         dofs_state.ctrl_mode[i_d, i_b] = gs.CTRL_MODE.FORCE
-        dofs_state.ctrl_force[i_d, i_b] = gs.qd_float(0.0)
+        dofs_state.ctrl_force[i_d, i_b] = 0.0
 
     if qd.static(static_rigid_sim_config.use_hibernation):
         qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
