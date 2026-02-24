@@ -166,7 +166,7 @@ def init(
             )
 
     if (
-        (backend == gs.cpu and device.type == "cpu")
+        (backend in (gs.cpu, qd.python) and device.type == "cpu")
         or (backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type == "cuda")
         or (backend == _gs_backend.metal and device.type == "mps" and (_use_ndarray or _TORCH_MPS_SUPPORT_DLPACK_FIELD))
     ):
