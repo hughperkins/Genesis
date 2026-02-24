@@ -81,7 +81,8 @@ def init(
     if precision not in ("32", "64"):
         raise_exception(f"Unsupported precision type: ~~<{precision}>~~")
 
-    backend = qd.python
+    _qd_arch = qd.python
+    backend = _gs_backend.cpu
 
     # Get device and backend
     global device
@@ -166,7 +167,7 @@ def init(
             )
 
     if (
-        (backend in (gs.cpu, qd.python) and device.type == "cpu")
+        (backend == gs.cpu and device.type == "cpu")
         or (backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type == "cuda")
         or (backend == _gs_backend.metal and device.type == "mps" and (_use_ndarray or _TORCH_MPS_SUPPORT_DLPACK_FIELD))
     ):
@@ -276,7 +277,7 @@ def init(
     qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
     with redirect_stdout(_qd_outputs):
         qd.init(
-            arch=getattr(qd, backend.name),
+            arch=_qd_arch,
             enable_fallback=False,
             # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
             debug=qd_debug and backend == _gs_backend.cpu,
