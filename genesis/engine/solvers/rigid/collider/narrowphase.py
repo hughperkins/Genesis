@@ -5,7 +5,7 @@ This module contains SDF-based contact detection, convex-convex contact,
 terrain detection, box-box contact, and multi-contact search algorithms.
 """
 
-import sys
+
 from enum import IntEnum
 
 import quadrants as qd
@@ -541,22 +541,7 @@ def func_convex_convex_contact(
     errno: array_class.V_ANNOTATION,
 ):
     if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
-        # Plane-box collision doesn't use perturbations, so call original function
-        if qd.static(sys.platform == "darwin"):
-            func_plane_box_contact(
-                i_ga=i_ga,
-                i_gb=i_gb,
-                i_b=i_b,
-                geoms_state=geoms_state,
-                geoms_info=geoms_info,
-                geoms_init_AABB=geoms_init_AABB,
-                verts_info=verts_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-                collider_state=collider_state,
-                collider_info=collider_info,
-                collider_static_config=collider_static_config,
-                errno=errno,
-            )
+        pass
     else:
         EPS = rigid_global_info.EPS[None]
 
@@ -1010,7 +995,7 @@ def func_narrow_phase_convex_vs_convex(
                     and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX
                 )
             ):
-                if qd.static(sys.platform == "darwin"):
+                if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
                     func_convex_convex_contact(
                         i_ga=i_ga,
                         i_gb=i_gb,
@@ -1039,36 +1024,6 @@ def func_narrow_phase_convex_vs_convex(
                         diff_contact_input=diff_contact_input,
                         errno=errno,
                     )
-                else:
-                    if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
-                        func_convex_convex_contact(
-                            i_ga=i_ga,
-                            i_gb=i_gb,
-                            i_b=i_b,
-                            links_state=links_state,
-                            links_info=links_info,
-                            geoms_state=geoms_state,
-                            geoms_info=geoms_info,
-                            geoms_init_AABB=geoms_init_AABB,
-                            verts_info=verts_info,
-                            faces_info=faces_info,
-                            edges_info=edges_info,
-                            rigid_global_info=rigid_global_info,
-                            static_rigid_sim_config=static_rigid_sim_config,
-                            collider_state=collider_state,
-                            collider_info=collider_info,
-                            collider_static_config=collider_static_config,
-                            mpr_state=mpr_state,
-                            mpr_info=mpr_info,
-                            gjk_state=gjk_state,
-                            gjk_info=gjk_info,
-                            gjk_static_config=gjk_static_config,
-                            sdf_info=sdf_info,
-                            support_field_info=support_field_info,
-                            # FIXME: Passing nested data structure as input argument is not supported for now.
-                            diff_contact_input=diff_contact_input,
-                            errno=errno,
-                        )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
@@ -1164,22 +1119,21 @@ def func_narrow_phase_convex_specializations(
             if geoms_info.type[i_ga] > geoms_info.type[i_gb]:
                 i_ga, i_gb = i_gb, i_ga
 
-            if qd.static(sys.platform != "darwin"):
-                if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
-                    func_plane_box_contact(
-                        i_ga,
-                        i_gb,
-                        i_b,
-                        geoms_state,
-                        geoms_info,
-                        geoms_init_AABB,
-                        verts_info,
-                        static_rigid_sim_config,
-                        collider_state,
-                        collider_info,
-                        collider_static_config,
-                        errno,
-                    )
+            if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
+                func_plane_box_contact(
+                    i_ga,
+                    i_gb,
+                    i_b,
+                    geoms_state,
+                    geoms_info,
+                    geoms_init_AABB,
+                    verts_info,
+                    static_rigid_sim_config,
+                    collider_state,
+                    collider_info,
+                    collider_static_config,
+                    errno,
+                )
 
             if qd.static(static_rigid_sim_config.box_box_detection):
                 if geoms_info.type[i_ga] == gs.GEOM_TYPE.BOX and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
