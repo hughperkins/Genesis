@@ -186,6 +186,8 @@ class ConstraintSolver:
             self._solver._static_rigid_sim_config,
         )
 
+        active_before = self.constraint_state.active.to_numpy().copy()
+
         func_solve_body(
             self._solver.entities_info,
             self._solver.dofs_state,
@@ -193,6 +195,8 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
+
+        self._print_active_grid(active_before)
 
         func_update_qacc(
             self._solver.dofs_state,
@@ -210,6 +214,21 @@ class ConstraintSolver:
             self.constraint_state,
             self._solver._static_rigid_sim_config,
         )
+
+    def _print_active_grid(self, active_before):
+        active_after = self.constraint_state.active.to_numpy()  # (max_constraints, B)
+        n_constraints = self.constraint_state.n_constraints.to_numpy()  # (B,)
+        n_envs = min(active_after.shape[1], 32)
+        max_c = int(n_constraints[:n_envs].max())
+        if max_c == 0:
+            return
+        changed = (active_after[:max_c, :n_envs] != active_before[:max_c, :n_envs]).astype(int)
+        header = "     " + "".join(f"{e:>2}" for e in range(n_envs))
+        lines = [f"=== active changed grid (constraint x env) ===", header]
+        for c in range(max_c):
+            row = "".join(f"{changed[c, e]:>2}" for e in range(n_envs))
+            lines.append(f"c{c:>3} {row}")
+        print("\n".join(lines), flush=True)
 
     def noslip(self):
         constraint_noslip.kernel_build_efc_AR_b(
