@@ -73,21 +73,23 @@ def _kernel_newton_only_nt_hessian(
     static_rigid_sim_config: ti.template(),
 ):
     """Step 4: Newton Hessian update (Newton only)"""
-    solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
-    if ti.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
-        solver.func_cholesky_factor_direct_tiled(
+    _B = constraint_state.jac.shape[2]
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        is_degenerated = solver.func_hessian_and_cholesky_factor_incremental_batch(
+            i_b,
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-    else:
-        _B = constraint_state.jac.shape[2]
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
-        for i_b in range(_B):
-            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-                solver.func_cholesky_factor_direct_batch(
-                    i_b=i_b, constraint_state=constraint_state, rigid_global_info=rigid_global_info
-                )
+        if is_degenerated:
+            solver.func_hessian_and_cholesky_factor_direct_batch(
+                i_b,
+                entities_info=entities_info,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
