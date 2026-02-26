@@ -186,6 +186,8 @@ class ConstraintSolver:
             self._solver._static_rigid_sim_config,
         )
 
+        # active_before = self.constraint_state.active.to_numpy().copy()
+
         func_solve_body(
             self._solver.entities_info,
             self._solver.dofs_state,
@@ -193,6 +195,9 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
+
+        # self._print_warp_efficiency(active_before)
+        # self._print_changed_histogram(active_before)
 
         func_update_qacc(
             self._solver.dofs_state,
@@ -210,6 +215,72 @@ class ConstraintSolver:
             self.constraint_state,
             self._solver._static_rigid_sim_config,
         )
+
+    def _print_warp_efficiency(self, active_before):
+        active_after = self.constraint_state.active.to_numpy()
+        n_constraints = self.constraint_state.n_constraints.to_numpy()
+        env_order = self.constraint_state.env_order.to_numpy()
+        _B = active_after.shape[1]
+        max_c = int(n_constraints.max())
+        if max_c == 0:
+            return
+        changed = active_after[:max_c, :] != active_before[:max_c, :]
+        all_counts = changed.sum(axis=0)
+        sorted_counts = all_counts[env_order]
+        warp_size = 32
+        n_warps = (_B + warp_size - 1) // warp_size
+        total_useful = 0
+        total_scheduled = 0
+        for w in range(n_warps):
+            warp_counts = sorted_counts[w * warp_size : (w + 1) * warp_size]
+            warp_max = int(warp_counts.max())
+            total_useful += int(warp_counts.sum())
+            total_scheduled += len(warp_counts) * warp_max
+        if total_scheduled == 0:
+            print("warp efficiency: n/a (no changes)", flush=True)
+            return
+        efficiency = total_useful / total_scheduled * 100
+        unsorted_counts = all_counts
+        unsorted_scheduled = 0
+        for w in range(n_warps):
+            warp_counts = unsorted_counts[w * warp_size : (w + 1) * warp_size]
+            unsorted_scheduled += len(warp_counts) * int(warp_counts.max())
+        unsorted_eff = total_useful / unsorted_scheduled * 100 if unsorted_scheduled > 0 else 0
+        print(
+            f"warp efficiency: {efficiency:5.1f}% (unsorted: {unsorted_eff:5.1f}%)  "
+            f"useful={total_useful} scheduled={total_scheduled}",
+            flush=True,
+        )
+
+    def _print_changed_histogram(self, active_before):
+        import numpy as np
+
+        active_after = self.constraint_state.active.to_numpy()
+        n_constraints = self.constraint_state.n_constraints.to_numpy()
+        n_envs = min(active_after.shape[1], 32)
+        max_c = int(n_constraints[:n_envs].max())
+        if max_c == 0:
+            return
+        changed = active_after[:max_c, :n_envs] != active_before[:max_c, :n_envs]
+        counts = changed.sum(axis=0)
+        max_count = int(counts.max())
+        if max_count == 0:
+            return
+        n_bins = 10
+        bin_size = max(1, (max_count + n_bins) // n_bins)
+        bins = np.arange(0, max_count + bin_size + 1, bin_size)
+        hist, _ = np.histogram(counts, bins=bins)
+        bar_width = 40
+        lines = [f"=== changed constraints per env (first {n_envs} envs, 1 warp) ==="]
+        for i, freq in enumerate(hist):
+            lo = int(bins[i])
+            hi = int(bins[i + 1] - 1)
+            label = f"{lo:3d}" if lo == hi else f"{lo:3d}-{hi:3d}"
+            bar_len = int(freq / n_envs * bar_width)
+            bar = "#" * bar_len
+            lines.append(f"  {label} changed: {freq:3d} envs  |{bar:<{bar_width}}| {freq/n_envs*100:5.1f}%")
+        lines.append(f"  min={int(counts.min())} max={max_count} mean={counts.mean():.1f} median={int(np.median(counts))}")
+        print("\n".join(lines), flush=True)
 
     def noslip(self):
         constraint_noslip.kernel_build_efc_AR_b(
