@@ -620,7 +620,86 @@ def box_pyramid(solver, n_envs, n_cubes, enable_island, gjk, enable_mujoco_compa
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
-@pytest.mark.parametrize("runnable", ["anymal_c", "batched_franka"])
+def _anymal(solver, n_envs, gjk, control):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            **get_rigid_solver_options(
+                dt=STEP_DT,
+                **(dict(constraint_solver=solver) if solver is not None else {}),
+                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            )
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    robot = scene.add_entity(
+        gs.morphs.URDF(
+            **get_file_morph_options(
+                file="urdf/anymal_c/urdf/anymal_c.urdf",
+                pos=(0, 0, 0.8),
+            )
+        ),
+    )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    n_motors = robot.n_dofs - 6
+    motors_dof_idx = slice(6, None)
+    robot.set_dofs_kp(torch.full((n_motors,), 1000.0, dtype=gs.tc_float, device=gs.device), motors_dof_idx)
+    pos_shape = (max(n_envs, 1), n_motors) if n_envs > 0 else (n_motors,)
+    robot.control_dofs_position(torch.zeros(pos_shape, dtype=gs.tc_float, device=gs.device), motors_dof_idx)
+
+    if control == "per_env":
+        rand_shape = (n_envs, n_motors)
+    elif control == "uniform":
+        rand_shape = (n_motors,)
+    else:
+        rand_shape = None
+
+    num_steps = 0
+    is_recording = False
+    time_start = time.time()
+    while True:
+        if rand_shape is not None:
+            target = torch.rand(rand_shape, dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05
+            if control == "uniform" and n_envs > 0:
+                target = target.unsqueeze(0).expand(n_envs, -1)
+            robot.control_dofs_position(target, motors_dof_idx)
+        scene.step()
+        # profiler_step()
+        time_elapsed = time.time() - time_start
+        if is_recording:
+            num_steps += 1
+            if time_elapsed > DURATION_RECORD:
+                break
+        elif time_elapsed > DURATION_WARMUP:
+            time_start = time.time()
+            is_recording = True
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
+    realtime_factor = runtime_fps * STEP_DT
+
+    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+
+
+@pytest.fixture
+def anymal_zero(solver, n_envs, gjk):
+    return _anymal(solver, n_envs, gjk, control=None)
+
+
+@pytest.fixture
+def anymal_uniform(solver, n_envs, gjk):
+    return _anymal(solver, n_envs, gjk, control="uniform")
+
+
+@pytest.fixture
+def anymal_random(solver, n_envs, gjk):
+    return _anymal(solver, n_envs, gjk, control="per_env")
+
+
+@pytest.mark.parametrize("runnable", ["anymal_c", "batched_franka", "anymal_zero", "anymal_uniform", "anymal_random"])
 @pytest.mark.parametrize("solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
 @pytest.mark.parametrize("n_envs", [30000])
 @pytest.mark.parametrize("gjk", [False, True])
