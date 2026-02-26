@@ -186,6 +186,8 @@ class ConstraintSolver:
             self._solver._static_rigid_sim_config,
         )
 
+        func_compute_env_order(self.constraint_state)
+
         func_solve_body(
             self._solver.entities_info,
             self._solver.dofs_state,
@@ -3010,6 +3012,37 @@ def func_solve_iter(
         )
 
 
+@qd.kernel(fastcache=gs.use_fastcache)
+def func_compute_env_order(
+    constraint_state: array_class.ConstraintState,
+):
+    """Sort env indices by number of changed constraints so that envs with similar workloads
+    land in the same warp, reducing GPU thread divergence during incremental Cholesky updates."""
+    _B = constraint_state.active.shape[1]
+
+    for i_b in range(_B):
+        count = 0
+        for i_c in range(constraint_state.n_constraints[i_b]):
+            if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
+                count += 1
+        constraint_state.incr_n_changed[i_b] = count
+        constraint_state.env_order[i_b] = i_b
+
+    qd.loop_config(serialize=True)
+    for i in range(_B):
+        min_val = constraint_state.incr_n_changed[constraint_state.env_order[i]]
+        min_idx = i
+        for j in range(i + 1, _B):
+            val = constraint_state.incr_n_changed[constraint_state.env_order[j]]
+            if val < min_val:
+                min_val = val
+                min_idx = j
+        if min_idx != i:
+            tmp = constraint_state.env_order[i]
+            constraint_state.env_order[i] = constraint_state.env_order[min_idx]
+            constraint_state.env_order[min_idx] = tmp
+
+
 @qd.perf_dispatch(
     get_geometry_hash=lambda *args, **kwargs: (*args, frozendict(kwargs)), warmup=3, active=3, repeat_after_seconds=1.0
 )
@@ -3034,7 +3067,8 @@ def func_solve_body_monolith(
     _B = constraint_state.grad.shape[1]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
-    for i_b in range(_B):
+    for i_t in range(_B):
+        i_b = constraint_state.env_order[i_t]
         if constraint_state.n_constraints[i_b] > 0:
             for _ in range(rigid_global_info.iterations[None]):
                 func_solve_iter(

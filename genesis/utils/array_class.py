@@ -240,6 +240,9 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
     incr_changed_idx: V_ANNOTATION
     incr_n_changed: V_ANNOTATION
+    # Env processing order sorted by number of changed constraints, so that envs with similar workloads
+    # land in the same warp, reducing GPU thread divergence during incremental Cholesky updates.
+    env_order: V_ANNOTATION
     # Backward gradients
     dL_dqacc: V_ANNOTATION
     dL_dM: V_ANNOTATION
@@ -316,6 +319,7 @@ def get_constraint_state(constraint_solver, solver):
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
+        env_order=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
         efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
         active=V(dtype=gs.qd_bool, shape=(len_constraints_, _B)),
