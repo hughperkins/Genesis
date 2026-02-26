@@ -3017,30 +3017,84 @@ def func_compute_env_order(
     constraint_state: array_class.ConstraintState,
 ):
     """Sort env indices by number of changed constraints so that envs with similar workloads
-    land in the same warp, reducing GPU thread divergence during incremental Cholesky updates."""
-    _B = constraint_state.active.shape[1]
+    land in the same warp, reducing GPU thread divergence during incremental Cholesky updates.
 
+    Phase 1: compute change counts per env (parallel, one thread per env).
+    Phase 2: counting sort within blocks of SORT_BLOCK envs using shared memory and cooperative threading.
+    The counting sort is O(SORT_BLOCK) per block, compared to O(SORT_BLOCK^2) for comparison-based sorts.
+    """
+    _B = constraint_state.active.shape[1]
+    SORT_BLOCK = qd.static(1024)
+    BLOCK_DIM = qd.static(32)
+    MAX_CHANGES = qd.static(64)
+    n_sort_blocks = (_B + SORT_BLOCK - 1) // SORT_BLOCK
+
+    # Phase 1: compute change counts per env (parallel, one thread per env)
     for i_b in range(_B):
         count = 0
         for i_c in range(constraint_state.n_constraints[i_b]):
             if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
                 count += 1
         constraint_state.incr_n_changed[i_b] = count
-        constraint_state.env_order[i_b] = i_b
 
-    qd.loop_config(serialize=True)
-    for i in range(_B):
-        min_val = constraint_state.incr_n_changed[constraint_state.env_order[i]]
-        min_idx = i
-        for j in range(i + 1, _B):
-            val = constraint_state.incr_n_changed[constraint_state.env_order[j]]
-            if val < min_val:
-                min_val = val
-                min_idx = j
-        if min_idx != i:
-            tmp = constraint_state.env_order[i]
-            constraint_state.env_order[i] = constraint_state.env_order[min_idx]
-            constraint_state.env_order[min_idx] = tmp
+    # Phase 2: counting sort within blocks using shared memory
+    qd.loop_config(block_dim=BLOCK_DIM)
+    for i in range(n_sort_blocks * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_block = i // BLOCK_DIM
+        if i_block >= n_sort_blocks:
+            continue
+        block_start = i_block * SORT_BLOCK
+        block_len = SORT_BLOCK
+        if block_start + block_len > _B:
+            block_len = _B - block_start
+
+        histogram = qd.simt.block.SharedArray((MAX_CHANGES,), qd.i32)
+        output = qd.simt.block.SharedArray((SORT_BLOCK,), qd.i32)
+
+        # Clear histogram
+        idx = tid
+        while idx < MAX_CHANGES:
+            histogram[idx] = 0
+            idx += BLOCK_DIM
+        qd.simt.block.sync()
+
+        # Build histogram (atomic adds to shared memory)
+        idx = tid
+        while idx < block_len:
+            c = constraint_state.incr_n_changed[block_start + idx]
+            if c >= MAX_CHANGES:
+                c = MAX_CHANGES - 1
+            qd.atomic_add(histogram[c], 1)
+            idx += BLOCK_DIM
+        qd.simt.block.sync()
+
+        # Exclusive prefix sum (single thread, only ~64 iterations)
+        if tid == 0:
+            running = 0
+            for c in range(MAX_CHANGES):
+                old_val = histogram[c]
+                histogram[c] = running
+                running += old_val
+        qd.simt.block.sync()
+
+        # Scatter env indices to sorted positions (atomic increment for stable positioning)
+        idx = tid
+        while idx < block_len:
+            c = constraint_state.incr_n_changed[block_start + idx]
+            if c >= MAX_CHANGES:
+                c = MAX_CHANGES - 1
+            pos = qd.atomic_add(histogram[c], 1)
+            output[pos] = block_start + idx
+            idx += BLOCK_DIM
+        qd.simt.block.sync()
+
+        # Write sorted order back to global memory
+        idx = tid
+        while idx < block_len:
+            constraint_state.env_order[block_start + idx] = output[idx]
+            idx += BLOCK_DIM
+        qd.simt.block.sync()
 
 
 @qd.perf_dispatch(
