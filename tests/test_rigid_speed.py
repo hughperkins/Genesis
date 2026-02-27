@@ -170,7 +170,53 @@ class TestRigidSpeed(unittest.TestCase):
             gs.destroy()
             return result
 
-        funcs = [run_random, run_anymal_c, run_batched_franka]
+        def run_uniform(solver):
+            gs.init(backend=gs.gpu, logging_level="warning", precision="32", seed=0)
+
+            scene = gs.Scene(
+                show_viewer=False,
+                viewer_options=gs.options.ViewerOptions(
+                    camera_pos=(3.5, 0.0, 2.5),
+                    camera_lookat=(0.0, 0.0, 0.5),
+                    camera_fov=40,
+                ),
+                rigid_options=gs.options.RigidOptions(
+                    dt=0.01,
+                    constraint_solver=solver,
+                ),
+            )
+
+            ########################## entities ##########################
+            plane = scene.add_entity(
+                gs.morphs.Plane(),
+            )
+
+            robot = scene.add_entity(
+                gs.morphs.URDF(
+                    file="urdf/anymal_c/urdf/anymal_c.urdf",
+                    pos=(0, 0, 0.8),
+                ),
+                visualize_contact=True,
+            )
+
+            ########################## build ##########################
+            scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
+
+            vec_fps = []
+            robot.set_dofs_kp(np.full(12, 1000), np.arange(6, 18))
+            dofs = torch.arange(6, 18).cuda()
+            robot.control_dofs_position((torch.rand((1, 12), device="cuda") * 0.1 - 0.05).expand(n_envs, -1), dofs)
+            for i in range(1000):
+                robot.control_dofs_position((torch.rand((1, 12), device="cuda") * 0.1 - 0.05).expand(n_envs, -1), dofs)
+                scene.step()
+                vec_fps.append(scene.FPS_tracker.total_fps)
+
+            total_fps = 1.0 / (1.0 / np.array(vec_fps[-n_frame_fps:])).mean()
+            result = f"random \t| {solver} \t| {total_fps:,.2f} fps \t| {n_envs} envs"
+            gs.destroy()
+            return result
+
+        funcs = [run_uniform, run_random, run_anymal_c]
         solvers = [gs.constraint_solver.CG, gs.constraint_solver.Newton]
         results = []
 
