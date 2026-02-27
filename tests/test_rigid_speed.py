@@ -212,7 +212,7 @@ class TestRigidSpeed(unittest.TestCase):
                 vec_fps.append(scene.FPS_tracker.total_fps)
 
             total_fps = 1.0 / (1.0 / np.array(vec_fps[-n_frame_fps:])).mean()
-            result = f"random \t| {solver} \t| {total_fps:,.2f} fps \t| {n_envs} envs"
+            result = f"uniform \t| {solver} \t| {total_fps:,.2f} fps \t| {n_envs} envs"
             gs.destroy()
             return result
 
