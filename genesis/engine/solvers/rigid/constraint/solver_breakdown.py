@@ -192,12 +192,12 @@ _graph_while_counter = None
 
 def _get_graph_while_counter():
     global _graph_while_counter
-    if _graph_while_counter is None or getattr(_graph_while_counter, 'arr', None) is None:
+    if _graph_while_counter is None or getattr(_graph_while_counter, "arr", None) is None:
         _graph_while_counter = V(dtype=gs.qd_int, shape=(1,))
     return _graph_while_counter
 
 
-@ti.kernel(graph_while='counter', fastcache=gs.use_fastcache)
+@ti.kernel(graph_while="counter", fastcache=gs.use_fastcache)
 def _kernel_solve_graph_while(
     entities_info: array_class.EntitiesInfo,
     dofs_state: array_class.DofsState,
