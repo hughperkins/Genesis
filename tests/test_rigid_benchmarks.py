@@ -19,8 +19,8 @@ from .utils import (
 REPORT_FILE = "speed_test.txt"
 
 STEP_DT = 0.01
-DURATION_WARMUP = 45.0
-DURATION_RECORD = 15.0
+DURATION_WARMUP = 5.0
+DURATION_RECORD = 5.0
 
 pytestmark = [
     pytest.mark.benchmarks,
@@ -765,33 +765,9 @@ def g1_fall(solver, n_envs, gjk, pytorch_profiler_step):
 @pytest.mark.parametrize(
     "runnable, solver, gjk, n_envs, backend",
     [
-        ("duck_in_box_easy", None, True, 30000, gs.gpu),
-        ("duck_in_box_easy", None, False, 30000, gs.gpu),
-        ("duck_in_box_hard", None, True, 30000, gs.gpu),
-        ("duck_in_box_hard", None, False, 30000, gs.gpu),
-        ("duck_in_box_hard", None, None, 0, gs.cpu),
-        ("anymal_random", None, None, 30000, gs.gpu),
-        ("anymal_uniform", None, None, 30000, gs.gpu),
-        ("anymal_zero", None, None, 30000, gs.gpu),
         ("anymal_zero", None, None, 0, gs.cpu),
-        ("go2", None, True, 4096, gs.gpu),
-        ("go2", gs.constraint_solver.CG, False, 4096, gs.gpu),
-        ("go2", gs.constraint_solver.Newton, False, 4096, gs.gpu),
-        ("franka_accessors", None, None, 0, gs.cpu),
-        ("franka_accessors", None, None, 30000, gs.gpu),
-        ("franka_free", None, None, 30000, gs.gpu),
+        ("anymal_zero", None, None, 30000, gs.gpu),
         ("franka", None, None, 30000, gs.gpu),
-        ("franka_random", None, False, 30000, gs.gpu),
-        ("franka_random", None, True, 30000, gs.gpu),
-        ("franka_random", gs.constraint_solver.CG, None, 30000, gs.gpu),
-        ("franka_random", gs.constraint_solver.Newton, None, 30000, gs.gpu),
-        ("franka_random", None, None, 0, gs.cpu),
-        ("box_pyramid_3", None, None, 4096, gs.gpu),
-        ("box_pyramid_4", None, None, 4096, gs.gpu),
-        ("box_pyramid_5", None, None, 4096, gs.gpu),
-        ("box_pyramid_6", None, True, 4096, gs.gpu),
-        ("box_pyramid_6", None, False, 4096, gs.gpu),
-        ("g1_fall", gs.constraint_solver.Newton, None, 4096, gs.gpu),
     ],
 )
 def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):

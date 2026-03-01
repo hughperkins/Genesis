@@ -2,6 +2,7 @@ import quadrants as ti
 
 import genesis as gs
 import genesis.utils.array_class as array_class
+from genesis.utils.array_class import V
 from genesis.engine.solvers.rigid.constraint import solver
 
 
@@ -180,3 +181,138 @@ def func_solve_decomposed(
             rigid_global_info,
             static_rigid_sim_config,
         )
+
+
+# =============================================================================
+# graph_while version: all solver steps in a single kernel, GPU-side iteration
+# =============================================================================
+
+_graph_while_counter = None
+
+
+def _get_graph_while_counter():
+    global _graph_while_counter
+    if _graph_while_counter is None:
+        _graph_while_counter = V(dtype=gs.qd_int, shape=(1,))
+    return _graph_while_counter
+
+
+@ti.kernel(graph_while='counter', fastcache=gs.use_fastcache)
+def _kernel_solve_graph_while(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+    counter: array_class.V_ANNOTATION,
+):
+    _B = constraint_state.grad.shape[1]
+
+    # Step 1: Linesearch + apply alpha
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_linesearch_and_apply_alpha(
+                i_b,
+                entities_info=entities_info,
+                dofs_state=dofs_state,
+                rigid_global_info=rigid_global_info,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        else:
+            constraint_state.improved[i_b] = False
+
+    # Step 2: CG save prev grad (compile-time branch)
+    if ti.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
+        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+        for i_b in range(_B):
+            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                solver.func_save_prev_grad(i_b, constraint_state=constraint_state)
+
+    # Step 3: Update constraint
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_update_constraint_batch(
+                i_b,
+                qacc=constraint_state.qacc,
+                Ma=constraint_state.Ma,
+                cost=constraint_state.cost,
+                dofs_state=dofs_state,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+    # Step 4: Newton Hessian update (compile-time branch)
+    if ti.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+        solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+        if ti.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
+            solver.func_cholesky_factor_direct_tiled(
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        else:
+            _B_jac = constraint_state.jac.shape[2]
+            ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+            for i_b in range(_B_jac):
+                if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                    solver.func_cholesky_factor_direct_batch(
+                        i_b=i_b, constraint_state=constraint_state, rigid_global_info=rigid_global_info
+                    )
+
+    # Step 5: Update gradient
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_update_gradient_batch(
+                i_b,
+                dofs_state=dofs_state,
+                entities_info=entities_info,
+                rigid_global_info=rigid_global_info,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+    # Step 6: Update search direction
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_terminate_or_update_descent_batch(
+                i_b,
+                rigid_global_info=rigid_global_info,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+    # Decrement counter for graph_while condition check
+    for i in range(1):
+        counter[0] -= 1
+
+
+@solver.func_solve_body.register(is_compatible=lambda *args, **kwargs: True)
+def func_solve_graph_while(
+    entities_info,
+    dofs_state,
+    constraint_state,
+    rigid_global_info,
+    static_rigid_sim_config,
+):
+    """
+    All solver steps in a single kernel with graph_while for GPU-side iteration.
+
+    On CUDA: the entire iteration loop runs as a single CUDA graph launch with
+    a conditional while node — no Python/host involvement per iteration.
+    On other backends: falls back to a C++ do-while loop with the same kernel.
+    """
+    counter = _get_graph_while_counter()
+    counter[0] = rigid_global_info.iterations[None]
+    _kernel_solve_graph_while(
+        entities_info,
+        dofs_state,
+        constraint_state,
+        rigid_global_info,
+        static_rigid_sim_config,
+        counter,
+    )
