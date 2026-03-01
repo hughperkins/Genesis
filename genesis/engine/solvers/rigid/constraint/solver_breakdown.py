@@ -192,7 +192,7 @@ _graph_while_counter = None
 
 def _get_graph_while_counter():
     global _graph_while_counter
-    if _graph_while_counter is None:
+    if _graph_while_counter is None or getattr(_graph_while_counter, 'arr', None) is None:
         _graph_while_counter = V(dtype=gs.qd_int, shape=(1,))
     return _graph_while_counter
 
