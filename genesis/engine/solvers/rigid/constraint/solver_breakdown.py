@@ -313,7 +313,6 @@ def func_solve_graph_while(
     a conditional while node — no Python/host involvement per iteration.
     On other backends: falls back to a C++ do-while loop with the same kernel.
 
-    Enable via: ``solver_breakdown.enable_graph_while()``
     """
     counter = _get_graph_while_counter()
     counter[0] = rigid_global_info.iterations[None]
