@@ -326,10 +326,4 @@ def func_solve_graph_while(
     )
 
 
-def enable_graph_while():
-    """Replace the default constraint solver with the graph_while version.
-
-    This fuses all solver iteration steps into a single GPU kernel launch
-    with GPU-side looping, providing 1.1-3.3x speedup depending on batch size.
-    """
-    solver.func_solve_body = func_solve_graph_while
+solver.func_solve_body.register(is_compatible=lambda *args, **kwargs: True)(func_solve_graph_while)
