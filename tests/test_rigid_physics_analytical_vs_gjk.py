@@ -526,6 +526,13 @@ def test_capsule_analytical_accuracy(tmp_path: Path, show_viewer: bool, tol: flo
     assert_allclose(contacts["normal"][0], (-1.0, 0.0, 0.0), tol=tol)
 
 
+def scene_add_sphere_named(name: str, tmp_path: Path, scene: gs.Scene, radius: float) -> "RigidGeom":
+    mjcf = create_sphere_mjcf(name, (0, 0, 0), radius)
+    path = tmp_path / f"{name}.xml"
+    ET.ElementTree(mjcf).write(path)
+    return cast("RigidGeom", scene.add_entity(gs.morphs.MJCF(file=path)))
+
+
 def create_sphere_mjcf(name, pos, radius):
     """Helper function to create an MJCF file with a single sphere."""
     mjcf = ET.Element("mujoco", model=name)
@@ -670,4 +677,157 @@ def test_sphere_capsule_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer
                 f"Backend: {backend}\n"
                 f"Sphere radius: {sphere_radius}\n"
                 f"Capsule radius: {capsule_radius}, Half-length: {capsule_half_length}\n"
+            ) from e
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer: bool, tol: float) -> None:
+    """
+    Compare MPR sphere-sphere collision with GJK by monkey-patching narrowphase.
+
+    Sphere-sphere has no analytical specialization on main, so the default
+    scene uses MPR and the patched scene uses GJK.  Both results are compared
+    against each other and against hand-computed expected values.
+
+    Test cases can be visualized using the script at:
+    https://github.com/Genesis-Embodied-AI/perso_hugh/blob/main/gs/visualize_sphere_sphere.py
+    (note: only accessible internally)
+    """
+    RADIUS_A = 0.10
+    RADIUS_B = 0.08
+    COMBINED_R = RADIUS_A + RADIUS_B
+
+    sqrt2 = np.sqrt(2)
+    sqrt3 = np.sqrt(3)
+
+    test_cases = [
+        # (pos_a, pos_b, should_collide, description, exp_pen, exp_normal)
+        #
+        # All non-colliding cases are positioned so that per-axis separation < COMBINED_R,
+        # ensuring AABB overlap and broadphase passage.
+
+        # --- No collision ---
+        ((0, 0, 0), (0.25 / sqrt3,) * 3, False, "separated_3d", None, None),
+        ((0, 0, 0), (0.13, 0.13, 0), False, "separated_diagonal", None, None),
+        ((0, 0, 0), (0.19 / sqrt2, 0, 0.19 / sqrt2), False, "barely_separated_diag_xz", None, None),
+        ((0, 0, 0), (0.18 / sqrt2, 0.18 / sqrt2, 0), False, "tangent_diag_xy", None, None),
+
+        # --- Light overlap ---
+        ((0, 0, 0), (0.15, 0, 0), True, "light_overlap_x", 0.03, (-1, 0, 0)),
+        ((0, 0, 0), (0, 0, 0.16), True, "light_overlap_z", 0.02, (0, 0, -1)),
+        ((0, 0, 0), (0, 0.12, 0), True, "light_overlap_y", 0.06, (0, -1, 0)),
+
+        # --- Diagonal overlap ---
+        ((0, 0, 0), (0.1, 0.1, 0), True, "diagonal_xy",
+         COMBINED_R - np.sqrt(0.02), (-1 / sqrt2, -1 / sqrt2, 0)),
+        ((0, 0, 0), (0.08, 0.06, 0.06), True, "diagonal_3d",
+         COMBINED_R - np.sqrt(0.0136), None),
+
+        # --- Deep overlap ---
+        ((0, 0, 0), (0.05, 0, 0), True, "deep_overlap_x", 0.13, (-1, 0, 0)),
+
+        # --- Near-concentric ---
+        ((0, 0, 0), (0.01, 0, 0), True, "near_concentric_x", 0.17, (-1, 0, 0)),
+        ((0, 0, 0), (0, 0.01, 0), True, "near_concentric_y", 0.17, (0, -1, 0)),
+        ((0, 0, 0), (0, 0, 0.01), True, "near_concentric_z", 0.17, (0, 0, -1)),
+
+        # --- Concentric (degenerate normal) ---
+        ((0, 0, 0), (0, 0, 0), True, "concentric", COMBINED_R, None),
+
+        # --- Offset origin (verify no origin bias) ---
+        ((1, 2, 3), (1.15, 2, 3), True, "offset_origin", 0.03, (-1, 0, 0)),
+    ]
+
+    def build_scene(scene: gs.Scene, tmp_path: Path, entities: list) -> None:
+        entities.append(scene_add_sphere_named("sphere_a", tmp_path, scene, radius=RADIUS_A))
+        entities.append(scene_add_sphere_named("sphere_b", tmp_path, scene, radius=RADIUS_B))
+        scene.build()
+
+    scene_creator = AnalyticalVsGJKSceneCreator(
+        monkeypatch=monkeypatch,
+        build_scene=build_scene,
+        tmp_path=tmp_path,
+        show_viewer=show_viewer,
+    )
+    scene_analytical, scene_gjk = scene_creator.setup_scenes()
+
+    # Phase 1: Run all MPR scenarios (original, unpatched kernel)
+    mpr_results = {}
+    for pos_a, pos_b, should_collide, description, exp_pen, exp_normal in test_cases:
+        try:
+            scene_creator.update_pos_quat_analytical(entity_idx=0, pos=pos_a, euler=[0, 0, 0])
+            scene_creator.update_pos_quat_analytical(entity_idx=1, pos=pos_b, euler=[0, 0, 0])
+            scene_creator.step_analytical()
+
+            contacts = scene_analytical.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
+            has_collision = len(contacts["geom_a"]) > 0
+            assert has_collision == should_collide, (
+                f"MPR collision mismatch: got {has_collision}, expected {should_collide}"
+            )
+            _check_expected_values(
+                contacts, description, exp_pen, exp_normal, "MPR", GJK_PEN_TOL, GJK_NORMAL_TOL
+            )
+            mpr_results[description] = copy.deepcopy(contacts)
+        except AssertionError as e:
+            raise AssertionError(
+                f"\nFAILED TEST SCENARIO (MPR phase): {description}\n"
+                f"Sphere A: pos={pos_a}, radius={RADIUS_A}\n"
+                f"Sphere B: pos={pos_b}, radius={RADIUS_B}\n"
+                f"Expected collision: {should_collide}\n"
+                f"Backend: {backend}\n"
+            ) from e
+
+    # Phase 2: Apply monkey-patch (replace @qd.kernel with version from tmp file)
+    scene_creator.apply_gjk_patch()
+
+    # Phase 3: Run all GJK scenarios (patched kernel, fresh cache)
+    for pos_a, pos_b, should_collide, description, exp_pen, exp_normal in test_cases:
+        try:
+            scene_creator.update_pos_quat_gjk(entity_idx=0, pos=pos_a, euler=[0, 0, 0])
+            scene_creator.update_pos_quat_gjk(entity_idx=1, pos=pos_b, euler=[0, 0, 0])
+            scene_creator.step_gjk()
+
+            contacts_gjk = scene_gjk.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
+            contacts_mpr = mpr_results[description]
+
+            has_collision_mpr = contacts_mpr is not None and len(contacts_mpr["geom_a"]) > 0
+            has_collision_gjk = contacts_gjk is not None and len(contacts_gjk["geom_a"]) > 0
+
+            assert has_collision_mpr == has_collision_gjk, (
+                f"Collision detection mismatch: MPR={has_collision_mpr}, GJK={has_collision_gjk}"
+            )
+            assert has_collision_gjk == should_collide
+
+            _check_expected_values(
+                contacts_gjk, description, exp_pen, exp_normal, "GJK", GJK_PEN_TOL, GJK_NORMAL_TOL
+            )
+
+            if has_collision_mpr and has_collision_gjk:
+                pen_mpr = contacts_mpr["penetration"][0]
+                pen_gjk = contacts_gjk["penetration"][0]
+
+                normal_mpr = np.array(contacts_mpr["normal"][0])
+                normal_gjk = np.array(contacts_gjk["normal"][0])
+
+                pos_mpr = np.array(contacts_mpr["position"][0])
+                pos_gjk = np.array(contacts_gjk["position"][0])
+
+                assert_allclose(pen_mpr, pen_gjk, atol=POS_TOL, rtol=0.1, err_msg="Penetration mismatch!")
+
+                normal_tol_val = 0.5 if description == "concentric" else 0.95
+                normal_agreement = abs(np.dot(normal_mpr, normal_gjk))
+                assert normal_agreement > normal_tol_val, (
+                    f"Normal mismatch: MPR={normal_mpr}, GJK={normal_gjk}, "
+                    f"|dot|={normal_agreement:.4f} < {normal_tol_val}"
+                )
+
+                assert_allclose(pos_mpr, pos_gjk, tol=POS_TOL)
+        except AssertionError as e:
+            raise AssertionError(
+                f"\nFAILED TEST SCENARIO (GJK phase): {description}\n"
+                f"Sphere A: pos={pos_a}, radius={RADIUS_A}\n"
+                f"Sphere B: pos={pos_b}, radius={RADIUS_B}\n"
+                f"Expected collision: {should_collide}\n"
+                f"Backend: {backend}\n"
             ) from e
