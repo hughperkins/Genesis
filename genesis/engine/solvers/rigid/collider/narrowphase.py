@@ -616,7 +616,16 @@ def func_convex_convex_contact(
                 )
 
             if (multi_contact and is_col_0) or (i_detection == 0):
-                if geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
+                if geoms_info.type[i_ga] == gs.GEOM_TYPE.SPHERE and geoms_info.type[i_gb] == gs.GEOM_TYPE.SPHERE:
+                    is_col, normal, contact_pos, penetration = capsule_contact.func_sphere_sphere_contact(
+                        i_ga=i_ga,
+                        i_gb=i_gb,
+                        ga_pos=ga_pos_current,
+                        gb_pos=gb_pos_current,
+                        geoms_info=geoms_info,
+                        rigid_global_info=rigid_global_info,
+                    )
+                elif geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
                     is_col, normal, contact_pos, penetration = capsule_contact.func_capsule_capsule_contact(
                         i_ga=i_ga,
                         i_gb=i_gb,

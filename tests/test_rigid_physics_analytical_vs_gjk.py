@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 
 ERRNO_CALLED_GJK = 1 << 16
+ERRNO_CALLED_SPHERE_SPHERE = 1 << 17
 POS_TOL = 1e-2  # otherwise tests fail
 
 # Tolerances for checking results against hand-computed expected values.
@@ -226,6 +227,9 @@ def create_modified_narrowphase_file(tmp_path: Path):
     content = content.replace("from .", "from genesis.engine.solvers.rigid.collider.")
 
     lines = content.split("\n")
+
+    # Disable sphere-sphere analytical path
+    lines = find_and_disable_condition(lines, "capsule_contact.func_sphere_sphere_contact")
 
     # Disable capsule-capsule analytical path
     lines = find_and_disable_condition(lines, "capsule_contact.func_capsule_capsule_contact")
@@ -684,11 +688,12 @@ def test_sphere_capsule_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer: bool, tol: float) -> None:
     """
-    Compare MPR sphere-sphere collision with GJK by monkey-patching narrowphase.
+    Compare analytical sphere-sphere collision with GJK by monkey-patching narrowphase.
 
-    Sphere-sphere has no analytical specialization on main, so the default
-    scene uses MPR and the patched scene uses GJK.  Both results are compared
-    against each other and against hand-computed expected values.
+    Two-phase approach to avoid kernel caching interference:
+    1. Run ALL analytical scenarios first (original kernel with sphere-sphere specialization)
+    2. Apply monkey-patch (replaces the @qd.kernel with a new object from a tmp file)
+    3. Run ALL GJK scenarios (patched kernel with sphere-sphere disabled)
 
     Test cases can be visualized using the script at:
     https://github.com/Genesis-Embodied-AI/perso_hugh/blob/main/gs/visualize_sphere_sphere.py
@@ -752,8 +757,8 @@ def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer:
     )
     scene_analytical, scene_gjk = scene_creator.setup_scenes()
 
-    # Phase 1: Run all MPR scenarios (original, unpatched kernel)
-    mpr_results = {}
+    # Phase 1: Run all analytical scenarios (original, unpatched kernel)
+    analytical_results = {}
     for pos_a, pos_b, should_collide, description, exp_pen, exp_normal in test_cases:
         try:
             scene_creator.update_pos_quat_analytical(entity_idx=0, pos=pos_a, euler=[0, 0, 0])
@@ -763,15 +768,16 @@ def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer:
             contacts = scene_analytical.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
             has_collision = len(contacts["geom_a"]) > 0
             assert has_collision == should_collide, (
-                f"MPR collision mismatch: got {has_collision}, expected {should_collide}"
+                f"Analytical collision mismatch: got {has_collision}, expected {should_collide}"
             )
             _check_expected_values(
-                contacts, description, exp_pen, exp_normal, "MPR", GJK_PEN_TOL, GJK_NORMAL_TOL
+                contacts, description, exp_pen, exp_normal,
+                "analytical", ANALYTICAL_PEN_TOL, ANALYTICAL_NORMAL_TOL,
             )
-            mpr_results[description] = copy.deepcopy(contacts)
+            analytical_results[description] = copy.deepcopy(contacts)
         except AssertionError as e:
             raise AssertionError(
-                f"\nFAILED TEST SCENARIO (MPR phase): {description}\n"
+                f"\nFAILED TEST SCENARIO (analytical phase): {description}\n"
                 f"Sphere A: pos={pos_a}, radius={RADIUS_A}\n"
                 f"Sphere B: pos={pos_b}, radius={RADIUS_B}\n"
                 f"Expected collision: {should_collide}\n"
@@ -789,13 +795,13 @@ def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer:
             scene_creator.step_gjk()
 
             contacts_gjk = scene_gjk.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
-            contacts_mpr = mpr_results[description]
+            contacts_analytical = analytical_results[description]
 
-            has_collision_mpr = contacts_mpr is not None and len(contacts_mpr["geom_a"]) > 0
+            has_collision_analytical = contacts_analytical is not None and len(contacts_analytical["geom_a"]) > 0
             has_collision_gjk = contacts_gjk is not None and len(contacts_gjk["geom_a"]) > 0
 
-            assert has_collision_mpr == has_collision_gjk, (
-                f"Collision detection mismatch: MPR={has_collision_mpr}, GJK={has_collision_gjk}"
+            assert has_collision_analytical == has_collision_gjk, (
+                f"Collision detection mismatch: analytical={has_collision_analytical}, GJK={has_collision_gjk}"
             )
             assert has_collision_gjk == should_collide
 
@@ -803,26 +809,26 @@ def test_sphere_sphere_vs_gjk(backend, monkeypatch, tmp_path: Path, show_viewer:
                 contacts_gjk, description, exp_pen, exp_normal, "GJK", GJK_PEN_TOL, GJK_NORMAL_TOL
             )
 
-            if has_collision_mpr and has_collision_gjk:
-                pen_mpr = contacts_mpr["penetration"][0]
+            if has_collision_analytical and has_collision_gjk:
+                pen_analytical = contacts_analytical["penetration"][0]
                 pen_gjk = contacts_gjk["penetration"][0]
 
-                normal_mpr = np.array(contacts_mpr["normal"][0])
+                normal_analytical = np.array(contacts_analytical["normal"][0])
                 normal_gjk = np.array(contacts_gjk["normal"][0])
 
-                pos_mpr = np.array(contacts_mpr["position"][0])
+                pos_analytical = np.array(contacts_analytical["position"][0])
                 pos_gjk = np.array(contacts_gjk["position"][0])
 
-                assert_allclose(pen_mpr, pen_gjk, atol=POS_TOL, rtol=0.1, err_msg="Penetration mismatch!")
+                assert_allclose(pen_analytical, pen_gjk, atol=POS_TOL, rtol=0.1, err_msg="Penetration mismatch!")
 
                 normal_tol_val = 0.5 if description == "concentric" else 0.95
-                normal_agreement = abs(np.dot(normal_mpr, normal_gjk))
+                normal_agreement = abs(np.dot(normal_analytical, normal_gjk))
                 assert normal_agreement > normal_tol_val, (
-                    f"Normal mismatch: MPR={normal_mpr}, GJK={normal_gjk}, "
+                    f"Normal mismatch: analytical={normal_analytical}, GJK={normal_gjk}, "
                     f"|dot|={normal_agreement:.4f} < {normal_tol_val}"
                 )
 
-                assert_allclose(pos_mpr, pos_gjk, tol=POS_TOL)
+                assert_allclose(pos_analytical, pos_gjk, tol=POS_TOL)
         except AssertionError as e:
             raise AssertionError(
                 f"\nFAILED TEST SCENARIO (GJK phase): {description}\n"

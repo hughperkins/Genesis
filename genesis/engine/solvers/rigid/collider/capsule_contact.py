@@ -194,3 +194,48 @@ def func_sphere_capsule_contact(
         contact_pos = sphere_center - (sphere_radius - 0.5 * penetration) * normal_unit
 
     return is_col, normal_unit * normal_dir, contact_pos, penetration
+
+
+@qd.func
+def func_sphere_sphere_contact(
+    i_ga,
+    i_gb,
+    ga_pos,
+    gb_pos,
+    geoms_info: array_class.GeomsInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """
+    Analytical sphere-sphere collision detection.
+
+    Two spheres collide when the distance between their centres is less than
+    the sum of their radii.  The contact normal points from B to A.
+    """
+    EPS = rigid_global_info.EPS[None]
+
+    radius_a = geoms_info.data[i_ga][0]
+    radius_b = geoms_info.data[i_gb][0]
+
+    diff = ga_pos - gb_pos
+    dist_sq = diff.dot(diff)
+    combined_radius = radius_a + radius_b
+    combined_radius_sq = combined_radius * combined_radius
+
+    is_col = False
+    normal_unit = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+    contact_pos = qd.Vector.zero(gs.qd_float, 3)
+    penetration = gs.qd_float(0.0)
+
+    if dist_sq < combined_radius_sq:
+        is_col = True
+        dist = qd.sqrt(dist_sq)
+
+        if dist > EPS:
+            normal_unit = diff / dist
+        else:
+            normal_unit = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+
+        penetration = combined_radius - dist
+        contact_pos = ga_pos - (radius_a - gs.qd_float(0.5) * penetration) * normal_unit
+
+    return is_col, normal_unit, contact_pos, penetration
