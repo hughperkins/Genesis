@@ -156,6 +156,68 @@ def func_cylinder_sphere_contact(
 
 
 @qd.func
+def _cap_vs_barrel(
+    cap_center,
+    cap_normal,
+    cap_radius: gs.qd_float,
+    barrel_pos,
+    barrel_axis,
+    barrel_radius: gs.qd_float,
+    barrel_halflength: gs.qd_float,
+    EPS,
+):
+    """Contact between a flat cap disc and a cylinder barrel.
+
+    The cap is a disc at *cap_center* with outward normal *cap_normal*
+    and radius *cap_radius*.  The barrel is the cylindrical surface at
+    distance *barrel_radius* from the line through *barrel_pos* along
+    *barrel_axis*, extending ±*barrel_halflength*.
+
+    Returns (is_col, normal, contact_pos, penetration) where the
+    returned normal equals the cap outward normal.
+    """
+    is_col = False
+    out_normal = cap_normal
+    contact_pos = qd.Vector.zero(gs.qd_float, 3)
+    pen = gs.qd_float(0.0)
+
+    a = barrel_axis.dot(cap_normal)
+    n_perp = cap_normal - a * barrel_axis
+    n_perp_len_sq = n_perp.dot(n_perp)
+
+    if n_perp_len_sq > EPS * EPS:
+        n_perp_len = qd.sqrt(n_perp_len_sq)
+        d_opt = -n_perp / n_perp_len
+
+        t_opt = gs.qd_float(0.0)
+        if qd.abs(a) > EPS:
+            t_opt = -barrel_halflength
+            if a < gs.qd_float(0.0):
+                t_opt = barrel_halflength
+        else:
+            t_opt = (cap_center - barrel_pos).dot(barrel_axis)
+            t_opt = qd.max(-barrel_halflength, qd.min(barrel_halflength, t_opt))
+
+        barrel_pt = barrel_pos + t_opt * barrel_axis + barrel_radius * d_opt
+        s = (barrel_pt - cap_center).dot(cap_normal)
+
+        # Use a small margin so that surfaces exactly at the boundary
+        # (s == 0) are still handled by cap logic instead of falling
+        # through to the barrel-barrel fallback.
+        margin = barrel_radius * gs.qd_float(0.02)
+        if s < margin:
+            proj = barrel_pt - s * cap_normal
+            offset = proj - cap_center
+            if offset.dot(offset) < cap_radius * cap_radius:
+                is_col = True
+                pen = qd.max(-s, gs.qd_float(0.0))
+                out_normal = cap_normal
+                contact_pos = barrel_pt + gs.qd_float(0.5) * pen * cap_normal
+
+    return is_col, out_normal, contact_pos, pen
+
+
+@qd.func
 def func_cylinder_cylinder_contact(
     ga_pos,
     ga_quat,
@@ -234,20 +296,83 @@ def func_cylinder_cylinder_contact(
         radial = Pa - Pb
         radial_dist = qd.sqrt(radial.dot(radial))
 
-        if radial_dist > EPS:
-            if radial_dist < combined_radius:
-                is_col = True
-                normal = radial / radial_dist
-                penetration = combined_radius - radial_dist
-                contact_pos = Pb + (radius_b - 0.5 * penetration) * normal
+        s_a = (Pa - ga_pos).dot(axis_a)
+        s_b = (Pb - gb_pos).dot(axis_b)
+        pa_at_end = (halflength_a - qd.abs(s_a)) < EPS
+        pb_at_end = (halflength_b - qd.abs(s_b)) < EPS
+
+        if pa_at_end or pb_at_end:
+            # At least one closest point is clamped to a segment endpoint,
+            # so the contact involves a flat cap rather than barrel-barrel.
+            # Only check the cap at the specific clamped endpoint to avoid
+            # phantom contacts from the far cap during deep penetrations.
+            best_pen = gs.qd_float(0.0)
+
+            if pb_at_end:
+                cap_sign_b = gs.qd_float(1.0)
+                if s_b < gs.qd_float(0.0):
+                    cap_sign_b = gs.qd_float(-1.0)
+                cap_center_b = gb_pos + cap_sign_b * halflength_b * axis_b
+                cap_normal_b = cap_sign_b * axis_b
+                cb, nb, pb2, db = _cap_vs_barrel(
+                    cap_center_b, cap_normal_b, radius_b,
+                    ga_pos, axis_a, radius_a, halflength_a, EPS)
+                if cb:
+                    if db > best_pen:
+                        best_pen = db
+                        is_col = True
+                        normal = nb
+                        penetration = db
+                        contact_pos = pb2
+
+            if pa_at_end:
+                cap_sign_a = gs.qd_float(1.0)
+                if s_a < gs.qd_float(0.0):
+                    cap_sign_a = gs.qd_float(-1.0)
+                cap_center_a = ga_pos + cap_sign_a * halflength_a * axis_a
+                cap_normal_a = cap_sign_a * axis_a
+                ca, na, pa2, da = _cap_vs_barrel(
+                    cap_center_a, cap_normal_a, radius_a,
+                    gb_pos, axis_b, radius_b, halflength_b, EPS)
+                if ca:
+                    if da > best_pen:
+                        best_pen = da
+                        is_col = True
+                        normal = -na
+                        penetration = da
+                        contact_pos = pa2
+
+            if not is_col:
+                if radial_dist > EPS:
+                    if radial_dist < combined_radius:
+                        is_col = True
+                        normal = radial / radial_dist
+                        penetration = combined_radius - radial_dist
+                        contact_pos = Pb + (radius_b - gs.qd_float(0.5) * penetration) * normal
+                else:
+                    cross_len = qd.sqrt(axis_cross_len_sq)
+                    sep_dir = axis_cross / cross_len
+                    if sep_dir.dot(center_diff) < 0.0:
+                        sep_dir = -sep_dir
+                    is_col = True
+                    normal = sep_dir
+                    penetration = combined_radius
+                    contact_pos = gs.qd_float(0.5) * (Pa + Pb)
         else:
-            cross_len = qd.sqrt(axis_cross_len_sq)
-            sep_dir = axis_cross / cross_len
-            if sep_dir.dot(center_diff) < 0.0:
-                sep_dir = -sep_dir
-            is_col = True
-            normal = sep_dir
-            penetration = combined_radius
-            contact_pos = 0.5 * (Pa + Pb)
+            if radial_dist > EPS:
+                if radial_dist < combined_radius:
+                    is_col = True
+                    normal = radial / radial_dist
+                    penetration = combined_radius - radial_dist
+                    contact_pos = Pb + (radius_b - gs.qd_float(0.5) * penetration) * normal
+            else:
+                cross_len = qd.sqrt(axis_cross_len_sq)
+                sep_dir = axis_cross / cross_len
+                if sep_dir.dot(center_diff) < 0.0:
+                    sep_dir = -sep_dir
+                is_col = True
+                normal = sep_dir
+                penetration = combined_radius
+                contact_pos = gs.qd_float(0.5) * (Pa + Pb)
 
     return is_col, normal, contact_pos, penetration
