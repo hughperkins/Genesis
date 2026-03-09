@@ -175,9 +175,13 @@ class Collider:
                 if geom_a.is_convex and geom_b.is_convex:
                     types = {geom_a.type, geom_b.type}
                     if self._solver._options.box_box_detection and types == {gs.GEOM_TYPE.BOX}:
-                        pass
+                        has_convex_specialization = True
                     elif types == {gs.GEOM_TYPE.PLANE, gs.GEOM_TYPE.BOX}:
-                        pass
+                        has_convex_specialization = True
+                    elif types == {gs.GEOM_TYPE.CAPSULE}:
+                        has_convex_specialization = True
+                    elif types == {gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.CAPSULE}:
+                        has_convex_specialization = True
                     else:
                         needs_kernel1 = True
                 if self._solver._options.box_box_detection:
@@ -592,6 +596,7 @@ class Collider:
             self._call_kernel2_mixed()
             narrowphase.func_prepare_gjk_rerun(self._collider_state)
             self._call_kernel2_mixed()
+        if self._collider_static_config.has_convex_specialization:
             func_narrow_phase_convex_specializations(
                 self._solver.geoms_state,
                 self._solver.geoms_info,
@@ -602,9 +607,6 @@ class Collider:
                 self._collider_state,
                 self._collider_info,
                 self._collider_static_config,
-                self._kernel1_mpr_state,
-                self._mpr._mpr_info,
-                self._support_field._support_field_info,
                 self._solver._errno,
             )
         if self._collider_static_config.has_terrain:
