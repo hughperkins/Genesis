@@ -592,21 +592,21 @@ class Collider:
             self._call_kernel2_mixed()
             narrowphase.func_prepare_gjk_rerun(self._collider_state)
             self._call_kernel2_mixed()
-        func_narrow_phase_convex_specializations(
-            self._solver.geoms_state,
-            self._solver.geoms_info,
-            self._solver.geoms_init_AABB,
-            self._solver.verts_info,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
-            self._collider_state,
-            self._collider_info,
-            self._collider_static_config,
-            self._kernel1_mpr_state,
-            self._mpr._mpr_info,
-            self._support_field._support_field_info,
-            self._solver._errno,
-        )
+            func_narrow_phase_convex_specializations(
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._solver.geoms_init_AABB,
+                self._solver.verts_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+                self._collider_state,
+                self._collider_info,
+                self._collider_static_config,
+                self._kernel1_mpr_state,
+                self._mpr._mpr_info,
+                self._support_field._support_field_info,
+                self._solver._errno,
+            )
         if self._collider_static_config.has_terrain:
             func_narrow_phase_any_vs_terrain(
                 self._solver.geoms_state,
