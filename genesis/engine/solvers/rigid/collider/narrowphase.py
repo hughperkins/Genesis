@@ -1823,51 +1823,15 @@ def func_narrowphase_kernel1_contact0(
 
             i_pair = collider_info.collision_pair_idx[(i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)]
 
-            if geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
-                is_col, normal, contact_pos, penetration = capsule_contact.func_capsule_capsule_contact(
-                    i_ga=i_ga,
-                    i_gb=i_gb,
-                    ga_pos=ga_pos,
-                    ga_quat=ga_quat,
-                    gb_pos=gb_pos,
-                    gb_quat=gb_quat,
-                    geoms_info=geoms_info,
-                    rigid_global_info=rigid_global_info,
-                )
-            elif (geoms_info.type[i_ga] == gs.GEOM_TYPE.SPHERE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE) or (
-                geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.SPHERE
+            if (
+                geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE
+                or (geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE)
+                or (geoms_info.type[i_ga] == gs.GEOM_TYPE.SPHERE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE)
+                or (geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.SPHERE)
             ):
-                is_col, normal, contact_pos, penetration = capsule_contact.func_sphere_capsule_contact(
-                    i_ga=i_ga,
-                    i_gb=i_gb,
-                    ga_pos=ga_pos,
-                    ga_quat=ga_quat,
-                    gb_pos=gb_pos,
-                    gb_quat=gb_quat,
-                    geoms_info=geoms_info,
-                    rigid_global_info=rigid_global_info,
-                )
-            elif geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE:
-                plane_dir = qd.Vector(
-                    [geoms_info.data[i_ga][0], geoms_info.data[i_ga][1], geoms_info.data[i_ga][2]], dt=gs.qd_float
-                )
-                plane_dir = gu.qd_transform_by_quat(plane_dir, ga_quat)
-                normal = -plane_dir.normalized()
-                v1 = mpr.support_driver(
-                    geoms_info,
-                    collider_state,
-                    collider_static_config,
-                    support_field_info,
-                    normal,
-                    i_gb,
-                    i_b,
-                    gb_pos,
-                    gb_quat,
-                )
-                penetration = normal.dot(v1 - ga_pos)
-                contact_pos = v1 - 0.5 * penetration * normal
-                is_col = penetration > 0.0
-            else:
+                continue
+
+            if True:
                 if qd.static(
                     collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
                 ):
@@ -2148,6 +2112,9 @@ def func_narrow_phase_convex_specializations(
     collider_state: array_class.ColliderState,
     collider_info: array_class.ColliderInfo,
     collider_static_config: qd.template(),
+    mpr_state: array_class.MPRState,
+    mpr_info: array_class.MPRInfo,
+    support_field_info: array_class.SupportFieldInfo,
     errno: array_class.V_ANNOTATION,
 ):
     _B = collider_state.active_buffer.shape[1]
@@ -2159,6 +2126,100 @@ def func_narrow_phase_convex_specializations(
 
             if geoms_info.type[i_ga] > geoms_info.type[i_gb]:
                 i_ga, i_gb = i_gb, i_ga
+
+            if (
+                geoms_info.is_convex[i_ga]
+                and geoms_info.is_convex[i_gb]
+                and not geoms_info.type[i_gb] == gs.GEOM_TYPE.TERRAIN
+                and not (
+                    qd.static(static_rigid_sim_config.box_box_detection)
+                    and geoms_info.type[i_ga] == gs.GEOM_TYPE.BOX
+                    and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX
+                )
+            ):
+                if geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
+                    is_col, normal, contact_pos, penetration = capsule_contact.func_capsule_capsule_contact(
+                        i_ga=i_ga,
+                        i_gb=i_gb,
+                        ga_pos=geoms_state.pos[i_ga, i_b],
+                        ga_quat=geoms_state.quat[i_ga, i_b],
+                        gb_pos=geoms_state.pos[i_gb, i_b],
+                        gb_quat=geoms_state.quat[i_gb, i_b],
+                        geoms_info=geoms_info,
+                        rigid_global_info=rigid_global_info,
+                    )
+                    if is_col:
+                        i_pair_idx = collider_info.collision_pair_idx[
+                            (i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)
+                        ]
+                        func_add_contact(
+                            i_ga, i_gb, normal, contact_pos, penetration,
+                            i_b, i_pair_idx, geoms_state, geoms_info,
+                            collider_state, collider_info, errno,
+                        )
+                    else:
+                        collider_state.contact_cache.normal[
+                            collider_info.collision_pair_idx[(i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)], i_b
+                        ] = qd.Vector.zero(gs.qd_float, 3)
+
+                elif (
+                    (geoms_info.type[i_ga] == gs.GEOM_TYPE.SPHERE and geoms_info.type[i_gb] == gs.GEOM_TYPE.CAPSULE)
+                    or (geoms_info.type[i_ga] == gs.GEOM_TYPE.CAPSULE and geoms_info.type[i_gb] == gs.GEOM_TYPE.SPHERE)
+                ):
+                    is_col, normal, contact_pos, penetration = capsule_contact.func_sphere_capsule_contact(
+                        i_ga=i_ga,
+                        i_gb=i_gb,
+                        ga_pos=geoms_state.pos[i_ga, i_b],
+                        ga_quat=geoms_state.quat[i_ga, i_b],
+                        gb_pos=geoms_state.pos[i_gb, i_b],
+                        gb_quat=geoms_state.quat[i_gb, i_b],
+                        geoms_info=geoms_info,
+                        rigid_global_info=rigid_global_info,
+                    )
+                    if is_col:
+                        i_pair_idx = collider_info.collision_pair_idx[
+                            (i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)
+                        ]
+                        func_add_contact(
+                            i_ga, i_gb, normal, contact_pos, penetration,
+                            i_b, i_pair_idx, geoms_state, geoms_info,
+                            collider_state, collider_info, errno,
+                        )
+                    else:
+                        collider_state.contact_cache.normal[
+                            collider_info.collision_pair_idx[(i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)], i_b
+                        ] = qd.Vector.zero(gs.qd_float, 3)
+
+                elif geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE:
+                    if not geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
+                        ga_pos = geoms_state.pos[i_ga, i_b]
+                        ga_quat = geoms_state.quat[i_ga, i_b]
+                        gb_pos = geoms_state.pos[i_gb, i_b]
+                        gb_quat = geoms_state.quat[i_gb, i_b]
+                        plane_dir = qd.Vector(
+                            [geoms_info.data[i_ga][0], geoms_info.data[i_ga][1], geoms_info.data[i_ga][2]],
+                            dt=gs.qd_float,
+                        )
+                        plane_dir = gu.qd_transform_by_quat(plane_dir, ga_quat)
+                        normal = -plane_dir.normalized()
+                        v1 = mpr.support_driver(
+                            geoms_info, collider_state, collider_static_config,
+                            support_field_info, normal, i_gb, i_b, gb_pos, gb_quat,
+                        )
+                        penetration = normal.dot(v1 - ga_pos)
+                        contact_pos = v1 - 0.5 * penetration * normal
+                        is_col = penetration > 0.0
+                        i_pair_idx = collider_info.collision_pair_idx[
+                            (i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)
+                        ]
+                        if is_col:
+                            func_add_contact(
+                                i_ga, i_gb, normal, contact_pos, penetration,
+                                i_b, i_pair_idx, geoms_state, geoms_info,
+                                collider_state, collider_info, errno,
+                            )
+                        else:
+                            collider_state.contact_cache.normal[i_pair_idx, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
             if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
                 func_plane_box_contact(
