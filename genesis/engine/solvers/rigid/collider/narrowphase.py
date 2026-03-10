@@ -1169,6 +1169,10 @@ def func_kernel2_mpr_multicontact(
     tolerance = func_compute_tolerance(
         i_ga, i_gb, i_b_env, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
     )
+    if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+        tolerance = func_compute_mj_tolerance(
+            i_ga, i_gb, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
+        )
 
     axis_0, axis_1 = func_contact_orthogonals(
         i_ga,
@@ -1198,12 +1202,19 @@ def func_kernel2_mpr_multicontact(
     local_penetration[0, 0] = penetration_0
 
     needs_gjk_upgrade = False
+    qrot = qd.Vector.zero(gs.qd_float, 4)
 
     for i_detection in range(4):
         if not needs_gjk_upgrade:
             i_det = i_detection + 1
-            axis = (2 * (i_det % 2) - 1) * axis_0 + (1 - 2 * ((i_det // 2) % 2)) * axis_1
-            qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
+            if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+                axis_idx = (i_det - 1) // 2
+                angle_sign = 2 * ((i_det - 1) % 2) - 1
+                axis = axis_0 if axis_idx == 0 else axis_1
+                qrot = gu.qd_rotvec_to_quat(angle_sign * collider_info.mc_perturbation[None] * axis, EPS)
+            else:
+                axis = (2 * (i_det % 2) - 1) * axis_0 + (1 - 2 * ((i_det // 2) % 2)) * axis_1
+                qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
 
             ga_pos_current, ga_quat_current = func_rotate_frame(
                 pos=ga_pos_original, quat=ga_quat_original, contact_pos=contact_pos_0, qrot=qrot
@@ -1278,8 +1289,11 @@ def func_kernel2_mpr_multicontact(
                     normal = normal + twist_rotvec.cross(normal)
 
                     penetration = normal.dot(contact_point_b - contact_point_a)
-                    if qd.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MJ_GJK):
-                        penetration = penetration_0
+
+                if qd.static(
+                    collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
+                ):
+                    penetration = penetration_0
 
                 repeated = False
                 for i_c in range(n_con):
@@ -1384,6 +1398,10 @@ def func_kernel2_gjk_full(
     tolerance = func_compute_tolerance(
         i_ga, i_gb, i_b_env, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
     )
+    if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+        tolerance = func_compute_mj_tolerance(
+            i_ga, i_gb, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
+        )
     diff_pos_tolerance = func_compute_tolerance(
         i_ga, i_gb, i_b_env, collider_info.diff_pos_tolerance[None], geoms_info, geoms_init_AABB
     )
@@ -1421,8 +1439,14 @@ def func_kernel2_gjk_full(
     for i_detection in range(5):
         if not gjk_multi_done:
             if multi_contact and is_col_0:
-                axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
-                qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
+                if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+                    axis_idx = (i_detection - 1) // 2
+                    angle_sign = 2 * ((i_detection - 1) % 2) - 1
+                    axis = axis_0 if axis_idx == 0 else axis_1
+                    qrot = gu.qd_rotvec_to_quat(angle_sign * collider_info.mc_perturbation[None] * axis, EPS)
+                else:
+                    axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
+                    qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
                 ga_pos_current, ga_quat_current = func_rotate_frame(
                     pos=ga_pos_original, quat=ga_quat_original, contact_pos=contact_pos_0, qrot=qrot
                 )
@@ -1532,8 +1556,11 @@ def func_kernel2_gjk_full(
                     )
                     normal = normal + twist_rotvec.cross(normal)
                     penetration = normal.dot(contact_point_b - contact_point_a)
-                    if qd.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MJ_GJK):
-                        penetration = penetration_0
+
+                if qd.static(
+                    collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
+                ):
+                    penetration = penetration_0
 
                 repeated = False
                 for i_c in range(n_con):
@@ -1847,7 +1874,27 @@ def func_narrowphase_kernel1_contact0(
             ):
                 continue
 
-            if True:
+            if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE:
+                plane_dir = qd.Vector(
+                    [geoms_info.data[i_ga][0], geoms_info.data[i_ga][1], geoms_info.data[i_ga][2]], dt=gs.qd_float
+                )
+                plane_dir = gu.qd_transform_by_quat(plane_dir, ga_quat)
+                normal = -plane_dir.normalized()
+                v1 = mpr.support_driver(
+                    geoms_info,
+                    collider_state,
+                    collider_static_config,
+                    support_field_info,
+                    normal,
+                    i_gb,
+                    i_b,
+                    gb_pos,
+                    gb_quat,
+                )
+                penetration = normal.dot(v1 - ga_pos)
+                contact_pos = v1 - 0.5 * penetration * normal
+                is_col = penetration > 0.0
+            else:
                 if qd.static(
                     collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
                 ):
