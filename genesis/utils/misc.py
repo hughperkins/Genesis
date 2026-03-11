@@ -61,7 +61,7 @@ class redirect_libc_stderr:
     def __enter__(self):
         try:
             self.stderr_fileno = sys.stderr.fileno()
-        except io.UnsupportedOperation:
+        except (io.UnsupportedOperation, AttributeError):
             # Do nothing is not a real OS-level file descriptor but rather some IO buffer
             return self
 
@@ -263,6 +263,22 @@ def get_usd_cache_dir():
     return os.path.join(get_cache_dir(), "usd")
 
 
+def geometric_mean(a, b):
+    """Geometric mean of two non-negative values: sqrt(a * b)."""
+    if a < 0 or b < 0:
+        gs.raise_exception(f"geometric_mean requires non-negative values, got {a} and {b}.")
+    return math.sqrt(a * b)
+
+
+def harmonic_mean(a, b):
+    """Harmonic mean of two non-negative values: 2 * (a * b) / (a + b)."""
+    if a < 0 or b < 0:
+        gs.raise_exception(f"harmonic_mean requires non-negative values, got {a} and {b}.")
+    if a == 0 or b == 0:
+        return 0.0
+    return 2 * (a * b) / (a + b)
+
+
 def assert_gs_tensor(x):
     if not isinstance(x, gs.Tensor):
         gs.raise_exception("Only accepts genesis.Tensor.")
@@ -454,8 +470,8 @@ def qd_to_python(
                     value._np = value_tc.numpy()
                     value._T_np = value._T_tc.numpy()
 
-        # FIXME: DLPack may return old values on Apple Metal for field if sync is not systematically called manually
-        if is_field and gs.backend == gs.metal:
+        # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually
+        if gs.backend == gs.metal:
             qd.sync()
 
         if copy:
@@ -618,8 +634,8 @@ def qd_to_torch(
     if gs.use_zerocopy:
         try:
             tensor = value._T_tc if transpose else value._tc
-            # FIXME: DLPack may return old values on Apple Metal for field if sync is not systematically called manually
-            if isinstance(value, qd.Field) and gs.backend == gs.metal:
+            # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually
+            if gs.backend == gs.metal:
                 qd.sync()
             if copy:
                 tensor = tensor.clone()

@@ -233,10 +233,11 @@ class IPCCouplerOptions(BaseCouplerOptions):
         Contact distance threshold. Defaults to None (use libuipc default: 0.01).
     contact_friction_enable : bool, optional
         Whether to enable friction in contact. Defaults to None (use libuipc default: True).
-    contact_friction_mu : float, optional
-        Friction coefficient. Defaults to 0.5.
     contact_resistance : float, optional
-        Contact resistance/stiffness. Defaults to 1e9.
+        Ground/default contact resistance/stiffness. It is used for ground contact pairs and
+        as the per-entity fallback when a material does not define ``contact_resistance``.
+        For ground pairs, it is combined with entity ``material.contact_resistance`` via
+        geometric mean. Defaults to 1e9.
     contact_eps_velocity : float, optional
         Epsilon velocity for contact. Defaults to None (use libuipc default: 0.01).
     contact_constitution : str, optional
@@ -276,8 +277,6 @@ class IPCCouplerOptions(BaseCouplerOptions):
         collisions within IPC are skipped. Defaults to True.
     two_way_coupling : bool, optional
         Whether to apply coupling forces/torques from IPC back to Genesis rigid bodies. Defaults to True.
-    enable_contact_proxy : bool, optional
-        Whether to use contact proxy mode for IPC coupling. Defaults to False.
     enable_rigid_dofs_sync : bool, optional
         Whether to synchronize the IPC reference DOF state with Genesis each step for
         external_articulation entities. When True, IPC gets tighter coupling with Genesis joint
@@ -287,6 +286,9 @@ class IPCCouplerOptions(BaseCouplerOptions):
         For external_articulation with non-fixed base: whether base link is fully driven by IPC physics.
         When False, base link uses SoftTransformConstraint controlled by Genesis. When True, base link
         is fully driven by IPC physics. Defaults to False.
+    _show_ipc_gui : bool, optional
+        [Dev/debug] Enable the libuipc built-in polyscope GUI viewer for inspecting the IPC scene.
+        Defaults to False.
     """
 
     # Newton solver options (None = use libuipc default)
@@ -311,7 +313,6 @@ class IPCCouplerOptions(BaseCouplerOptions):
     contact_enable: bool = None
     contact_d_hat: float = None
     contact_friction_enable: bool = None
-    contact_friction_mu: float = 0.5
     contact_resistance: float = 1e9
     contact_eps_velocity: float = None
     contact_constitution: str = None
@@ -331,16 +332,35 @@ class IPCCouplerOptions(BaseCouplerOptions):
     enable_rigid_ground_contact: bool = True
     enable_rigid_rigid_contact: bool = True
     two_way_coupling: bool = True
-    enable_contact_proxy: bool = False
     enable_rigid_dofs_sync: bool = False
-    fem_fem_friction_mu: float = 0.001
     free_base_driven_by_ipc: bool = False
+
+    def __init__(self, _show_ipc_gui: bool = False, **data):
+        super().__init__(**data)
+        self._show_ipc_gui = bool(_show_ipc_gui)
 
 
 ############################ Solvers inside simulator ############################
 """
 Parameters in these solver-specific options will override SimOptions if available.
 """
+
+
+class KinematicOptions(Options):
+    """
+    Options configuring the KinematicSolver (visualization-only solver).
+
+    KinematicSolver is a lightweight solver for ghost/reference entities that only computes
+    forward kinematics for visualization. No collision, physics integration, or constraint
+    solving is performed.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    """
+
+    dt: Optional[float] = None
 
 
 class ToolOptions(Options):

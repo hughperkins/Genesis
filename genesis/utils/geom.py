@@ -398,7 +398,7 @@ def qd_orthogonals(a):
         b[1] = -a[1] * a[2]
         b[2] = 1.0 - a[2] ** 2
     b = b.normalized()
-    return b, a.cross(b)
+    return b.cross(a), b
 
 
 @qd.func
@@ -1743,21 +1743,22 @@ def quat_to_rotvec(quat: np.ndarray, out: np.ndarray | None = None) -> np.ndarra
                 and returned, which is slower.
     """
     assert quat.ndim >= 1
+    B = quat.shape[:-1]
     if out is None:
-        out_ = np.empty((*quat.shape[:-1], 3), dtype=quat.dtype)
+        out_ = np.empty((*B, 3), dtype=quat.dtype)
     else:
-        assert out.shape == (*quat.shape[:-1], 3)
+        assert out.shape == (*B, 3)
         out_ = out
 
     # Split real (qw,) and imaginary (qx, qy, qz) quaternion parts
-    q_w, q_vec = quat[..., 0], quat[..., 1:]
+    q_w, q_vec = quat[..., :1], np.ascontiguousarray(quat[..., 1:])
 
     # Compute the angle-axis representation of the relative rotation
-    s2 = np.sqrt(np.sum(np.square(q_vec), -1))
+    s2 = np.sqrt(np.sum(np.square(q_vec.reshape((-1, 3))), -1)).reshape((*B, 1))
     angle = 2.0 * np.arctan2(s2, np.abs(q_w))
     # FIXME: Ideally, a taylor expansion should be used to handle angle ~ 0.0
     inv_sinc = angle / np.maximum(s2, gs.EPS)
-    out_[:] = (-1.0 if q_w < 0.0 else 1.0) * inv_sinc * q_vec
+    out_[:] = np.where(q_w < 0.0, -1.0, 1.0) * inv_sinc * q_vec
 
     if out is None:
         return out_
@@ -1846,6 +1847,9 @@ def R_to_rotvec(R: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
     :param out: Pre-allocated array into which to store the result. If not provided, a new array is freshly-allocated
                 and returned, which is slower.
     """
+    # The quaternion path (Shepperd + arctan2) is preferred over direct Rodrigues formula theta from arccos of trace)
+    # because the latter is catastrophically imprecise for near-identity rotations in float32 (the trace is ~3.0 and
+    # arccos amplifies rounding).
     return quat_to_rotvec(_np_R_to_quat(R), out=out)
 
 
@@ -2036,7 +2040,7 @@ def default_solver_params():
 
     Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
     """
-    return np.array([0.0, 1.0e00, 9.0e-01, 9.5e-01, 1.0e-03, 5.0e-01, 2.0e00])
+    return np.array([0.0, 1.0, 9.0e-01, 9.5e-01, 1.0e-03, 5.0e-01, 2.0])
 
 
 def default_friction():
@@ -2233,3 +2237,23 @@ def cubic_spline_1d(x, y, xv):
     ix = np.clip(np.searchsorted(x[1:], xv), 0, n - 2)
     dx = (xv - x[ix])[:, None]
     return y_2d[ix] + b[ix] * dx + c[ix] * dx**2 + d[ix] * dx**3
+
+
+@nb.jit(nopython=True, cache=True)
+def orthogonals(a):
+    """
+    Returns orthogonal vectors `b` and `c`, given a normal vector `a`.
+
+    Note that `a` is assumed to be normalized.
+    """
+    B = a.shape[:-1]
+
+    a_1d = a.reshape((-1, 3))
+    a_x, a_y, a_z = a_1d[:, 0], a_1d[:, 1], a_1d[:, 2]
+
+    b1 = np.stack((-a_x * a_y, 1.0 - a_y**2, -a_z * a_y), axis=-1)
+    b2 = np.stack((-a_x * a_z, -a_y * a_z, 1.0 - a_z**2), axis=-1)
+    b_1d = np.where(np.abs(a_y).reshape((-1, 1)) < 0.5, b1, b2)
+    b_1d /= np.sqrt(np.sum(np.square(b_1d), -1)).reshape((-1, 1))
+
+    return np.cross(b_1d, a_1d).reshape((*B, 3)), b_1d.reshape((*B, 3))

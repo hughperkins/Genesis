@@ -23,6 +23,7 @@ from .box_contact import (
 from .contact import (
     func_add_contact,
     func_add_diff_contact_input,
+    func_compute_mj_tolerance,
     func_compute_tolerance,
     func_contact_orthogonals,
     func_rotate_frame,
@@ -523,7 +524,6 @@ def func_convex_convex_contact(
     geoms_init_AABB: array_class.GeomsInitAABB,
     verts_info: array_class.VertsInfo,
     faces_info: array_class.FacesInfo,
-    edges_info: array_class.EdgesInfo,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     collider_state: array_class.ColliderState,
@@ -534,30 +534,12 @@ def func_convex_convex_contact(
     gjk_state: array_class.GJKState,
     gjk_info: array_class.GJKInfo,
     gjk_static_config: qd.template(),
-    sdf_info: array_class.SDFInfo,
     support_field_info: array_class.SupportFieldInfo,
     # FIXME: Passing nested data structure as input argument is not supported for now.
     diff_contact_input: array_class.DiffContactInput,
     errno: array_class.V_ANNOTATION,
 ):
-    if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
-        # Plane-box collision doesn't use perturbations, so call original function
-        if qd.static(sys.platform == "darwin"):
-            func_plane_box_contact(
-                i_ga=i_ga,
-                i_gb=i_gb,
-                i_b=i_b,
-                geoms_state=geoms_state,
-                geoms_info=geoms_info,
-                geoms_init_AABB=geoms_init_AABB,
-                verts_info=verts_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-                collider_state=collider_state,
-                collider_info=collider_info,
-                collider_static_config=collider_static_config,
-                errno=errno,
-            )
-    else:
+    if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
         EPS = rigid_global_info.EPS[None]
 
         # Disabling multi-contact for pairs of decomposed geoms would speed up simulation but may cause physical
@@ -575,6 +557,10 @@ def func_convex_convex_contact(
         tolerance = func_compute_tolerance(
             i_ga, i_gb, i_b, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
         )
+        if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+            tolerance = func_compute_mj_tolerance(
+                i_ga, i_gb, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
+            )
         diff_pos_tolerance = func_compute_tolerance(
             i_ga, i_gb, i_b, collider_info.diff_pos_tolerance[None], geoms_info, geoms_init_AABB
         )
@@ -621,10 +607,19 @@ def func_convex_convex_contact(
 
             # Apply perturbations to thread-local state
             if multi_contact and is_col_0:
-                # Perturbation axis must not be aligned with the principal axes of inertia the geometry,
-                # otherwise it would be more sensitive to ill-conditioning.
-                axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
-                qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
+                if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+                    # Match MuJoCo's perturbation pattern: single axis at a time
+                    # i_detection 1: (axis_0, -angle), 2: (axis_0, +angle),
+                    # 3: (axis_1, -angle), 4: (axis_1, +angle)
+                    axis_idx = (i_detection - 1) // 2
+                    angle_sign = 2 * ((i_detection - 1) % 2) - 1
+                    axis = axis_0 if axis_idx == 0 else axis_1
+                    qrot = gu.qd_rotvec_to_quat(angle_sign * collider_info.mc_perturbation[None] * axis, EPS)
+                else:
+                    # Perturbation axis must not be aligned with the principal axes of inertia the geometry,
+                    # otherwise it would be more sensitive to ill-conditioning.
+                    axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
+                    qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
 
                 # Apply perturbation starting from original state
                 ga_pos_current, ga_quat_current = func_rotate_frame(
@@ -931,10 +926,13 @@ def func_convex_convex_contact(
                     # contact points and thefore more continuous contact forces, without changing the mean-field
                     # dynamics since zero-penetration contact points should not induce any force.
                     penetration = normal.dot(contact_point_b - contact_point_a)
-                    if qd.static(collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MJ_GJK):
-                        # Only change penetration to the initial one, because the normal vector could change abruptly
-                        # under MuJoCo's GJK-EPA.
-                        penetration = penetration_0
+
+                # For MuJoCo-compatible GJK, set penetration of perturbed contacts to equal the initial contact's
+                # penetration, matching MuJoCo's behavior (engine_collision_convex.c:1010).
+                if qd.static(
+                    collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
+                ):
+                    penetration = penetration_0
 
                 # Discard contact point is repeated
                 repeated = False
@@ -1010,7 +1008,7 @@ def func_narrow_phase_convex_vs_convex(
                     and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX
                 )
             ):
-                if qd.static(sys.platform == "darwin"):
+                if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
                     func_convex_convex_contact(
                         i_ga=i_ga,
                         i_gb=i_gb,
@@ -1022,7 +1020,6 @@ def func_narrow_phase_convex_vs_convex(
                         geoms_init_AABB=geoms_init_AABB,
                         verts_info=verts_info,
                         faces_info=faces_info,
-                        edges_info=edges_info,
                         rigid_global_info=rigid_global_info,
                         static_rigid_sim_config=static_rigid_sim_config,
                         collider_state=collider_state,
@@ -1033,42 +1030,11 @@ def func_narrow_phase_convex_vs_convex(
                         gjk_state=gjk_state,
                         gjk_info=gjk_info,
                         gjk_static_config=gjk_static_config,
-                        sdf_info=sdf_info,
                         support_field_info=support_field_info,
                         # FIXME: Passing nested data structure as input argument is not supported for now.
                         diff_contact_input=diff_contact_input,
                         errno=errno,
                     )
-                else:
-                    if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
-                        func_convex_convex_contact(
-                            i_ga=i_ga,
-                            i_gb=i_gb,
-                            i_b=i_b,
-                            links_state=links_state,
-                            links_info=links_info,
-                            geoms_state=geoms_state,
-                            geoms_info=geoms_info,
-                            geoms_init_AABB=geoms_init_AABB,
-                            verts_info=verts_info,
-                            faces_info=faces_info,
-                            edges_info=edges_info,
-                            rigid_global_info=rigid_global_info,
-                            static_rigid_sim_config=static_rigid_sim_config,
-                            collider_state=collider_state,
-                            collider_info=collider_info,
-                            collider_static_config=collider_static_config,
-                            mpr_state=mpr_state,
-                            mpr_info=mpr_info,
-                            gjk_state=gjk_state,
-                            gjk_info=gjk_info,
-                            gjk_static_config=gjk_static_config,
-                            sdf_info=sdf_info,
-                            support_field_info=support_field_info,
-                            # FIXME: Passing nested data structure as input argument is not supported for now.
-                            diff_contact_input=diff_contact_input,
-                            errno=errno,
-                        )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
@@ -1164,22 +1130,21 @@ def func_narrow_phase_convex_specializations(
             if geoms_info.type[i_ga] > geoms_info.type[i_gb]:
                 i_ga, i_gb = i_gb, i_ga
 
-            if qd.static(sys.platform != "darwin"):
-                if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
-                    func_plane_box_contact(
-                        i_ga,
-                        i_gb,
-                        i_b,
-                        geoms_state,
-                        geoms_info,
-                        geoms_init_AABB,
-                        verts_info,
-                        static_rigid_sim_config,
-                        collider_state,
-                        collider_info,
-                        collider_static_config,
-                        errno,
-                    )
+            if geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:
+                func_plane_box_contact(
+                    i_ga,
+                    i_gb,
+                    i_b,
+                    geoms_state,
+                    geoms_info,
+                    geoms_init_AABB,
+                    verts_info,
+                    static_rigid_sim_config,
+                    collider_state,
+                    collider_info,
+                    collider_static_config,
+                    errno,
+                )
 
             if qd.static(static_rigid_sim_config.box_box_detection):
                 if geoms_info.type[i_ga] == gs.GEOM_TYPE.BOX and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX:

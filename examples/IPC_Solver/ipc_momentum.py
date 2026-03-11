@@ -13,7 +13,7 @@ def main():
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()
 
-    gs.init(backend=gs.gpu)
+    gs.init(backend=gs.cpu)
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -60,7 +60,7 @@ def main():
         material=gs.materials.Rigid(
             rho=1000,
             friction=0.3,
-            coupling_mode="two_way_soft_constraint",
+            coup_type="two_way_soft_constraint",
         ),
         surface=gs.surfaces.Plastic(
             color=(0.8, 0.2, 0.2, 0.8),

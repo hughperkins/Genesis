@@ -30,13 +30,13 @@ DELTA_ROT = 0.02
 
 
 def main():
-    gs.init(backend=gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu, logging_level="info")
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--coupling_type",
+        "--coup_type",
         type=str,
-        default="external_articulation",
+        default="two_way_soft_constraint",
         choices=["two_way_soft_constraint", "external_articulation"],
     )
     args = parser.parse_args()
@@ -55,10 +55,8 @@ def main():
             newton_semi_implicit_enable=False,  # Must be false to avoid time stealing artifact
             linear_system_tolerance=1e-3,
             contact_enable=True,
-            enable_rigid_rigid_contact=False,
+            enable_rigid_rigid_contact=True,
             contact_d_hat=0.001,
-            contact_friction_mu=0.5,
-            fem_fem_friction_mu=0.0,
             contact_resistance=1e7,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -74,10 +72,10 @@ def main():
 
     # Add Franka robot
     franka_material_kwargs = dict(
-        coupling_mode=args.coupling_type,
+        coup_type=args.coup_type,
     )
-    if args.coupling_type == "two_way_soft_constraint":
-        franka_material_kwargs["coupling_link_filter"] = ("left_finger", "right_finger")
+    if args.coup_type == "two_way_soft_constraint":
+        franka_material_kwargs["coup_links"] = ("left_finger", "right_finger")
     franka = scene.add_entity(
         gs.morphs.MJCF(
             file="xml/franka_emika_panda/panda_non_overlap.xml",
@@ -108,6 +106,7 @@ def main():
             rho=200,
             thickness=0.001,
             bending_stiffness=10.0,
+            friction_mu=0.5,
         ),
         surface=gs.surfaces.Plastic(
             color=(0.3, 0.1, 0.8, 1.0),
@@ -126,6 +125,7 @@ def main():
             rho=200,
             thickness=0.001,
             bending_stiffness=40.0,
+            friction_mu=0.5,
         ),
         surface=gs.surfaces.Plastic(
             color=(0.3, 0.5, 0.8, 1.0),
@@ -148,8 +148,8 @@ def main():
                 ),
                 material=gs.materials.Rigid(
                     rho=500,
-                    friction=0.5,
-                    coupling_mode="ipc_only",
+                    coup_friction=0.5,
+                    coup_type="ipc_only",
                 ),
                 surface=gs.surfaces.Plastic(
                     color=(0.8, 0.3, 0.2, 0.8),
@@ -167,13 +167,15 @@ def main():
 
     scene.build()
 
-    # FIXME: Setting initial configuration is not working...
-    # qpos = franka.inverse_kinematics(
-    #     link=ee_link, pos=target_pos, quat=target_quat, dofs_idx_local=motor_dofs_idx
-    # )
-    # qpos = (2.2116, -1.5328, -0.7347, -1.7235, -1.3377, 0.7519, -1.4410, 0.04, 0.04)
-    # franka.set_qpos(qpos)
-    # franka.control_dofs_position(qpos)
+    franka.set_dofs_kp(500.0, dofs_idx_local=finger_dofs_idx)
+    franka.set_dofs_kv(50.0, dofs_idx_local=finger_dofs_idx)
+
+    # Setting initial configuration is not supported by coupling mode "external_articulation"
+    if args.coup_type != "external_articulation":
+        # qpos = franka.inverse_kinematics(link=ee_link, pos=target_pos, quat=target_quat, dofs_idx_local=motor_dofs_idx)
+        qpos = (2.2116, -1.5328, -0.7347, -1.7235, -1.3377, 0.7519, -1.4410, 0.04, 0.04)
+        franka.set_qpos(qpos)
+        franka.control_dofs_position(qpos)
 
     target_ik = scene.draw_debug_frame(
         T=gu.trans_quat_to_T(target_pos, target_quat),
@@ -222,14 +224,15 @@ def main():
         Keybind("move_down", Key.M, KeyAction.HOLD, callback=move, args=((0, 0, -DELTA_POS),)),
         Keybind("yaw_left", Key.J, KeyAction.HOLD, callback=rotate, args=(2, DELTA_ROT)),
         Keybind("yaw_right", Key.K, KeyAction.HOLD, callback=rotate, args=(2, -DELTA_ROT)),
-        Keybind("pitch_up", Key.I, KeyAction.HOLD, callback=rotate, args=(1, DELTA_ROT)),
+        Keybind("pitch_up", Key.U, KeyAction.HOLD, callback=rotate, args=(1, DELTA_ROT)),
         Keybind("pitch_down", Key.O, KeyAction.HOLD, callback=rotate, args=(1, -DELTA_ROT)),
         Keybind("roll_left", Key.L, KeyAction.HOLD, callback=rotate, args=(0, DELTA_ROT)),
         Keybind("roll_right", Key.SEMICOLON, KeyAction.HOLD, callback=rotate, args=(0, -DELTA_ROT)),
-        Keybind("reset_scene", Key.U, KeyAction.PRESS, callback=reset_scene),
+        Keybind("reset_scene", Key.G, KeyAction.PRESS, callback=reset_scene),
         Keybind("close_gripper", Key.SPACE, KeyAction.PRESS, callback=set_gripper, args=(True,)),
         Keybind("open_gripper", Key.SPACE, KeyAction.RELEASE, callback=set_gripper, args=(False,)),
         Keybind("quit", Key.ESCAPE, KeyAction.PRESS, callback=stop),
+        overwrite=True,
     )
 
     try:
@@ -243,9 +246,11 @@ def main():
             franka.control_dofs_position(qpos[motor_dofs_idx], motor_dofs_idx)
 
             if gripper_close[()]:
-                franka.control_dofs_velocity([-0.1, -0.1], dofs_idx_local=finger_dofs_idx)
+                # FIXME: Force control is acting weird...
+                # franka.control_dofs_force(-0.1, dofs_idx_local=finger_dofs_idx)
+                franka.control_dofs_position(-0.03, dofs_idx_local=finger_dofs_idx)
             else:
-                franka.control_dofs_velocity([0.1, 0.1], dofs_idx_local=finger_dofs_idx)
+                franka.control_dofs_position(0.04, dofs_idx_local=finger_dofs_idx)
 
             scene.step()
 

@@ -203,6 +203,11 @@ class FEMEntity(Entity):
         if not is_valid:
             gs.raise_exception("Tensor shape not supported.")
 
+        # Immediately flush to the solver's internal elements_v so that the
+        # visualizer can render the updated positions without scene.step().
+        if is_valid and self._tgt["pos"] is not None:
+            self.set_pos(self._sim.cur_substep_local, self._tgt["pos"])
+
     def set_velocity(self, vel):
         """
         Set the target velocity(ies) for the FEM entity.
@@ -885,10 +890,15 @@ class FEMEntity(Entity):
             envs_idx : array_like, optional
                 List of environment indices to apply the constraints to. If None, applies to all environments.
         """
+        from genesis.engine.couplers import IPCCoupler
+
         if self._solver._use_implicit_solver and not self._solver._enable_vertex_constraints:
             gs.raise_exception(
                 "This feature is disabled. Please set 'enable_vertex_constraints=True' when using FEM implicit solver."
             )
+
+        if isinstance(self.sim.coupler, IPCCoupler):
+            gs.raise_exception("This method is only supported by IPC coupler.")
 
         if not self._solver._constraints_initialized:
             self._solver.init_constraints()
@@ -961,10 +971,10 @@ class FEMEntity(Entity):
     @qd.kernel
     def _kernel_get_verts_pos(self, f: qd.i32, pos: qd.types.ndarray(), verts_idx: qd.types.ndarray()):
         # get current position of vertices
-        for i_v, i_b in qd.ndrange(verts_idx.shape[0], verts_idx.shape[1]):
-            i_global = verts_idx[i_v, i_b] + self.v_start
+        for i_b, i_v_ in qd.ndrange(verts_idx.shape[0], verts_idx.shape[1]):
+            i_v = verts_idx[i_b, i_v_] + self.v_start
             for j in qd.static(range(3)):
-                pos[i_b, i_v, j] = self._solver.elements_v[f, i_global, i_b].pos[j]
+                pos[i_b, i_v_, j] = self._solver.elements_v[f, i_v, i_b].pos[j]
 
     def get_el2v(self):
         """
