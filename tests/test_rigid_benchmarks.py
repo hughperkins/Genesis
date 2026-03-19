@@ -774,6 +774,110 @@ def g1_fall(solver, n_envs, gjk, pytorch_profiler_step):
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
+def _find_head_geom_idx(robot, xml_path):
+    """Find the Genesis geom index for the head_collision geom by parsing the MJCF XML."""
+    import xml.etree.ElementTree as ET
+
+    geom_name = "head_collision"
+    tree = ET.parse(xml_path)
+    body_name, pos = None, None
+    for body in tree.find(".//worldbody").iter("body"):
+        for geom_el in body.findall("geom"):
+            if geom_el.get("name") == geom_name:
+                body_name = body.get("name")
+                pos = [float(x) for x in geom_el.get("pos", "0 0 0").split()]
+                break
+        if body_name:
+            break
+    if body_name is None:
+        raise ValueError(f"Geom '{geom_name}' not found in {xml_path}")
+    for i, g in enumerate(robot.geoms):
+        if g.link.name == body_name:
+            if all(abs(a - b) < 1e-6 for a, b in zip(g.init_pos, pos)):
+                return i
+    raise ValueError(f"Geom '{geom_name}' (body={body_name}) not matched in robot")
+
+
+@pytest.fixture
+def g1_fall_forever(solver, n_envs, gjk, pytorch_profiler_step):
+    """G1 humanoid falling with conditional per-env reset when head drops."""
+    import quadrants as qd
+
+    duration_warmup = 20.0
+    duration_record = 5.0
+    step_dt = 0.005
+    pelvis_height = 0.793
+    head_reset_threshold = 0.66
+    max_force = 50.0
+
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            dt=step_dt,
+            iterations=10,
+            tolerance=1e-5,
+            ls_iterations=20,
+            **(dict(constraint_solver=solver) if solver is not None else {}),
+            **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+
+    scene.add_entity(gs.morphs.Plane())
+    asset_path = get_hf_dataset(pattern="unitree_g1/*")
+    xml_path = f"{asset_path}/unitree_g1/g1_29dof_rev_1_0.xml"
+    robot = scene.add_entity(
+        gs.morphs.MJCF(
+            **get_file_morph_options(file=xml_path)
+        ),
+        vis_mode="collision",
+    )
+    time_start = time.time()
+    scene.build(n_envs=n_envs)
+    compile_time = time.time() - time_start
+
+    head_geom_idx = _find_head_geom_idx(robot, xml_path)
+
+    init_qpos = torch.zeros((robot.n_qs,), dtype=gs.tc_float, device=gs.device)
+    init_qpos[2] = pelvis_height
+    init_qpos[3] = 1.0
+    robot.set_qpos(init_qpos)
+
+    random_forces = torch.zeros(
+        (n_envs, robot.n_dofs), dtype=gs.tc_float, device=gs.device)
+
+    num_steps = 0
+    is_recording = False
+    qd.sync()
+    time_start = time.time()
+    while True:
+        random_forces.uniform_(-max_force, max_force)
+        robot.control_dofs_force(random_forces)
+        scene.step()
+
+        head_z = robot.geoms[head_geom_idx].get_pos()[:, 2]
+        fallen = (head_z < head_reset_threshold).nonzero(as_tuple=True)[0]
+        if len(fallen) > 0:
+            robot.set_qpos(init_qpos, envs_idx=fallen, zero_velocity=True)
+
+        pytorch_profiler_step()
+        time_elapsed = time.time() - time_start
+        if is_recording:
+            num_steps += 1
+            if time_elapsed > duration_record:
+                qd.sync()
+                time_elapsed = time.time() - time_start
+                break
+        elif time_elapsed > duration_warmup:
+            qd.sync()
+            time_start = time.time()
+            is_recording = True
+    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
+    realtime_factor = runtime_fps * step_dt
+
+    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+
+
 @pytest.fixture
 def dex_hand(solver, n_envs, gjk, pytorch_profiler_step):
     """Two shadow hands manipulating a drill on a table."""
@@ -1004,6 +1108,7 @@ def dex_hand(solver, n_envs, gjk, pytorch_profiler_step):
         ("box_pyramid_6", None, True, 4096, gs.gpu),
         ("box_pyramid_6", None, False, 4096, gs.gpu),
         ("g1_fall", gs.constraint_solver.Newton, None, 4096, gs.gpu),
+        ("g1_fall_forever", gs.constraint_solver.Newton, None, 4096, gs.gpu),
         ("dex_hand", None, None, 4096, gs.gpu),
     ],
 )
