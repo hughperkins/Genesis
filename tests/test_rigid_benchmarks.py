@@ -802,8 +802,8 @@ def g1_fall_forever(solver, n_envs, gjk, pytorch_profiler_step):
     """G1 humanoid falling with conditional per-env reset when head drops."""
     import quadrants as qd
 
-    duration_warmup = 20.0
-    duration_record = 5.0
+    duration_warmup = 5.0
+    duration_record = 10.0
     step_dt = 0.005
     pelvis_height = 0.793
     head_reset_threshold = 0.66
