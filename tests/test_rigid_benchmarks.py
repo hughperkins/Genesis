@@ -774,7 +774,7 @@ def g1_fall(solver, n_envs, gjk, pytorch_profiler_step):
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
-def _find_geom_idx(robot, xml_path, geom_name):
+def _find_geom_idx(robot: "gs.engine.entities.RigidEntity", xml_path: str, geom_name: str) -> int:
     """Find the Genesis geom index for a named MJCF geom by parsing the XML."""
     import xml.etree.ElementTree as ET
 
