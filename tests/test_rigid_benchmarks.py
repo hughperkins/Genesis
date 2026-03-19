@@ -774,11 +774,10 @@ def g1_fall(solver, n_envs, gjk, pytorch_profiler_step):
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
-def _find_head_geom_idx(robot, xml_path):
-    """Find the Genesis geom index for the head_collision geom by parsing the MJCF XML."""
+def _find_geom_idx(robot, xml_path, geom_name):
+    """Find the Genesis geom index for a named MJCF geom by parsing the XML."""
     import xml.etree.ElementTree as ET
 
-    geom_name = "head_collision"
     tree = ET.parse(xml_path)
     body_name, pos = None, None
     for body in tree.find(".//worldbody").iter("body"):
@@ -836,7 +835,7 @@ def g1_fall_forever(solver, n_envs, gjk, pytorch_profiler_step):
     scene.build(n_envs=n_envs)
     compile_time = time.time() - time_start
 
-    head_geom_idx = _find_head_geom_idx(robot, xml_path)
+    head_geom_idx = _find_geom_idx(robot, xml_path, "head_collision")
 
     init_qpos = torch.zeros((robot.n_qs,), dtype=gs.tc_float, device=gs.device)
     init_qpos[2] = pelvis_height
