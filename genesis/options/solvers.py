@@ -521,6 +521,9 @@ class RigidOptions(Options):
     # GJK collision detection
     use_gjk_collision: StrictBool | None = None
 
+    # Broadphase kernel decomposition: 1 = single-kernel SAP, 2 = two-kernel (generate+validate), 3 = three-kernel
+    broadphase_kernels: int = 2
+
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
         super().__init__(**data)
         if contact_resolve_time is not None:

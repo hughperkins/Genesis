@@ -30,6 +30,8 @@ from .broadphase import (
     func_check_collision_valid,
     func_collision_clear,
     func_broad_phase,
+    func_broad_phase_generate_candidates,
+    func_broad_phase_validate_candidates,
 )
 
 from .contact import (
@@ -657,19 +659,124 @@ class Collider:
             return
 
         self._contact_data_cache.clear()
-        func_broad_phase(
-            self._solver.links_state,
-            self._solver.links_info,
-            self._solver.geoms_state,
-            self._solver.geoms_info,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
-            self._solver.constraint_solver.constraint_state,
-            self._collider_state,
-            self._solver.equalities_info,
-            self._collider_info,
-            self._solver._errno,
-        )
+
+        broadphase_kernels = self._solver._options.broadphase_kernels
+        use_two_kernel = broadphase_kernels >= 2
+        use_three_kernel = broadphase_kernels >= 3
+
+        if use_two_kernel and use_three_kernel:
+            import time
+            from genesis.engine.solvers.rigid.collider.broadphase import (
+                func_collision_clear_kernel,
+                func_broad_phase_sort_only,
+                func_broad_phase_sweep_candidates,
+            )
+
+            if not hasattr(self, "_kernel_times"):
+                self._kernel_times = {"sort": [], "sweep": [], "validate": []}
+
+            func_collision_clear_kernel(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._collider_state,
+                self._solver._static_rigid_sim_config,
+            )
+
+            gs.qd.sync()
+            t0 = time.perf_counter()
+            func_broad_phase_sort_only(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._collider_state,
+                self._collider_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
+            gs.qd.sync()
+            t1 = time.perf_counter()
+            self._kernel_times["sort"].append((t1 - t0) * 1000)
+
+            gs.qd.sync()
+            t0 = time.perf_counter()
+            func_broad_phase_sweep_candidates(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._collider_state,
+                self._collider_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
+            gs.qd.sync()
+            t1 = time.perf_counter()
+            self._kernel_times["sweep"].append((t1 - t0) * 1000)
+
+            self._collider_state.n_broad_pairs.fill(0)
+
+            gs.qd.sync()
+            t0 = time.perf_counter()
+            func_broad_phase_validate_candidates(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._collider_state,
+                self._collider_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+                self._solver.constraint_solver.constraint_state,
+                self._solver.equalities_info,
+                self._solver._errno,
+            )
+            gs.qd.sync()
+            t1 = time.perf_counter()
+            self._kernel_times["validate"].append((t1 - t0) * 1000)
+
+        elif use_two_kernel:
+            self._collider_state.n_candidates.fill(0)
+            self._collider_state.n_broad_pairs.fill(0)
+
+            func_broad_phase_generate_candidates(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._collider_state,
+                self._collider_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
+
+            func_broad_phase_validate_candidates(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._collider_state,
+                self._collider_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+                self._solver.constraint_solver.constraint_state,
+                self._solver.equalities_info,
+                self._solver._errno,
+            )
+        else:
+            func_broad_phase(
+                self._solver.links_state,
+                self._solver.links_info,
+                self._solver.geoms_state,
+                self._solver.geoms_info,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+                self._solver.constraint_solver.constraint_state,
+                self._collider_state,
+                self._solver.equalities_info,
+                self._collider_info,
+                self._solver._errno,
+            )
         if self._use_split_narrowphase:
             narrowphase._func_reset_narrowphase_work_queues(
                 self._collider_state,
