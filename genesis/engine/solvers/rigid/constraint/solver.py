@@ -1402,32 +1402,30 @@ def func_hessian_direct_batch(
         for i_d2 in range(i_d1 + 1):
             constraint_state.nt_H[i_b, i_d1, i_d2] = gs.qd_float(0.0)
 
-    # Compute `H += J.T @ D @ J` using either dense or sparse implementation
+    # Compute `H += (sqrt(D)*J).T @ (sqrt(D)*J)` using either dense or sparse implementation
     if qd.static(static_rigid_sim_config.sparse_solve):
         for i_c in range(constraint_state.n_constraints[i_b]):
+            sqrt_D_active = qd.sqrt(constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b])
             jac_n_relevant_dofs = constraint_state.jac_n_relevant_dofs[i_c, i_b]
             for i_d1_ in range(jac_n_relevant_dofs):
                 i_d1 = constraint_state.jac_relevant_dofs[i_c, i_d1_, i_b]
-                if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
+                jd1 = constraint_state.jac[i_c, i_d1, i_b] * sqrt_D_active
+                if qd.abs(jd1) > EPS:
                     for i_d2_ in range(i_d1_, jac_n_relevant_dofs):
                         i_d2 = constraint_state.jac_relevant_dofs[i_c, i_d2_, i_b]  # i_d2 is strictly <= i_d1
+                        jd2 = constraint_state.jac[i_c, i_d2, i_b] * sqrt_D_active
                         constraint_state.nt_H[i_b, i_d1, i_d2] = (
-                            constraint_state.nt_H[i_b, i_d1, i_d2]
-                            + constraint_state.jac[i_c, i_d2, i_b]
-                            * constraint_state.jac[i_c, i_d1, i_b]
-                            * constraint_state.efc_D[i_c, i_b]
-                            * constraint_state.active[i_c, i_b]
+                            constraint_state.nt_H[i_b, i_d1, i_d2] + jd1 * jd2
                         )
     else:
         for i_d1, i_c in qd.ndrange(n_dofs, constraint_state.n_constraints[i_b]):
-            if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
+            sqrt_D_active = qd.sqrt(constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b])
+            jd1 = constraint_state.jac[i_c, i_d1, i_b] * sqrt_D_active
+            if qd.abs(jd1) > EPS:
                 for i_d2 in range(i_d1 + 1):
+                    jd2 = constraint_state.jac[i_c, i_d2, i_b] * sqrt_D_active
                     constraint_state.nt_H[i_b, i_d1, i_d2] = (
-                        constraint_state.nt_H[i_b, i_d1, i_d2]
-                        + constraint_state.jac[i_c, i_d2, i_b]
-                        * constraint_state.jac[i_c, i_d1, i_b]
-                        * constraint_state.efc_D[i_c, i_b]
-                        * constraint_state.active[i_c, i_b]
+                        constraint_state.nt_H[i_b, i_d1, i_d2] + jd1 * jd2
                     )
 
     # Compute `H += M`
@@ -1478,17 +1476,17 @@ def func_hessian_direct_tiled(
 
         jac_row = qd.simt.block.SharedArray((MAX_CONSTRAINTS_PER_BLOCK, MAX_DOFS_PER_BLOCK), gs.qd_float)
         jac_col = qd.simt.block.SharedArray((MAX_CONSTRAINTS_PER_BLOCK, MAX_DOFS_PER_BLOCK), gs.qd_float)
-        efc_D = qd.simt.block.SharedArray((MAX_CONSTRAINTS_PER_BLOCK,), gs.qd_float)
+        sqrt_D_active = qd.simt.block.SharedArray((MAX_CONSTRAINTS_PER_BLOCK,), gs.qd_float)
 
         # Loop over all the constraints and accumulate their respective contributions to the Hessian matrix
         i_c_start = 0
         n_c = constraint_state.n_constraints[i_b]
         while i_c_start < n_c:
-            # Store masked `efc_D` in shared memory for fast access
+            # Pre-compute sqrt(D * active) per constraint tile for folding into jac
             i_c_ = tid
             n_conts_tile = qd.min(MAX_CONSTRAINTS_PER_BLOCK, n_c - i_c_start)
             while i_c_ < n_conts_tile:
-                efc_D[i_c_] = (
+                sqrt_D_active[i_c_] = qd.sqrt(
                     constraint_state.efc_D[i_c_start + i_c_, i_b] * constraint_state.active[i_c_start + i_c_, i_b]
                 )
                 i_c_ = i_c_ + BLOCK_DIM
@@ -1498,11 +1496,12 @@ def func_hessian_direct_tiled(
             while i_d1_start < n_dofs:
                 n_dofs_tile_row = qd.min(MAX_DOFS_PER_BLOCK, n_dofs - i_d1_start)
 
-                # Copy Jacobian row blocks to shared memory for fast access
+                # Copy Jacobian row blocks pre-multiplied by sqrt(D * active) to shared memory
                 i_c_ = tid
                 while i_c_ < n_conts_tile:
+                    sd = sqrt_D_active[i_c_]
                     for i_d_ in range(n_dofs_tile_row):
-                        jac_row[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d1_start + i_d_, i_b]
+                        jac_row[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d1_start + i_d_, i_b] * sd
                     i_c_ = i_c_ + BLOCK_DIM
                 qd.simt.block.sync()
 
@@ -1512,17 +1511,17 @@ def func_hessian_direct_tiled(
                     n_dofs_tile_col = qd.min(MAX_DOFS_PER_BLOCK, n_dofs - i_d2_start)
                     is_diag_tile = i_d1_start == i_d2_start
 
-                    # Copy Jacobian column block to shared memory for fast access if necessary, i.e. the hessian block
-                    # being considered is a diagonal block.
+                    # Copy Jacobian column block pre-multiplied by sqrt(D * active) if off-diagonal
                     if not is_diag_tile:
                         i_c_ = tid
                         while i_c_ < n_conts_tile:
+                            sd = sqrt_D_active[i_c_]
                             for i_d_ in range(n_dofs_tile_col):
-                                jac_col[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d2_start + i_d_, i_b]
+                                jac_col[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d2_start + i_d_, i_b] * sd
                             i_c_ = i_c_ + BLOCK_DIM
                         qd.simt.block.sync()
 
-                    # Compute `H += J.T @ D @ J` for a single Hessian block
+                    # Compute `H += (sqrt(D)*J).T @ (sqrt(D)*J)` for a single Hessian block
                     pid = tid
                     numel = n_dofs_tile_row * n_dofs_tile_col
                     while pid < numel:
@@ -1536,10 +1535,10 @@ def func_hessian_direct_tiled(
                                 coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             if is_diag_tile:
                                 for j_c_ in range(n_conts_tile):
-                                    coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_] * efc_D[j_c_]
+                                    coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_]
                             else:
                                 for j_c_ in range(n_conts_tile):
-                                    coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_] * efc_D[j_c_]
+                                    coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_]
                             if i_c_start == 0:
                                 constraint_state.nt_H[i_b, i_d1, i_d2] = coef
                             else:
