@@ -304,7 +304,7 @@ def func_solve_decomposed(
     rigid_global_info,
     static_rigid_sim_config,
     _n_iterations,
-    _ls_iterations=0,
+    _ls_iterations,
 ):
     """
     Uses separate kernels for each solver step per iteration.

@@ -2029,10 +2029,10 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     enable_joint_limit: bool
     box_box_detection: bool
     sparse_solve: bool
-    ls_parallel: bool
     integrator: int
     solver_type: int
     requires_grad: bool
+    ls_parallel: bool = False
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
     tiled_n_dofs_per_entity: int = -1

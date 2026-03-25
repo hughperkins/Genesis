@@ -3270,7 +3270,7 @@ def func_solve_body(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     _n_iterations: int,
-    _ls_iterations: int = 0,
+    _ls_iterations: int,
 ) -> None: ...
 
 
@@ -3283,7 +3283,7 @@ def func_solve_body_monolith(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     _n_iterations: int,
-    _ls_iterations: int = 0,
+    _ls_iterations: int,
 ):
     _B = constraint_state.grad.shape[1]
 
