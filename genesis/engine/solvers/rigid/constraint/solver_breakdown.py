@@ -215,6 +215,87 @@ def _kernel_update_search_direction(
             )
 
 
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_linesearch_prepare(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Compute mv, jv, and quad_gauss needed before parallel linesearch evaluation."""
+    _B = constraint_state.grad.shape[1]
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_ls_prepare(
+                i_b,
+                entities_info=entities_info,
+                dofs_state=dofs_state,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_linesearch_parallel_eval(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+    _ls_iterations: ti.template(),
+):
+    """Evaluate linesearch cost at many alpha values in parallel."""
+    _B = constraint_state.grad.shape[1]
+    for i_b, i_alpha in ti.ndrange(_B, _ls_iterations):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_ls_parallel_eval_cost(
+                i_b,
+                i_alpha,
+                _ls_iterations,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+            )
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_linesearch_pick_best(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+    _ls_iterations: ti.template(),
+):
+    """Pick the alpha with minimum cost from parallel evaluation results."""
+    _B = constraint_state.grad.shape[1]
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_ls_parallel_pick_best(
+                i_b,
+                _ls_iterations,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+            )
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_linesearch_apply_alpha(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Apply the chosen alpha: update qacc, Ma, Jaref."""
+    _B = constraint_state.grad.shape[1]
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_ls_apply_alpha(
+                i_b,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+            )
+
+
 @solver.func_solve_body.register(is_compatible=lambda *args, **kwargs: gs.backend in {gs.cuda})
 def func_solve_decomposed(
     entities_info,
@@ -223,6 +304,7 @@ def func_solve_decomposed(
     rigid_global_info,
     static_rigid_sim_config,
     _n_iterations,
+    _ls_iterations=0,
 ):
     """
     Uses separate kernels for each solver step per iteration.
@@ -231,14 +313,41 @@ def func_solve_decomposed(
     and more flexibility in execution, at the cost of more Python→C++ boundary crossings.
     """
     # _n_iterations is a Python-native int to avoid CPU-GPU sync (vs rigid_global_info.iterations[None])
+    _ls_parallel = static_rigid_sim_config.ls_parallel
     for _it in range(_n_iterations):
-        _kernel_linesearch(
-            entities_info,
-            dofs_state,
-            constraint_state,
-            rigid_global_info,
-            static_rigid_sim_config,
-        )
+        if _ls_parallel:
+            _kernel_linesearch_prepare(
+                entities_info,
+                dofs_state,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+            _kernel_linesearch_parallel_eval(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+                _ls_iterations,
+            )
+            _kernel_linesearch_pick_best(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+                _ls_iterations,
+            )
+            _kernel_linesearch_apply_alpha(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+        else:
+            _kernel_linesearch(
+                entities_info,
+                dofs_state,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.CG:
             _kernel_cg_only_save_prev_grad(
                 constraint_state,

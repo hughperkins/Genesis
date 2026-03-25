@@ -440,6 +440,13 @@ class RigidOptions(Options):
         Number of line search iterations for the constraint solver. Defaults to 50.
     ls_tolerance : float, optional
         Tolerance for the line search. Defaults to 1e-2.
+    ls_parallel : bool, optional
+        Whether to use parallel linesearch (evaluate many step sizes simultaneously) instead of
+        iterative Newton-based linesearch. Only effective on GPU with the decomposed solver path.
+        Defaults to False.
+    ls_parallel_min_step : float, optional
+        Minimum step size for parallel linesearch alpha candidates (log-spaced from this value to 1.0).
+        Only used when ls_parallel is True. Defaults to 1e-6.
     noslip_iterations : int, optional
         Number of iterations for the noslip solver. Defaults to 0 (disabled).
         noslip is a post-processing step after the main solver to suppress slip/drift.
@@ -499,6 +506,8 @@ class RigidOptions(Options):
     tolerance: PositiveFloat = 1e-6
     ls_iterations: PositiveInt = 50
     ls_tolerance: PositiveFloat = 1e-2
+    ls_parallel: StrictBool = False
+    ls_parallel_min_step: PositiveFloat = 1e-6
     noslip_iterations: NonNegativeInt = 0
     noslip_tolerance: PositiveFloat = 1e-6
     sparse_solve: StrictBool = False

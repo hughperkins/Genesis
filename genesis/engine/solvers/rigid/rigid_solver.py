@@ -364,6 +364,7 @@ class RigidSolver(KinematicSolver):
             enable_joint_limit=self._enable_joint_limit,
             box_box_detection=self._box_box_detection,
             sparse_solve=self._options.sparse_solve,
+            ls_parallel=self._options.ls_parallel,
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
         )

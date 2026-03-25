@@ -129,6 +129,7 @@ class StructRigidGlobalInfo(metaclass=BASE_METACLASS):
     tolerance: V_ANNOTATION
     ls_iterations: V_ANNOTATION
     ls_tolerance: V_ANNOTATION
+    ls_parallel_min_step: V_ANNOTATION
     noslip_iterations: V_ANNOTATION
     noslip_tolerance: V_ANNOTATION
     n_equalities: V_ANNOTATION
@@ -181,6 +182,7 @@ def get_rigid_global_info(solver, kinematic_only):
             tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             ls_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
             ls_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
+            ls_parallel_min_step=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             noslip_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
             noslip_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             n_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
@@ -216,6 +218,7 @@ def get_rigid_global_info(solver, kinematic_only):
         tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.tolerance),
         ls_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._options.ls_iterations),
         ls_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.ls_tolerance),
+        ls_parallel_min_step=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.ls_parallel_min_step),
         noslip_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._options.noslip_iterations),
         noslip_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.noslip_tolerance),
         n_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._n_equalities),
@@ -272,6 +275,8 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     eq_sum: V_ANNOTATION
     ls_it: V_ANNOTATION
     ls_result: V_ANNOTATION
+    ls_alpha: V_ANNOTATION
+    ls_cost_buffer: V_ANNOTATION
     # Optional CG fields
     cg_prev_grad: V_ANNOTATION
     cg_prev_Mgrad: V_ANNOTATION
@@ -312,6 +317,9 @@ def get_constraint_state(constraint_solver, solver):
     _B = solver._B
     len_constraints_ = constraint_solver.len_constraints_
 
+    ls_parallel = solver._options.ls_parallel
+    ls_iterations = solver._options.ls_iterations
+
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
@@ -344,6 +352,8 @@ def get_constraint_state(constraint_solver, solver):
         gtol=V(dtype=gs.qd_float, shape=(_B,)),
         ls_it=V(dtype=gs.qd_int, shape=(_B,)),
         ls_result=V(dtype=gs.qd_int, shape=(_B,)),
+        ls_alpha=V(dtype=gs.qd_float, shape=maybe_shape((_B,), ls_parallel)),
+        ls_cost_buffer=V(dtype=gs.qd_float, shape=maybe_shape((ls_iterations, _B), ls_parallel)),
         cg_beta=V(dtype=gs.qd_float, shape=(_B,)),
         cg_pg_dot_pMg=V(dtype=gs.qd_float, shape=(_B,)),
         quad_gauss=V(dtype=gs.qd_float, shape=(3, _B)),
@@ -2019,6 +2029,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     enable_joint_limit: bool
     box_box_detection: bool
     sparse_solve: bool
+    ls_parallel: bool
     integrator: int
     solver_type: int
     requires_grad: bool

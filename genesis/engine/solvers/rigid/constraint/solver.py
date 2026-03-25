@@ -37,6 +37,8 @@ class ConstraintSolver:
         self.tolerance = rigid_solver._options.tolerance
         self.ls_iterations = rigid_solver._options.ls_iterations
         self.ls_tolerance = rigid_solver._options.ls_tolerance
+        self.ls_parallel = rigid_solver._options.ls_parallel
+        self.ls_parallel_min_step = rigid_solver._options.ls_parallel_min_step
         self.sparse_solve = rigid_solver._options.sparse_solve
 
         # Note that it must be over-estimated because friction parameters and joint limits may be updated dynamically.
@@ -224,6 +226,7 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
             self._n_iterations,
+            self.ls_iterations if self.ls_parallel else 0,
         )
 
         func_update_qacc(
@@ -2564,6 +2567,163 @@ def func_linesearch_batch(
 
 
 # =====================================================================================================================
+# ============================================ Parallel Linesearch =====================================================
+# =====================================================================================================================
+
+
+@qd.func
+def _log_scale(min_value, max_value, num_values, i):
+    step = (qd.log(max_value) - qd.log(min_value)) / qd.max(1.0, gs.qd_float(num_values - 1))
+    return qd.exp(qd.log(min_value) + gs.qd_float(i) * step)
+
+
+@qd.func
+def func_ls_prepare(
+    i_b,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Compute mv, jv, and quad_gauss for parallel linesearch."""
+    n_dofs = constraint_state.search.shape[0]
+    n_entities = entities_info.dof_start.shape[0]
+    n_con = constraint_state.n_constraints[i_b]
+
+    for i_e in range(n_entities):
+        for i_d1 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+            mv = gs.qd_float(0.0)
+            for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+            constraint_state.mv[i_d1, i_b] = mv
+
+    for i_c in range(n_con):
+        jv = gs.qd_float(0.0)
+        if qd.static(static_rigid_sim_config.sparse_solve):
+            for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+        else:
+            for i_d in range(n_dofs):
+                jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+        constraint_state.jv[i_c, i_b] = jv
+
+    quad_gauss_1 = gs.qd_float(0.0)
+    quad_gauss_2 = gs.qd_float(0.0)
+    for i_d in range(n_dofs):
+        quad_gauss_1 = quad_gauss_1 + (
+            constraint_state.search[i_d, i_b] * constraint_state.Ma[i_d, i_b]
+            - constraint_state.search[i_d, i_b] * dofs_state.force[i_d, i_b]
+        )
+        quad_gauss_2 = quad_gauss_2 + 0.5 * constraint_state.search[i_d, i_b] * constraint_state.mv[i_d, i_b]
+    constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+    constraint_state.quad_gauss[1, i_b] = quad_gauss_1
+    constraint_state.quad_gauss[2, i_b] = quad_gauss_2
+
+
+@qd.func
+def func_ls_parallel_eval_cost(
+    i_b,
+    i_alpha,
+    ls_iterations,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Evaluate total cost at one candidate alpha for one environment."""
+    min_step = rigid_global_info.ls_parallel_min_step[None]
+    alpha = _log_scale(min_step, 1.0, ls_iterations, i_alpha)
+
+    q0 = constraint_state.quad_gauss[0, i_b]
+    q1 = constraint_state.quad_gauss[1, i_b]
+    q2 = constraint_state.quad_gauss[2, i_b]
+
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    for i_c in range(ne):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        q0 = q0 + D * (0.5 * Jaref_c * Jaref_c)
+        q1 = q1 + D * (jv_c * Jaref_c)
+        q2 = q2 + D * (0.5 * jv_c * jv_c)
+
+    for i_c in range(ne, nef):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        f = constraint_state.efc_frictionloss[i_c, i_b]
+        r = constraint_state.diag[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        rf = r * f
+        if x <= -rf:
+            q0 = q0 + f * (-0.5 * rf - Jaref_c)
+            q1 = q1 + (-f * jv_c)
+        elif x >= rf:
+            q0 = q0 + f * (-0.5 * rf + Jaref_c)
+            q1 = q1 + f * jv_c
+        else:
+            q0 = q0 + D * (0.5 * Jaref_c * Jaref_c)
+            q1 = q1 + D * (jv_c * Jaref_c)
+            q2 = q2 + D * (0.5 * jv_c * jv_c)
+
+    for i_c in range(nef, n_con):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        if x < 0:
+            q0 = q0 + D * (0.5 * Jaref_c * Jaref_c)
+            q1 = q1 + D * (jv_c * Jaref_c)
+            q2 = q2 + D * (0.5 * jv_c * jv_c)
+
+    cost = alpha * alpha * q2 + alpha * q1 + q0
+    constraint_state.ls_cost_buffer[i_alpha, i_b] = cost
+
+
+@qd.func
+def func_ls_parallel_pick_best(
+    i_b,
+    ls_iterations,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Pick the alpha with minimum cost."""
+    min_step = rigid_global_info.ls_parallel_min_step[None]
+    best_cost = gs.qd_float(1e30)
+    best_id = 0
+    for i in range(ls_iterations):
+        c = constraint_state.ls_cost_buffer[i, i_b]
+        if c < best_cost:
+            best_cost = c
+            best_id = i
+    constraint_state.ls_alpha[i_b] = _log_scale(min_step, 1.0, ls_iterations, best_id)
+
+
+@qd.func
+def func_ls_apply_alpha(
+    i_b,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Apply chosen alpha to update qacc, Ma, and Jaref."""
+    alpha = constraint_state.ls_alpha[i_b]
+    n_dofs = constraint_state.qacc.shape[0]
+    if qd.abs(alpha) < rigid_global_info.EPS[None]:
+        constraint_state.improved[i_b] = False
+    else:
+        for i_d in range(n_dofs):
+            constraint_state.qacc[i_d, i_b] = (
+                constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
+            )
+            constraint_state.Ma[i_d, i_b] = constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+        for i_c in range(constraint_state.n_constraints[i_b]):
+            constraint_state.Jaref[i_c, i_b] = constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+
+
+# =====================================================================================================================
 # ================================================= Solving Algorithm =================================================
 # =====================================================================================================================
 
@@ -3110,6 +3270,7 @@ def func_solve_body(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     _n_iterations: int,
+    _ls_iterations: int = 0,
 ) -> None: ...
 
 
@@ -3122,6 +3283,7 @@ def func_solve_body_monolith(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     _n_iterations: int,
+    _ls_iterations: int = 0,
 ):
     _B = constraint_state.grad.shape[1]
 
