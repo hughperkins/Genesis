@@ -71,8 +71,9 @@ class broadphase_traversal(IntEnum):
 
 # rigid solver broadphase filter chain (combinable bitmask)
 class broadphase_filter(_IntFlag):
-    SPHERE = 1
-    AABB = 2
+    PLANE = 1
+    SPHERE = 2
+    AABB = 4
 
 
 # backend

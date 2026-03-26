@@ -527,7 +527,7 @@ class Collider:
             elif g.type == gs.GEOM_TYPE.BOX:
                 rbound[i] = np.sqrt(g.data[0] ** 2 + g.data[1] ** 2 + g.data[2] ** 2)
             elif g.type == gs.GEOM_TYPE.PLANE:
-                rbound[i] = np.finfo(gs.np_float).max
+                rbound[i] = 0.0
             else:
                 verts = g.init_verts[0] if g.init_verts.ndim == 3 else g.init_verts
                 centroid = verts.mean(axis=0)

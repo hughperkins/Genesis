@@ -413,6 +413,46 @@ def func_broad_phase_all_vs_all_clear(
 
 
 @qd.func
+def func_plane_filter(
+    geoms_state: array_class.GeomsState,
+    collider_info: array_class.ColliderInfo,
+    i_ga,
+    i_gb,
+    i_b,
+):
+    """Check if a geom is within rbound distance of a plane's surface.
+
+    Assumes at least one of the geoms has rbound == 0 (i.e. is a plane).
+    The plane normal is the z-axis of the plane's world-space rotation,
+    derived from its quaternion.
+    """
+    rbound_a = collider_info.geom_rbound[i_ga]
+    rbound_b = collider_info.geom_rbound[i_gb]
+
+    if rbound_a == 0.0:
+        plane_pos = geoms_state.pos[i_ga, i_b]
+        plane_quat = geoms_state.quat[i_ga, i_b]
+        geom_pos = geoms_state.pos[i_gb, i_b]
+        bound = rbound_b
+    else:
+        plane_pos = geoms_state.pos[i_gb, i_b]
+        plane_quat = geoms_state.quat[i_gb, i_b]
+        geom_pos = geoms_state.pos[i_ga, i_b]
+        bound = rbound_a
+
+    # Plane normal = z-column of rotation matrix from quaternion (w, x, y, z)
+    w, x, y, z = plane_quat
+    normal = qd.Vector([
+        2.0 * (x * z + w * y),
+        2.0 * (y * z - w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    ])
+
+    dist = (geom_pos - plane_pos).dot(normal)
+    return dist <= bound
+
+
+@qd.func
 def func_is_spheres_overlap(
     geoms_state: array_class.GeomsState,
     collider_info: array_class.ColliderInfo,
@@ -447,8 +487,9 @@ def func_broad_phase_all_vs_all(
     All-vs-all broad-phase collision detection.
 
     Iterates over pre-filtered valid geom pairs in parallel across pairs and batches.
-    Applies the configured filter chain (SPHERE, AABB, or both) to each pair.
-    Passing pairs are appended to the output buffer via atomic add.
+    For plane pairs (rbound == 0), applies the PLANE filter. For other pairs, applies
+    the SPHERE then AABB filter cascade. Passing pairs are appended to the output
+    buffer via atomic add.
     """
     n_valid_pairs = collider_info.n_valid_pairs[None]
     _B = collider_state.n_contacts.shape[0]
@@ -472,16 +513,25 @@ def func_broad_phase_all_vs_all(
         ):
             continue
 
-        # Filter chain: SPHERE then AABB (compile-time branching via bitmask)
+        # Filter chain (compile-time branching via bitmask).
+        # If either geom is a plane (rbound == 0), only the PLANE filter applies.
+        # Otherwise, SPHERE then AABB cascade.
         is_overlap = True
+        rbound_a = collider_info.geom_rbound[i_ga]
+        rbound_b = collider_info.geom_rbound[i_gb]
 
-        if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.SPHERE)):
-            if not func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
-                is_overlap = False
+        if rbound_a == 0.0 or rbound_b == 0.0:
+            if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.PLANE)):
+                if not func_plane_filter(geoms_state, collider_info, i_ga, i_gb, i_b):
+                    is_overlap = False
+        else:
+            if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.SPHERE)):
+                if not func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                    is_overlap = False
 
-        if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.AABB)):
-            if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
-                is_overlap = False
+            if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.AABB)):
+                if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
+                    is_overlap = False
 
         if not is_overlap:
             if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
