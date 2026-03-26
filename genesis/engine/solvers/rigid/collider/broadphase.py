@@ -441,12 +441,15 @@ def func_plane_filter(
         bound = rbound_a
 
     # Plane normal = z-column of rotation matrix from quaternion (w, x, y, z)
-    w, x, y, z = plane_quat
+    qw = plane_quat[0]
+    qx = plane_quat[1]
+    qy = plane_quat[2]
+    qz = plane_quat[3]
     normal = qd.Vector(
         [
-            2.0 * (x * z + w * y),
-            2.0 * (y * z - w * x),
-            1.0 - 2.0 * (x * x + y * y),
+            2.0 * (qx * qz + qw * qy),
+            2.0 * (qy * qz - qw * qx),
+            1.0 - 2.0 * (qx * qx + qy * qy),
         ]
     )
 
