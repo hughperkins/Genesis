@@ -347,8 +347,13 @@ class AnalyticalVsGJKSceneCreator:
 
     def setup_scenes(self) -> tuple[gs.Scene, gs.Scene]:
         """Build both scenes WITHOUT any monkey-patching."""
+        _sap_opts = dict(
+            broadphase_traversal=gs.broadphase_traversal.SAP,
+            broadphase_filter=gs.broadphase_filter.AABB,
+        )
         # Scene 1: Using ORIGINAL analytical collision detection
         self.scene_analytical = gs.Scene(
+            rigid_options=gs.options.RigidOptions(**_sap_opts),
             show_viewer=self.show_viewer,
         )
         self.build_scene(
@@ -361,6 +366,7 @@ class AnalyticalVsGJKSceneCreator:
         self.scene_gjk = gs.Scene(
             rigid_options=gs.options.RigidOptions(
                 use_gjk_collision=True,
+                **_sap_opts,
             ),
             show_viewer=self.show_viewer,
         )
