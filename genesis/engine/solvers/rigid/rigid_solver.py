@@ -367,6 +367,7 @@ class RigidSolver(KinematicSolver):
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
             broadphase_traversal=self._options.broadphase_traversal,
+            broadphase_filter=self._options.broadphase_filter,
         )
 
         if self.is_active:

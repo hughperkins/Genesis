@@ -192,6 +192,7 @@ class Collider:
         )
         self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()
+        self._init_geom_rbound()
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
         self._init_max_contact_pairs(self._n_possible_pairs)
         self._init_terrain_state()
@@ -508,6 +509,30 @@ class Collider:
         if len(self._valid_pairs_a) > 0:
             self._collider_info.valid_pairs_a.from_numpy(self._valid_pairs_a)
             self._collider_info.valid_pairs_b.from_numpy(self._valid_pairs_b)
+
+    def _init_geom_rbound(self):
+        """Precompute bounding sphere radius per geom for the sphere broadphase filter."""
+        geoms = self._solver.geoms
+        n_geoms = self._solver.n_geoms
+        if n_geoms == 0:
+            return
+        rbound = np.zeros(n_geoms, dtype=gs.np_float)
+        for i, g in enumerate(geoms):
+            if g.type == gs.GEOM_TYPE.SPHERE:
+                rbound[i] = g.data[0]
+            elif g.type == gs.GEOM_TYPE.CAPSULE:
+                rbound[i] = g.data[0] + 0.5 * g.data[1]
+            elif g.type == gs.GEOM_TYPE.ELLIPSOID:
+                rbound[i] = max(g.data[0], g.data[1], g.data[2])
+            elif g.type == gs.GEOM_TYPE.BOX:
+                rbound[i] = np.sqrt(g.data[0] ** 2 + g.data[1] ** 2 + g.data[2] ** 2)
+            elif g.type == gs.GEOM_TYPE.PLANE:
+                rbound[i] = np.finfo(gs.np_float).max
+            else:
+                verts = g.init_verts[0] if g.init_verts.ndim == 3 else g.init_verts
+                centroid = verts.mean(axis=0)
+                rbound[i] = np.max(np.linalg.norm(verts - centroid, axis=1))
+        self._collider_info.geom_rbound.from_numpy(rbound)
 
     def _init_verts_connectivity(self, vert_neighbors, vert_neighbor_start, vert_n_neighbors):
         if self._solver.n_verts > 0:

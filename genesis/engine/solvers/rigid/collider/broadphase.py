@@ -412,6 +412,23 @@ def func_broad_phase_nxn_clear(
         collider_state.n_broad_pairs[i_b] = 0
 
 
+@qd.func
+def func_is_spheres_overlap(
+    geoms_state: array_class.GeomsState,
+    collider_info: array_class.ColliderInfo,
+    i_ga,
+    i_gb,
+    i_b,
+):
+    """Check if bounding spheres of two geoms overlap using precomputed rbound."""
+    pos_a = geoms_state.pos[i_ga, i_b]
+    pos_b = geoms_state.pos[i_gb, i_b]
+    dif = pos_b - pos_a
+    dist_sq = dif.dot(dif)
+    bound = collider_info.geom_rbound[i_ga] + collider_info.geom_rbound[i_gb]
+    return dist_sq <= bound * bound
+
+
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_broad_phase_nxn(
     links_state: array_class.LinksState,
@@ -429,8 +446,9 @@ def func_broad_phase_nxn(
     """
     All-vs-all (NXN) broad-phase collision detection.
 
-    Iterates over pre-filtered valid geom pairs in parallel across pairs and batches,
-    checking 3D AABB overlap. Passing pairs are appended to the output buffer via atomic add.
+    Iterates over pre-filtered valid geom pairs in parallel across pairs and batches.
+    Applies the configured filter chain (SPHERE, AABB, or both) to each pair.
+    Passing pairs are appended to the output buffer via atomic add.
     """
     n_valid_pairs = collider_info.n_valid_pairs[None]
     _B = collider_state.n_contacts.shape[0]
@@ -454,7 +472,18 @@ def func_broad_phase_nxn(
         ):
             continue
 
-        if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
+        # Filter chain: SPHERE then AABB (compile-time branching via bitmask)
+        is_overlap = True
+
+        if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.SPHERE)):
+            if not func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                is_overlap = False
+
+        if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.AABB)):
+            if not func_is_geom_aabbs_overlap(geoms_state, i_ga, i_gb, i_b):
+                is_overlap = False
+
+        if not is_overlap:
             if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
                 i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)

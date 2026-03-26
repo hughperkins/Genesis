@@ -4719,7 +4719,10 @@ def test_heterogeneous_simulation(show_viewer, tol):
     # Run homogeneous simulation with box only
     # NXN broadphase does not support heterogeneous entities; use SAP for all sub-scenes
     # so the homogeneous references match the heterogeneous scene exactly.
-    sap_opts = gs.options.RigidOptions(broadphase_traversal=gs.broadphase_traversal.SAP)
+    sap_opts = gs.options.RigidOptions(
+        broadphase_traversal=gs.broadphase_traversal.SAP,
+        broadphase_filter=gs.broadphase_filter.AABB,
+    )
     scene_box = gs.Scene(show_viewer=False, rigid_options=sap_opts)
     scene_box.add_entity(gs.morphs.Plane())
     box_obj = scene_box.add_entity(gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, box_drop_height)))
@@ -4957,7 +4960,10 @@ def test_pick_heterogenous_objects(show_viewer):
     """Test heterogeneous simulation: CoM at rest, lifting, and gripper width differ per variant."""
     scene = gs.Scene(
         show_viewer=show_viewer,
-        rigid_options=gs.options.RigidOptions(broadphase_traversal=gs.broadphase_traversal.SAP),
+        rigid_options=gs.options.RigidOptions(
+            broadphase_traversal=gs.broadphase_traversal.SAP,
+            broadphase_filter=gs.broadphase_filter.AABB,
+        ),
     )
     scene.add_entity(gs.morphs.Plane())
     franka = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
@@ -5154,6 +5160,7 @@ def test_heterogeneous_robots(show_viewer, tol):
             # Allow specifying different controller gains for each env
             batch_dofs_info=True,
             broadphase_traversal=gs.broadphase_traversal.SAP,
+            broadphase_filter=gs.broadphase_filter.AABB,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(1.0, 1.0, 1.0),
@@ -5343,6 +5350,7 @@ def test_hibernation_and_contact_islands(show_viewer):
             use_contact_island=True,
             use_hibernation=True,
             broadphase_traversal=gs.broadphase_traversal.SAP,
+            broadphase_filter=gs.broadphase_filter.AABB,
         ),
         show_viewer=show_viewer,
     )
