@@ -413,39 +413,12 @@ def func_broad_phase_all_vs_all_clear(
 
 
 @qd.func
-def func_plane_filter(
-    geoms_state: array_class.GeomsState,
-    collider_info: array_class.ColliderInfo,
-    i_ga,
-    i_gb,
-    i_b,
-):
-    """Check if a geom is within rbound distance of a plane's surface.
+def _plane_signed_dist(geoms_state: array_class.GeomsState, i_plane, i_geom, i_b):
+    """Signed distance from geom centre to the plane surface.
 
-    Assumes at least one of the geoms has rbound == 0 (i.e. is a plane).
-    The plane normal is the z-axis of the plane's world-space rotation,
-    derived from its quaternion.
+    Plane normal is the z-column of the rotation matrix derived from
+    the plane's quaternion (w, x, y, z order).
     """
-    rbound_a = collider_info.geom_rbound[i_ga]
-
-    # Determine which geom is the plane (rbound == 0) vs the other geom.
-    # Initialize before the branch so Quadrants sees the names in scope.
-    i_plane = i_ga
-    i_geom = i_gb
-    bound = rbound_a
-    if rbound_a == 0.0:
-        i_plane = i_ga
-        i_geom = i_gb
-        bound = collider_info.geom_rbound[i_gb]
-    else:
-        i_plane = i_gb
-        i_geom = i_ga
-        bound = rbound_a
-
-    plane_pos = geoms_state.pos[i_plane, i_b]
-    geom_pos = geoms_state.pos[i_geom, i_b]
-
-    # Plane normal = z-column of rotation matrix from quaternion (w, x, y, z)
     qw = geoms_state.quat[i_plane, i_b][0]
     qx = geoms_state.quat[i_plane, i_b][1]
     qy = geoms_state.quat[i_plane, i_b][2]
@@ -457,8 +430,34 @@ def func_plane_filter(
             1.0 - 2.0 * (qx * qx + qy * qy),
         ]
     )
+    return (geoms_state.pos[i_geom, i_b] - geoms_state.pos[i_plane, i_b]).dot(normal)
 
-    dist = (geom_pos - plane_pos).dot(normal)
+
+@qd.func
+def func_plane_filter(
+    geoms_state: array_class.GeomsState,
+    collider_info: array_class.ColliderInfo,
+    i_ga,
+    i_gb,
+    i_b,
+):
+    """Check if a geom is within rbound distance of a plane's surface.
+
+    Assumes exactly one of the geoms has rbound == 0 (i.e. is a plane).
+    Avoids conditional variable assignment (unsupported by Quadrants JIT)
+    by computing both cases and blending branchlessly.
+    """
+    rbound_a = collider_info.geom_rbound[i_ga]
+    rbound_b = collider_info.geom_rbound[i_gb]
+    # Exactly one rbound is 0 (plane), so the sum is the non-plane rbound.
+    bound = rbound_a + rbound_b
+
+    dist_a = _plane_signed_dist(geoms_state, i_ga, i_gb, i_b)
+    dist_b = _plane_signed_dist(geoms_state, i_gb, i_ga, i_b)
+
+    # Branchless select: s = 1 when a is the plane (rbound_a == 0), 0 otherwise.
+    s = rbound_b / bound
+    dist = s * dist_a + (1.0 - s) * dist_b
     return dist <= bound
 
 
