@@ -74,6 +74,7 @@ class broadphase_filter(_IntFlag):
     PLANE = 1
     SPHERE = 2
     AABB = 4
+    OBB = 8
 
 
 # backend

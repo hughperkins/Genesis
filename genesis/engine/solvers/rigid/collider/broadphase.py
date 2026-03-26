@@ -12,6 +12,7 @@ import genesis.utils.array_class as array_class
 
 from .utils import (
     func_is_geom_aabbs_overlap,
+    func_is_obbs_overlap,
 )
 
 
@@ -271,6 +272,14 @@ def func_broad_phase(
                                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                             continue
 
+                        if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.OBB)):
+                            if collider_info.geom_rbound[i_ga] > 0.0 and collider_info.geom_rbound[i_gb] > 0.0:
+                                if not func_is_obbs_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                                    if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
+                                        i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
+                                        collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                                    continue
+
                         if n_broad == collider_info.max_collision_pairs_broad[None]:
                             errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
                             break
@@ -326,6 +335,14 @@ def func_broad_phase(
                                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                                 continue
 
+                            if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.OBB)):
+                                if collider_info.geom_rbound[i_ga] > 0.0 and collider_info.geom_rbound[i_gb] > 0.0:
+                                    if not func_is_obbs_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                                        if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
+                                            i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
+                                            collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                                        continue
+
                             collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                             collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                             n_broad = n_broad + 1
@@ -358,6 +375,13 @@ def func_broad_phase(
                                     i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                                     continue
+
+                                if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.OBB)):
+                                    if collider_info.geom_rbound[i_ga] > 0.0 and collider_info.geom_rbound[i_gb] > 0.0:
+                                        if not func_is_obbs_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                                            i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
+                                            collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                                            continue
 
                                 collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                                 collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
@@ -496,8 +520,8 @@ def func_broad_phase_all_vs_all(
     All-vs-all broad-phase collision detection.
 
     Iterates over pre-filtered valid geom pairs in parallel across pairs and batches.
-    For plane pairs (rbound == 0), applies the PLANE then AABB filter cascade.
-    For other pairs, applies the SPHERE then AABB filter cascade. Passing pairs
+    For plane pairs (rbound == 0), applies the PLANE → AABB → OBB filter cascade.
+    For other pairs, applies the SPHERE → AABB → OBB filter cascade. Passing pairs
     are appended to the output buffer via atomic add.
     """
     n_valid_pairs = collider_info.n_valid_pairs[None]
@@ -523,8 +547,9 @@ def func_broad_phase_all_vs_all(
             continue
 
         # Filter chain (compile-time branching via bitmask).
-        # Plane pairs: PLANE (coarse) then AABB (tight).
-        # Non-plane pairs: SPHERE (coarse) then AABB (tight).
+        # Plane pairs: PLANE (coarse) → AABB (tight).
+        # Non-plane pairs: SPHERE (coarse) → AABB → OBB (tight).
+        # OBB is skipped for plane pairs (planes have no meaningful OBB).
         is_overlap = True
         rbound_a = collider_info.geom_rbound[i_ga]
         rbound_b = collider_info.geom_rbound[i_gb]
@@ -536,6 +561,10 @@ def func_broad_phase_all_vs_all(
         else:
             if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.SPHERE)):
                 if not func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                    is_overlap = False
+
+            if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.OBB)):
+                if not func_is_obbs_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
                     is_overlap = False
 
         if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.AABB)):

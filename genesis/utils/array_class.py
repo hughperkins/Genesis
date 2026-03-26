@@ -728,6 +728,9 @@ class StructColliderInfo(metaclass=BASE_METACLASS):
     valid_pairs_b: V_ANNOTATION
     # Precomputed bounding sphere radius per geom (for sphere broadphase filter)
     geom_rbound: V_ANNOTATION
+    # Precomputed OBB center and half-sizes in geom-local frame (for OBB broadphase filter)
+    geom_obb_center: V_ANNOTATION
+    geom_obb_halfsize: V_ANNOTATION
     # Terrain fields
     terrain_hf: V_ANNOTATION
     terrain_rc: V_ANNOTATION
@@ -763,6 +766,8 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         valid_pairs_a=V(dtype=gs.qd_int, shape=(max(n_valid_pairs, 1),)),
         valid_pairs_b=V(dtype=gs.qd_int, shape=(max(n_valid_pairs, 1),)),
         geom_rbound=V(dtype=gs.qd_float, shape=(solver.n_geoms_,)),
+        geom_obb_center=V(dtype=gs.qd_vec3, shape=(solver.n_geoms_,)),
+        geom_obb_halfsize=V(dtype=gs.qd_vec3, shape=(solver.n_geoms_,)),
         terrain_hf=V(dtype=gs.qd_float, shape=terrain_hf_shape),
         terrain_rc=V(dtype=gs.qd_int, shape=(2,)),
         terrain_scale=V(dtype=gs.qd_float, shape=(2,)),

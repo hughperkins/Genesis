@@ -532,7 +532,7 @@ class RigidOptions(Options):
 
     # broadphase configuration
     broadphase_traversal: gs.broadphase_traversal = gs.broadphase_traversal.ALL_VS_ALL
-    broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB
+    broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB | gs.broadphase_filter.OBB
 
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
         super().__init__(**data)
@@ -541,9 +541,10 @@ class RigidOptions(Options):
 
     def model_post_init(self, context):
         if self.broadphase_traversal == gs.broadphase_traversal.SAP:
-            if self.broadphase_filter != gs.broadphase_filter.AABB:
+            unsupported = self.broadphase_filter & (gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE)
+            if unsupported:
                 gs.raise_exception(
-                    f"SAP traversal only supports broadphase_filter=AABB, got {self.broadphase_filter!r}"
+                    f"SAP traversal does not support PLANE/SPHERE filters, got {self.broadphase_filter!r}"
                 )
         elif self.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
             if self.use_hibernation:

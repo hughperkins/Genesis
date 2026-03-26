@@ -103,6 +103,71 @@ def func_is_geom_aabbs_overlap(geoms_state: array_class.GeomsState, i_ga, i_gb, 
 
 
 @qd.func
+def func_is_obbs_overlap(
+    geoms_state: array_class.GeomsState,
+    collider_info: array_class.ColliderInfo,
+    i_ga,
+    i_gb,
+    i_b,
+):
+    """6-axis SAT oriented bounding box overlap test (Gottschalk et al.).
+
+    Tests the 3 face normals of each OBB as separating axes.  Uses a flag
+    (no early return) to comply with Quadrants JIT constraints.
+    """
+    size_a = collider_info.geom_obb_halfsize[i_ga]
+    size_b = collider_info.geom_obb_halfsize[i_gb]
+    center_a = collider_info.geom_obb_center[i_ga]
+    center_b = collider_info.geom_obb_center[i_gb]
+
+    pos_a = geoms_state.pos[i_ga, i_b]
+    pos_b = geoms_state.pos[i_gb, i_b]
+    qa = geoms_state.quat[i_ga, i_b]
+    qb = geoms_state.quat[i_gb, i_b]
+
+    # Rotation matrix columns from quaternion (w, x, y, z)
+    wa = qa[0]; xa = qa[1]; ya = qa[2]; za = qa[3]
+    a0 = qd.Vector([1.0 - 2.0 * (ya * ya + za * za), 2.0 * (xa * ya + wa * za), 2.0 * (xa * za - wa * ya)], dt=gs.qd_float)
+    a1 = qd.Vector([2.0 * (xa * ya - wa * za), 1.0 - 2.0 * (xa * xa + za * za), 2.0 * (ya * za + wa * xa)], dt=gs.qd_float)
+    a2 = qd.Vector([2.0 * (xa * za + wa * ya), 2.0 * (ya * za - wa * xa), 1.0 - 2.0 * (xa * xa + ya * ya)], dt=gs.qd_float)
+
+    wb = qb[0]; xb = qb[1]; yb = qb[2]; zb = qb[3]
+    b0 = qd.Vector([1.0 - 2.0 * (yb * yb + zb * zb), 2.0 * (xb * yb + wb * zb), 2.0 * (xb * zb - wb * yb)], dt=gs.qd_float)
+    b1 = qd.Vector([2.0 * (xb * yb - wb * zb), 1.0 - 2.0 * (xb * xb + zb * zb), 2.0 * (yb * zb + wb * xb)], dt=gs.qd_float)
+    b2 = qd.Vector([2.0 * (xb * zb + wb * yb), 2.0 * (yb * zb - wb * xb), 1.0 - 2.0 * (xb * xb + yb * yb)], dt=gs.qd_float)
+
+    # World centers: R @ local_center + world_pos
+    wc_a = a0 * center_a[0] + a1 * center_a[1] + a2 * center_a[2] + pos_a
+    wc_b = b0 * center_b[0] + b1 * center_b[1] + b2 * center_b[2] + pos_b
+    d = wc_b - wc_a
+
+    # Compute max separation across 6 axes; positive means separated.
+    sep = gs.qd_float(-1e30)
+
+    # A's 3 face normals
+    gap = qd.abs(d.dot(a0)) - size_a[0] - (qd.abs(size_b[0] * b0.dot(a0)) + qd.abs(size_b[1] * b1.dot(a0)) + qd.abs(size_b[2] * b2.dot(a0)))
+    sep = qd.max(sep, gap)
+
+    gap = qd.abs(d.dot(a1)) - size_a[1] - (qd.abs(size_b[0] * b0.dot(a1)) + qd.abs(size_b[1] * b1.dot(a1)) + qd.abs(size_b[2] * b2.dot(a1)))
+    sep = qd.max(sep, gap)
+
+    gap = qd.abs(d.dot(a2)) - size_a[2] - (qd.abs(size_b[0] * b0.dot(a2)) + qd.abs(size_b[1] * b1.dot(a2)) + qd.abs(size_b[2] * b2.dot(a2)))
+    sep = qd.max(sep, gap)
+
+    # B's 3 face normals
+    gap = qd.abs(d.dot(b0)) - size_b[0] - (qd.abs(size_a[0] * a0.dot(b0)) + qd.abs(size_a[1] * a1.dot(b0)) + qd.abs(size_a[2] * a2.dot(b0)))
+    sep = qd.max(sep, gap)
+
+    gap = qd.abs(d.dot(b1)) - size_b[1] - (qd.abs(size_a[0] * a0.dot(b1)) + qd.abs(size_a[1] * a1.dot(b1)) + qd.abs(size_a[2] * a2.dot(b1)))
+    sep = qd.max(sep, gap)
+
+    gap = qd.abs(d.dot(b2)) - size_b[2] - (qd.abs(size_a[0] * a0.dot(b2)) + qd.abs(size_a[1] * a1.dot(b2)) + qd.abs(size_a[2] * a2.dot(b2)))
+    sep = qd.max(sep, gap)
+
+    return sep <= 0.0
+
+
+@qd.func
 def func_is_discrete_geom(
     geoms_info: array_class.GeomsInfo,
     i_g,

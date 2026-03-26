@@ -511,28 +511,44 @@ class Collider:
             self._collider_info.valid_pairs_b.from_numpy(self._valid_pairs_b)
 
     def _init_geom_rbound(self):
-        """Precompute bounding sphere radius per geom for the sphere broadphase filter."""
+        """Precompute bounding sphere radius and OBB (center + half-sizes) per geom."""
         geoms = self._solver.geoms
         n_geoms = self._solver.n_geoms
         if n_geoms == 0:
             return
         rbound = np.zeros(n_geoms, dtype=gs.np_float)
+        obb_center = np.zeros((n_geoms, 3), dtype=gs.np_float)
+        obb_halfsize = np.zeros((n_geoms, 3), dtype=gs.np_float)
         for i, g in enumerate(geoms):
             if g.type == gs.GEOM_TYPE.SPHERE:
-                rbound[i] = g.data[0]
+                r = g.data[0]
+                rbound[i] = r
+                obb_halfsize[i] = [r, r, r]
             elif g.type == gs.GEOM_TYPE.CAPSULE:
-                rbound[i] = g.data[0] + 0.5 * g.data[1]
+                r, length = g.data[0], g.data[1]
+                rbound[i] = r + 0.5 * length
+                obb_halfsize[i] = [r, r, r + 0.5 * length]
             elif g.type == gs.GEOM_TYPE.ELLIPSOID:
-                rbound[i] = max(g.data[0], g.data[1], g.data[2])
+                rx, ry, rz = g.data[0], g.data[1], g.data[2]
+                rbound[i] = max(rx, ry, rz)
+                obb_halfsize[i] = [rx, ry, rz]
             elif g.type == gs.GEOM_TYPE.BOX:
-                rbound[i] = np.sqrt(g.data[0] ** 2 + g.data[1] ** 2 + g.data[2] ** 2)
+                hx, hy, hz = g.data[0], g.data[1], g.data[2]
+                rbound[i] = np.sqrt(hx ** 2 + hy ** 2 + hz ** 2)
+                obb_halfsize[i] = [hx, hy, hz]
             elif g.type == gs.GEOM_TYPE.PLANE:
                 rbound[i] = 0.0
             else:
                 verts = g.init_verts[0] if g.init_verts.ndim == 3 else g.init_verts
+                lower = verts.min(axis=0)
+                upper = verts.max(axis=0)
+                obb_center[i] = (lower + upper) * 0.5
+                obb_halfsize[i] = (upper - lower) * 0.5
                 centroid = verts.mean(axis=0)
                 rbound[i] = np.max(np.linalg.norm(verts - centroid, axis=1))
         self._collider_info.geom_rbound.from_numpy(rbound)
+        self._collider_info.geom_obb_center.from_numpy(obb_center)
+        self._collider_info.geom_obb_halfsize.from_numpy(obb_halfsize)
 
     def _init_verts_connectivity(self, vert_neighbors, vert_neighbor_start, vert_n_neighbors):
         if self._solver.n_verts > 0:
