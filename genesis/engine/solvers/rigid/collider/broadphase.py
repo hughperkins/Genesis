@@ -442,11 +442,13 @@ def func_plane_filter(
 
     # Plane normal = z-column of rotation matrix from quaternion (w, x, y, z)
     w, x, y, z = plane_quat
-    normal = qd.Vector([
-        2.0 * (x * z + w * y),
-        2.0 * (y * z - w * x),
-        1.0 - 2.0 * (x * x + y * y),
-    ])
+    normal = qd.Vector(
+        [
+            2.0 * (x * z + w * y),
+            2.0 * (y * z - w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ]
+    )
 
     dist = (geom_pos - plane_pos).dot(normal)
     return dist <= bound

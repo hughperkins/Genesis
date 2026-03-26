@@ -532,7 +532,9 @@ class RigidOptions(Options):
 
     # broadphase configuration
     broadphase_traversal: gs.broadphase_traversal = gs.broadphase_traversal.ALL_VS_ALL
-    broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE | gs.broadphase_filter.AABB
+    broadphase_filter: gs.broadphase_filter = (
+        gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE | gs.broadphase_filter.AABB
+    )
 
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
         super().__init__(**data)
