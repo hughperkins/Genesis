@@ -427,24 +427,29 @@ def func_plane_filter(
     derived from its quaternion.
     """
     rbound_a = collider_info.geom_rbound[i_ga]
-    rbound_b = collider_info.geom_rbound[i_gb]
 
+    # Determine which geom is the plane (rbound == 0) vs the other geom.
+    # Initialize before the branch so Quadrants sees the names in scope.
+    i_plane = i_ga
+    i_geom = i_gb
+    bound = rbound_a
     if rbound_a == 0.0:
-        plane_pos = geoms_state.pos[i_ga, i_b]
-        plane_quat = geoms_state.quat[i_ga, i_b]
-        geom_pos = geoms_state.pos[i_gb, i_b]
-        bound = rbound_b
+        i_plane = i_ga
+        i_geom = i_gb
+        bound = collider_info.geom_rbound[i_gb]
     else:
-        plane_pos = geoms_state.pos[i_gb, i_b]
-        plane_quat = geoms_state.quat[i_gb, i_b]
-        geom_pos = geoms_state.pos[i_ga, i_b]
+        i_plane = i_gb
+        i_geom = i_ga
         bound = rbound_a
 
+    plane_pos = geoms_state.pos[i_plane, i_b]
+    geom_pos = geoms_state.pos[i_geom, i_b]
+
     # Plane normal = z-column of rotation matrix from quaternion (w, x, y, z)
-    qw = plane_quat[0]
-    qx = plane_quat[1]
-    qy = plane_quat[2]
-    qz = plane_quat[3]
+    qw = geoms_state.quat[i_plane, i_b][0]
+    qx = geoms_state.quat[i_plane, i_b][1]
+    qy = geoms_state.quat[i_plane, i_b][2]
+    qz = geoms_state.quat[i_plane, i_b][3]
     normal = qd.Vector(
         [
             2.0 * (qx * qz + qw * qy),
