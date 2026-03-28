@@ -469,6 +469,16 @@ class RigidOptions(Options):
     use_gjk_collision: bool, optional
         Whether to use GJK for collision detection instead of MPR. More stable but much slower. Defaults to
         `sim_options.requires_grad`.
+    narrowphase_gjk_threads : int, optional
+        Number of GPU threads allocated for GJK work in the split narrowphase kernel.
+        Each thread requires its own GJK state (simplex, EPA polytope, etc.), so this
+        directly controls narrowphase memory usage.  ``None`` (default) uses the
+        hardware-derived value (``gpu_cuda_cores`` in GJK-only mode,
+        ``gpu_cuda_cores // 4`` otherwise).
+    narrowphase_mpr_threads : int, optional
+        Number of GPU threads allocated for MPR work in the split narrowphase kernel.
+        Only used in mixed GJK+MPR mode (ignored when GJK-only).  ``None`` (default)
+        uses ``gpu_cuda_cores * 7 // 4``.
 
     Warning
     -------
@@ -520,6 +530,8 @@ class RigidOptions(Options):
 
     # GJK collision detection
     use_gjk_collision: StrictBool | None = None
+    narrowphase_gjk_threads: PositiveInt | None = None
+    narrowphase_mpr_threads: PositiveInt | None = None
 
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
         super().__init__(**data)

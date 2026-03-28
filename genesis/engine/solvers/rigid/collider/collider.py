@@ -212,13 +212,19 @@ class Collider:
             self._contact0_mpr_state = array_class.get_mpr_state(self._contact0_grid_size)
             self._contact0_gjk_state = array_class.get_gjk_state_contact_only(self._contact0_grid_size)
 
+            def _round_up_64(n):
+                return (n + 63) & ~63
+
             gjk_only = self._collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
+            user_gjk_threads = self._solver._options.narrowphase_gjk_threads
+            user_mpr_threads = self._solver._options.narrowphase_mpr_threads
             if gjk_only:
-                self._multicontact_n_gjk_threads = gpu_cuda_cores
+                self._multicontact_n_gjk_threads = _round_up_64(user_gjk_threads or gpu_cuda_cores)
                 self._multicontact_n_total_threads = self._multicontact_n_gjk_threads
             else:
-                self._multicontact_n_gjk_threads = 4000
-                self._multicontact_n_total_threads = 40000
+                self._multicontact_n_gjk_threads = _round_up_64(user_gjk_threads or (gpu_cuda_cores // 4))
+                n_mpr = _round_up_64(user_mpr_threads or (gpu_cuda_cores * 7 // 4))
+                self._multicontact_n_total_threads = self._multicontact_n_gjk_threads + n_mpr
             self._multicontact_max_items_per_thread = 128
             self._multicontact_mpr_state = array_class.get_mpr_state(self._multicontact_n_total_threads)
 
