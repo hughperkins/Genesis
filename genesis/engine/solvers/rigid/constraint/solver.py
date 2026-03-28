@@ -1,5 +1,7 @@
 from typing import TYPE_CHECKING
 
+import os
+
 import numpy as np
 import quadrants as qd
 import torch
@@ -8,6 +10,7 @@ from frozendict import frozendict
 import genesis as gs
 
 import genesis.utils.array_class as array_class
+
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
@@ -18,6 +21,9 @@ from . import noslip as constraint_noslip
 
 if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
+
+_HESSIAN_BLOCK_DIM = int(os.environ.get("GS_HESSIAN_BLOCK_DIM", "64"))
+_HESSIAN_MAX_CONSTRAINTS = int(os.environ.get("GS_HESSIAN_MAX_CONSTRAINTS", "32"))
 
 
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -1458,10 +1464,9 @@ def func_hessian_direct_tiled(
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
 
-    # Performance is optimal for BLOCK_DIM = MAX_DOFS_PER_BLOCK = 64
-    BLOCK_DIM = qd.static(64)
+    BLOCK_DIM = qd.static(_HESSIAN_BLOCK_DIM)
     MAX_DOFS_PER_BLOCK = qd.static(64)
-    MAX_CONSTRAINTS_PER_BLOCK = qd.static(32)
+    MAX_CONSTRAINTS_PER_BLOCK = qd.static(_HESSIAN_MAX_CONSTRAINTS)
 
     n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
