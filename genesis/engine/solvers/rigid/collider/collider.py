@@ -150,7 +150,6 @@ class Collider:
         # Compute collision pairs and algorithm flags in a single pass
         (
             self._n_possible_pairs,
-            self._collision_pair_idx,
             self._valid_pairs_a,
             self._valid_pairs_b,
             has_terrain,
@@ -189,7 +188,6 @@ class Collider:
             diff_pos_tolerance=self._diff_pos_tolerance,
             diff_normal_tolerance=self._diff_normal_tolerance,
         )
-        self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
         self._init_max_contact_pairs(self._n_possible_pairs)
@@ -245,8 +243,8 @@ class Collider:
         For each pair of geoms, determine if they can collide based on their properties and the solver configuration.
         Pairs that are already colliding at the initial configuration (qpos0) are filtered out with a warning.
 
-        Returns (n_possible_pairs, collision_pair_idx, pair_flags) where pair_flags is a dict of booleans
-        for has_terrain, has_non_box_plane_convex_convex, has_convex_specialization, has_nonconvex_nonterrain.
+        Returns (n_possible_pairs, valid_pairs_a, valid_pairs_b, has_terrain,
+        has_non_box_plane_convex_convex, has_convex_specialization, has_nonconvex_nonterrain).
         """
         # Links whose contact is handled by an external solver (e.g. IPC) — exclude from GJK collision.
         # Only applies when the IPC coupler is active. Mirrors the link filtering logic in
@@ -259,7 +257,7 @@ class Collider:
 
         if n_geoms == 0:
             empty_int = np.array([], dtype=gs.np_int)
-            return 0, np.full((0, 0), fill_value=-1, dtype=gs.np_int), empty_int, empty_int, False, False, False, False
+            return 0, empty_int, empty_int, False, False, False, False
 
         # Links delegated to IPC coupler (skip pair only when BOTH are IPC-handled)
         ipc_delegated_link_idxs = set()
@@ -412,12 +410,9 @@ class Collider:
                 "This behavior can be disabled by setting Morph option 'enable_neutral_collision=True'."
             )
 
-        # --- Build collision_pair_idx, valid pairs list, and count ---
+        # --- Build valid pairs arrays ---
         valid_indices = np.where(valid)[0]
         n_possible_pairs = len(valid_indices)
-        collision_pair_idx = np.full((n_geoms, n_geoms), fill_value=-1, dtype=gs.np_int)
-        collision_pair_idx[row[valid_indices], col[valid_indices]] = np.arange(n_possible_pairs, dtype=gs.np_int)
-
         valid_pairs_a = row[valid_indices].astype(gs.np_int)
         valid_pairs_b = col[valid_indices].astype(gs.np_int)
 
@@ -467,7 +462,6 @@ class Collider:
 
         return (
             n_possible_pairs,
-            collision_pair_idx,
             valid_pairs_a,
             valid_pairs_b,
             has_any_vs_terrain,
@@ -496,12 +490,6 @@ class Collider:
             vert_n_neighbors = np.concatenate(vert_n_neighbors, dtype=gs.np_int)
 
         return vert_neighbors, vert_neighbor_start, vert_n_neighbors
-
-    def _init_collision_pair_idx(self, collision_pair_idx):
-        if self._n_possible_pairs == 0:
-            self._collider_info.collision_pair_idx.fill(-1)
-            return
-        self._collider_info.collision_pair_idx.from_numpy(collision_pair_idx)
 
     def _init_valid_pairs(self):
         if len(self._valid_pairs_a) > 0:
