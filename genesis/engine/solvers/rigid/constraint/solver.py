@@ -107,6 +107,12 @@ class ConstraintSolver:
 
         self.reset()
 
+        # Cache zero-copy torch views for prefix sum (used by collision constraints)
+        collider_state = self._collider._collider_state
+        self._nc_torch = torch.utils.dlpack.from_dlpack(collider_state.n_contacts.to_dlpack())
+        self._ps_torch = torch.utils.dlpack.from_dlpack(collider_state.n_contacts_prefix_sum.to_dlpack())
+        self._ps_torch[0] = 0
+
         # Creating a dummy ContactIsland, needed as param for some functions,
         # and not used when hibernation is not enabled.
         self.contact_island = ContactIsland(self._collider)
@@ -204,6 +210,28 @@ class ConstraintSolver:
             self.constraint_state,
             self._collider._collider_state,
             self._solver._rigid_global_info,
+            self._solver._static_rigid_sim_config,
+        )
+        if self._solver._static_rigid_sim_config.enable_collision:
+            self._add_collision_constraints()
+
+    def _add_collision_constraints(self):
+        collider_state = self._collider._collider_state
+
+        torch.cumsum(self._nc_torch, dim=0, out=self._ps_torch[1:])
+
+        add_collision_constraints_work(
+            self._solver.links_info,
+            self._solver.links_state,
+            self._solver.dofs_state,
+            self.constraint_state,
+            collider_state,
+            self._solver._rigid_global_info,
+            self._solver._static_rigid_sim_config,
+        )
+        update_n_constraints_collision(
+            self.constraint_state,
+            collider_state,
             self._solver._static_rigid_sim_config,
         )
 
@@ -576,23 +604,7 @@ def constraint_solver_kernel_masked_clear(
 # ========================================= Register Pre-Defined Constraints ==========================================
 
 
-@qd.func
-def compute_contact_prefix_sum(
-    collider_state: array_class.ColliderState,
-    static_rigid_sim_config: qd.template(),
-):
-    _B = collider_state.n_contacts.shape[0]
-
-    qd.loop_config(serialize=True)
-    for i_b in range(_B):
-        if i_b == 0:
-            collider_state.n_contacts_prefix_sum[0] = 0
-        collider_state.n_contacts_prefix_sum[i_b + 1] = (
-            collider_state.n_contacts_prefix_sum[i_b] + collider_state.n_contacts[i_b]
-        )
-
-
-@qd.func
+@qd.kernel(fastcache=gs.use_fastcache)
 def add_collision_constraints_work(
     links_info: array_class.LinksInfo,
     links_state: array_class.LinksState,
@@ -707,7 +719,7 @@ def add_collision_constraints_work(
                 constraint_state.efc_D[n_con, i_b] = 1 / diag
 
 
-@qd.func
+@qd.kernel
 def update_n_constraints_collision(
     constraint_state: array_class.ConstraintState,
     collider_state: array_class.ColliderState,
@@ -718,33 +730,6 @@ def update_n_constraints_collision(
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         constraint_state.n_constraints[i_b] = constraint_state.n_constraints[i_b] + collider_state.n_contacts[i_b] * 4
-
-
-@qd.func
-def add_collision_constraints(
-    links_info: array_class.LinksInfo,
-    links_state: array_class.LinksState,
-    dofs_state: array_class.DofsState,
-    constraint_state: array_class.ConstraintState,
-    collider_state: array_class.ColliderState,
-    rigid_global_info: array_class.RigidGlobalInfo,
-    static_rigid_sim_config: qd.template(),
-):
-    compute_contact_prefix_sum(collider_state=collider_state, static_rigid_sim_config=static_rigid_sim_config)
-    add_collision_constraints_work(
-        links_info=links_info,
-        links_state=links_state,
-        dofs_state=dofs_state,
-        constraint_state=constraint_state,
-        collider_state=collider_state,
-        rigid_global_info=rigid_global_info,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
-    update_n_constraints_collision(
-        constraint_state=constraint_state,
-        collider_state=collider_state,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
 
 
 @qd.func
@@ -1020,16 +1005,6 @@ def add_inequality_constraints(
         constraint_state=constraint_state,
         static_rigid_sim_config=static_rigid_sim_config,
     )
-    if qd.static(static_rigid_sim_config.enable_collision):
-        add_collision_constraints(
-            links_info=links_info,
-            links_state=links_state,
-            dofs_state=dofs_state,
-            constraint_state=constraint_state,
-            collider_state=collider_state,
-            rigid_global_info=rigid_global_info,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
     if qd.static(static_rigid_sim_config.enable_joint_limit):
         add_joint_limit_constraints(
             links_info=links_info,
