@@ -105,6 +105,14 @@ class ConstraintSolver:
             self.nt_H = cs.nt_H
             self.nt_vec = cs.nt_vec
 
+        try:
+            gpu_props = torch.cuda.get_device_properties(gs.device)
+            self._collision_con_n_threads = gpu_props.multi_processor_count * 128
+        except Exception:
+            self._collision_con_n_threads = max(4096, self._B)
+        max_total_contacts = int(rigid_solver.collider._collider_info.max_contact_pairs[None]) * self._B
+        self._collision_con_max_items_per_thread = max(1, -(-max_total_contacts // self._collision_con_n_threads))
+
         self.reset()
 
         # Creating a dummy ContactIsland, needed as param for some functions,
@@ -206,6 +214,20 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
+        if self._solver._static_rigid_sim_config.enable_collision:
+            reset_collision_con_work_queue(self._collider._collider_state)
+            enqueue_collision_contacts(self._collider._collider_state)
+            add_collision_constraints_persistent(
+                self._solver.links_info,
+                self._solver.links_state,
+                self._solver.dofs_state,
+                self.constraint_state,
+                self._collider._collider_state,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+                self._collision_con_n_threads,
+                self._collision_con_max_items_per_thread,
+            )
 
     def resolve(self):
         func_solve_init(
@@ -576,8 +598,31 @@ def constraint_solver_kernel_masked_clear(
 # ========================================= Register Pre-Defined Constraints ==========================================
 
 
-@qd.func
-def add_collision_constraints(
+@qd.kernel
+def reset_collision_con_work_queue(
+    collider_state: array_class.ColliderState,
+):
+    for _i in range(1):
+        collider_state.collision_con_work_queue.queue_size[0] = 0
+        collider_state.collision_con_work_queue.work_counter[0] = 0
+
+
+@qd.kernel
+def enqueue_collision_contacts(
+    collider_state: array_class.ColliderState,
+):
+    _B = collider_state.n_contacts.shape[0]
+    for i_b in range(_B):
+        n_ct = collider_state.n_contacts[i_b]
+        if n_ct > 0:
+            base_idx = qd.atomic_add(collider_state.collision_con_work_queue.queue_size[0], n_ct)
+            for i_col in range(n_ct):
+                collider_state.collision_con_work_queue.work_i_b[base_idx + i_col] = i_b
+                collider_state.collision_con_work_queue.work_i_col[base_idx + i_col] = i_col
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def add_collision_constraints_persistent(
     links_info: array_class.LinksInfo,
     links_state: array_class.LinksState,
     dofs_state: array_class.DofsState,
@@ -585,18 +630,23 @@ def add_collision_constraints(
     collider_state: array_class.ColliderState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    n_threads: qd.template(),
+    max_items_per_thread: qd.template(),
 ):
     EPS = rigid_global_info.EPS[None]
-
-    _B = dofs_state.ctrl_mode.shape[1]
     n_dofs = dofs_state.ctrl_mode.shape[0]
 
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        for i_col in range(collider_state.n_contacts[i_b]):
+    for i_tid in range(n_threads):
+        for _iter in range(max_items_per_thread):
+            flat_idx = qd.atomic_add(collider_state.collision_con_work_queue.work_counter[0], 1)
+            if flat_idx >= collider_state.collision_con_work_queue.queue_size[0]:
+                break
+
+            i_b = collider_state.collision_con_work_queue.work_i_b[flat_idx]
+            i_col = collider_state.collision_con_work_queue.work_i_col[flat_idx]
+
             contact_data_link_a = collider_state.contact_data.link_a[i_col, i_b]
             contact_data_link_b = collider_state.contact_data.link_b[i_col, i_b]
-
             contact_data_pos = collider_state.contact_data.pos[i_col, i_b]
             contact_data_normal = collider_state.contact_data.normal[i_col, i_b]
             contact_data_friction = collider_state.contact_data.friction[i_col, i_b]
@@ -639,7 +689,6 @@ def add_collision_constraints(
                     while link > -1:
                         link_maybe_batch = [link, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else link
 
-                        # reverse order to make sure dofs in each row of self.jac_relevant_dofs is strictly descending
                         for i_d_ in range(links_info.n_dofs[link_maybe_batch]):
                             i_d = links_info.dof_end[link_maybe_batch] - 1 - i_d_
 
@@ -949,16 +998,6 @@ def add_inequality_constraints(
         constraint_state=constraint_state,
         static_rigid_sim_config=static_rigid_sim_config,
     )
-    if qd.static(static_rigid_sim_config.enable_collision):
-        add_collision_constraints(
-            links_info=links_info,
-            links_state=links_state,
-            dofs_state=dofs_state,
-            constraint_state=constraint_state,
-            collider_state=collider_state,
-            rigid_global_info=rigid_global_info,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
     if qd.static(static_rigid_sim_config.enable_joint_limit):
         add_joint_limit_constraints(
             links_info=links_info,

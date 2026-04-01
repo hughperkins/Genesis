@@ -629,6 +629,23 @@ def get_narrowphase_work_queues(max_entries):
 
 
 @DATA_ORIENTED
+class StructCollisionConWorkQueue(metaclass=BASE_METACLASS):
+    work_i_b: V_ANNOTATION
+    work_i_col: V_ANNOTATION
+    queue_size: V_ANNOTATION
+    work_counter: V_ANNOTATION
+
+
+def get_collision_con_work_queue(max_entries):
+    return StructCollisionConWorkQueue(
+        work_i_b=V(dtype=gs.qd_int, shape=(max_entries,)),
+        work_i_col=V(dtype=gs.qd_int, shape=(max_entries,)),
+        queue_size=V(dtype=gs.qd_int, shape=(1,)),
+        work_counter=V(dtype=gs.qd_int, shape=(1,)),
+    )
+
+
+@DATA_ORIENTED
 class StructColliderState(metaclass=BASE_METACLASS):
     sort_buffer: StructSortBuffer
     contact_data: StructContactData
@@ -654,6 +671,7 @@ class StructColliderState(metaclass=BASE_METACLASS):
     # Input data for differentiable contact detection used in the backward pass
     diff_contact_input: StructDiffContactInput
     narrowphase_work_queues: StructNarrowphaseWorkQueues
+    collision_con_work_queue: StructCollisionConWorkQueue
     contact_sort_key: V_ANNOTATION
     contact_sort_idx: V_ANNOTATION
 
@@ -712,6 +730,7 @@ def get_collider_state(
         narrowphase_work_queues=get_narrowphase_work_queues(
             max(max_collision_pairs_broad * _B, 1) if collider_static_config.has_non_box_plane_convex_convex else 1
         ),
+        collision_con_work_queue=get_collision_con_work_queue(max(max_contact_pairs * _B, 1)),
         contact_sort_key=V(dtype=gs.qd_float, shape=(max(max_contact_pairs, 1), _B)),
         contact_sort_idx=V(dtype=gs.qd_int, shape=(max(max_contact_pairs, 1), _B)),
     )
