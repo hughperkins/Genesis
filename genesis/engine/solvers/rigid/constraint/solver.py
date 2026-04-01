@@ -195,6 +195,7 @@ class ConstraintSolver:
         )
 
     def add_inequality_constraints(self):
+        cfg = self._solver._static_rigid_sim_config
         add_inequality_constraints(
             self._solver.links_info,
             self._solver.links_state,
@@ -204,8 +205,34 @@ class ConstraintSolver:
             self.constraint_state,
             self._collider._collider_state,
             self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
+            cfg,
         )
+        if cfg.enable_collision:
+            collider_state = self._collider._collider_state
+            add_collision_constraints_work(
+                self._solver.links_info,
+                self._solver.links_state,
+                self._solver.dofs_state,
+                self.constraint_state,
+                collider_state,
+                self._solver._rigid_global_info,
+                cfg,
+            )
+            update_n_constraints_collision(
+                self.constraint_state,
+                collider_state,
+                cfg,
+            )
+        if cfg.enable_joint_limit:
+            add_joint_limit_constraints_kernel(
+                self._solver.links_info,
+                self._solver.joints_info,
+                self._solver.dofs_info,
+                self._solver.dofs_state,
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                cfg,
+            )
 
     def resolve(self):
         func_solve_init(
@@ -576,8 +603,8 @@ def constraint_solver_kernel_masked_clear(
 # ========================================= Register Pre-Defined Constraints ==========================================
 
 
-@qd.func
-def add_collision_constraints(
+@qd.kernel(fastcache=gs.use_fastcache)
+def add_collision_constraints_work(
     links_info: array_class.LinksInfo,
     links_state: array_class.LinksState,
     dofs_state: array_class.DofsState,
@@ -590,10 +617,15 @@ def add_collision_constraints(
 
     _B = dofs_state.ctrl_mode.shape[1]
     n_dofs = dofs_state.ctrl_mode.shape[0]
+    max_contact_pairs = collider_state.contact_data.link_a.shape[0]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        for i_col in range(collider_state.n_contacts[i_b]):
+    for flat_idx in range(max_contact_pairs * _B):
+        i_b = flat_idx % _B
+        i_col = flat_idx // _B
+        if i_col < collider_state.n_contacts[i_b]:
+            collision_con_start = constraint_state.n_constraints[i_b]
+
             contact_data_link_a = collider_state.contact_data.link_a[i_col, i_b]
             contact_data_link_b = collider_state.contact_data.link_b[i_col, i_b]
 
@@ -618,7 +650,7 @@ def add_collision_constraints(
                 d = (2 * (i % 2) - 1) * (d1 if i < 2 else d2)
                 n = d * contact_data_friction - contact_data_normal
 
-                n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
+                n_con = collision_con_start + i_col * 4 + i
                 if qd.static(static_rigid_sim_config.sparse_solve):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                         i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
@@ -674,6 +706,40 @@ def add_collision_constraints(
                 constraint_state.diag[n_con, i_b] = diag
                 constraint_state.aref[n_con, i_b] = aref
                 constraint_state.efc_D[n_con, i_b] = 1 / diag
+
+
+@qd.kernel
+def update_n_constraints_collision(
+    constraint_state: array_class.ConstraintState,
+    collider_state: array_class.ColliderState,
+    static_rigid_sim_config: qd.template(),
+):
+    _B = collider_state.n_contacts.shape[0]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        constraint_state.n_constraints[i_b] = constraint_state.n_constraints[i_b] + collider_state.n_contacts[i_b] * 4
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def add_joint_limit_constraints_kernel(
+    links_info: array_class.LinksInfo,
+    joints_info: array_class.JointsInfo,
+    dofs_info: array_class.DofsInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    add_joint_limit_constraints(
+        links_info=links_info,
+        joints_info=joints_info,
+        dofs_info=dofs_info,
+        dofs_state=dofs_state,
+        rigid_global_info=rigid_global_info,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
 
 
 @qd.func
@@ -949,26 +1015,6 @@ def add_inequality_constraints(
         constraint_state=constraint_state,
         static_rigid_sim_config=static_rigid_sim_config,
     )
-    if qd.static(static_rigid_sim_config.enable_collision):
-        add_collision_constraints(
-            links_info=links_info,
-            links_state=links_state,
-            dofs_state=dofs_state,
-            constraint_state=constraint_state,
-            collider_state=collider_state,
-            rigid_global_info=rigid_global_info,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
-    if qd.static(static_rigid_sim_config.enable_joint_limit):
-        add_joint_limit_constraints(
-            links_info=links_info,
-            joints_info=joints_info,
-            dofs_info=dofs_info,
-            dofs_state=dofs_state,
-            rigid_global_info=rigid_global_info,
-            constraint_state=constraint_state,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
 
 
 @qd.func
