@@ -7,6 +7,7 @@ from genesis.utils.geom import R_to_quat
 from genesis.utils.misc import qd_to_torch, qd_to_numpy, tensor_to_array
 from genesis.utils import set_random_seed
 
+from .conftest import SKIP_METAL_GRAD_NDARRAY
 from .utils import assert_allclose
 
 
@@ -263,6 +264,7 @@ def test_diff_solver(monkeypatch):
         )
         func_solve_body(
             entities_info=rigid_solver.entities_info,
+            dofs_info=rigid_solver.dofs_info,
             dofs_state=rigid_solver.dofs_state,
             constraint_state=constraint_solver.constraint_state,
             rigid_global_info=rigid_solver._rigid_global_info,
@@ -409,6 +411,9 @@ def test_diff_solver(monkeypatch):
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_differentiable_rigid(show_viewer):
+    if gs.backend == gs.metal and gs.use_ndarray:
+        pytest.skip(SKIP_METAL_GRAD_NDARRAY)
+
     dt = 1e-2
     horizon = 100
     substeps = 1

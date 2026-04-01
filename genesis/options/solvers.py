@@ -470,14 +470,14 @@ class RigidOptions(Options):
         Whether to use GJK for collision detection instead of MPR. More stable but much slower. Defaults to
         `sim_options.requires_grad`.
     broadphase_traversal : gs.broadphase_traversal, optional
-        Broadphase traversal strategy. ``SAP`` (sweep-and-prune) or ``ALL_VS_ALL``.
-        Defaults to ``gs.broadphase_traversal.ALL_VS_ALL``.
+        Broadphase traversal strategy. ``SAP`` (sweep-and-prune) or ``ALL_VS_ALL`` (parallel pair iteration). Defaults
+        to ``None`` (auto: ``SAP`` on CPU or when hibernation/heterogeneous entities are enabled, ``ALL_VS_ALL`` on GPU
+        otherwise). See ``gs.broadphase_traversal`` for details on each strategy.
     broadphase_filter : gs.broadphase_filter, optional
-        Broadphase filter bitmask applied to candidate pairs. ``PLANE``, ``SPHERE``, and
-        ``AABB`` can be combined with ``|``. When a pair involves a plane, only the ``PLANE``
-        filter runs; otherwise the ``SPHERE`` then ``AABB`` cascade applies.
-        SAP traversal requires ``AABB`` only. Defaults to
-        ``gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB``.
+        Broadphase filter bitmask applied to candidate pairs. ``PLANE``, ``SPHERE``, ``AABB``, and ``OBB`` can be
+        combined with ``|``. When a pair involves a plane, only the ``PLANE`` filter runs; otherwise the ``SPHERE``
+        then ``OBB`` then ``AABB`` cascade applies. SAP traversal only supports ``AABB`` and ``OBB``.
+        Defaults to ``gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB | gs.broadphase_filter.OBB``.
 
     Warning
     -------
@@ -527,11 +527,17 @@ class RigidOptions(Options):
     enable_multi_contact: StrictBool = True
     enable_mujoco_compatibility: StrictBool = False
 
+    # Linesearch strategy selection:
+    #   * None:  perf dispatch chooses between monolith + iterative and decomposed + parallel linesearch
+    #   * False: force monolith + iterative (Newton-guided) linesearch
+    #   * True:  force decomposed + parallel (grid search) linesearch
+    prefer_parallel_linesearch: StrictBool | None = None
+
     # GJK collision detection
     use_gjk_collision: StrictBool | None = None
 
     # broadphase configuration
-    broadphase_traversal: gs.broadphase_traversal = gs.broadphase_traversal.ALL_VS_ALL
+    broadphase_traversal: gs.broadphase_traversal | None = None
     broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB | gs.broadphase_filter.OBB
 
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
@@ -540,15 +546,15 @@ class RigidOptions(Options):
             gs.logger.warning("'contact_resolve_time' is deprecated. Use 'constraint_timeconst' instead.")
 
     def model_post_init(self, context):
+        super().model_post_init(context)
         if self.broadphase_traversal == gs.broadphase_traversal.SAP:
             unsupported = self.broadphase_filter & (gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE)
             if unsupported:
                 gs.raise_exception(
                     f"SAP traversal does not support PLANE/SPHERE filters, got {self.broadphase_filter!r}"
                 )
-        elif self.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
-            if self.use_hibernation:
-                gs.raise_exception("ALL_VS_ALL broadphase traversal does not support hibernation")
+        if self.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL and self.use_hibernation:
+            gs.raise_exception("ALL_VS_ALL broadphase traversal does not support hibernation")
 
 
 class MPMOptions(Options):

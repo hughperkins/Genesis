@@ -140,7 +140,7 @@ def func_collision_clear(
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
-def func_broad_phase(
+def _func_broad_phase_sap(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
     geoms_state: array_class.GeomsState,
@@ -420,22 +420,6 @@ def func_broad_phase(
         collider_state.n_broad_pairs[i_b] = n_broad
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
-def func_broad_phase_all_vs_all_clear(
-    links_state: array_class.LinksState,
-    links_info: array_class.LinksInfo,
-    collider_state: array_class.ColliderState,
-    static_rigid_sim_config: qd.template(),
-):
-    """Clear contacts and zero broadphase counters before the all-vs-all sweep."""
-    func_collision_clear(links_state, links_info, collider_state, static_rigid_sim_config)
-
-    _B = collider_state.n_contacts.shape[0]
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        collider_state.n_broad_pairs[i_b] = 0
-
-
 @qd.func
 def _plane_signed_dist(geoms_state: array_class.GeomsState, i_plane, i_geom, i_b):
     """Signed distance from geom centre to the plane surface.
@@ -458,7 +442,7 @@ def _plane_signed_dist(geoms_state: array_class.GeomsState, i_plane, i_geom, i_b
 
 
 @qd.func
-def func_plane_filter(
+def _func_plane_filter(
     geoms_state: array_class.GeomsState,
     collider_info: array_class.ColliderInfo,
     i_ga,
@@ -473,20 +457,18 @@ def func_plane_filter(
     """
     rbound_a = collider_info.geom_rbound[i_ga]
     rbound_b = collider_info.geom_rbound[i_gb]
-    # Exactly one rbound is 0 (plane), so the sum is the non-plane rbound.
     bound = rbound_a + rbound_b
 
     dist_a = _plane_signed_dist(geoms_state, i_ga, i_gb, i_b)
     dist_b = _plane_signed_dist(geoms_state, i_gb, i_ga, i_b)
 
-    # Branchless select: s = 1 when a is the plane (rbound_a == 0), 0 otherwise.
     s = rbound_b / bound
     dist = s * dist_a + (1.0 - s) * dist_b
     return dist <= bound
 
 
 @qd.func
-def func_is_spheres_overlap(
+def _func_is_spheres_overlap(
     geoms_state: array_class.GeomsState,
     collider_info: array_class.ColliderInfo,
     i_ga,
@@ -503,7 +485,7 @@ def func_is_spheres_overlap(
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
-def func_broad_phase_all_vs_all(
+def _func_broad_phase_all_vs_all(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
     geoms_state: array_class.GeomsState,
@@ -524,12 +506,19 @@ def func_broad_phase_all_vs_all(
     For other pairs, applies the SPHERE → AABB → OBB filter cascade. Passing pairs
     are appended to the output buffer via atomic add.
     """
-    n_valid_pairs = collider_info.n_valid_pairs[None]
-    _B = collider_state.n_contacts.shape[0]
 
+    func_collision_clear(links_state, links_info, collider_state, static_rigid_sim_config)
+
+    _B = collider_state.n_contacts.shape[0]
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        collider_state.n_broad_pairs[i_b] = 0
+
+    n_valid_pairs = collider_info.n_valid_pairs[None]
     for i_vp, i_b in qd.ndrange(n_valid_pairs, _B):
-        i_ga = collider_info.valid_pairs_a[i_vp]
-        i_gb = collider_info.valid_pairs_b[i_vp]
+        pair = collider_info.valid_collision_pairs[i_vp]
+        i_ga = pair[0]
+        i_gb = pair[1]
 
         if not func_check_collision_valid(
             i_ga,
@@ -556,11 +545,11 @@ def func_broad_phase_all_vs_all(
 
         if rbound_a == 0.0 or rbound_b == 0.0:
             if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.PLANE)):
-                if not func_plane_filter(geoms_state, collider_info, i_ga, i_gb, i_b):
+                if not _func_plane_filter(geoms_state, collider_info, i_ga, i_gb, i_b):
                     is_overlap = False
         else:
             if qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.SPHERE)):
-                if not func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
+                if not _func_is_spheres_overlap(geoms_state, collider_info, i_ga, i_gb, i_b):
                     is_overlap = False
 
             if is_overlap and qd.static(bool(static_rigid_sim_config.broadphase_filter & gs.broadphase_filter.OBB)):
@@ -583,3 +572,48 @@ def func_broad_phase_all_vs_all(
             collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
         else:
             errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+
+
+
+def func_broad_phase(
+    links_state,
+    links_info,
+    geoms_state,
+    geoms_info,
+    rigid_global_info,
+    static_rigid_sim_config,
+    constraint_state,
+    collider_state,
+    equalities_info,
+    collider_info,
+    errno,
+):
+    """Dispatch to the appropriate broad-phase kernel based on config."""
+    if static_rigid_sim_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
+        _func_broad_phase_all_vs_all(
+            links_state,
+            links_info,
+            geoms_state,
+            geoms_info,
+            rigid_global_info,
+            static_rigid_sim_config,
+            constraint_state,
+            collider_state,
+            equalities_info,
+            collider_info,
+            errno,
+        )
+    else:
+        _func_broad_phase_sap(
+            links_state,
+            links_info,
+            geoms_state,
+            geoms_info,
+            rigid_global_info,
+            static_rigid_sim_config,
+            constraint_state,
+            collider_state,
+            equalities_info,
+            collider_info,
+            errno,
+        )

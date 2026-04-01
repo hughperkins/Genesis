@@ -306,6 +306,9 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     bw_w: V_ANNOTATION
     # Timers for profiling
     timers: V_ANNOTATION
+    # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
+    graph_counter: qd.types.ndarray()
+    early_exit_flag: V_ANNOTATION
 
 
 def get_constraint_state(constraint_solver, solver):
@@ -396,6 +399,8 @@ def get_constraint_state(constraint_solver, solver):
         bw_w=V(dtype=gs.qd_float, shape=maybe_shape((len_constraints_, _B), solver._requires_grad)),
         # Timers
         timers=V(dtype=qd.i64 if gs.backend != gs.metal else qd.i32, shape=(10, _B)),
+        graph_counter=qd.ndarray(qd.i32, shape=()),
+        early_exit_flag=V(dtype=qd.i32, shape=()),
     )
 
 
@@ -717,15 +722,15 @@ class StructColliderInfo(metaclass=BASE_METACLASS):
     vert_neighbors: V_ANNOTATION
     vert_neighbor_start: V_ANNOTATION
     vert_n_neighbors: V_ANNOTATION
+    # (i_ga, i_gb) -> dense pair index, or -1 if invalid. Used by SAP broadphase, narrowphase, and contact cache.
     collision_pair_idx: V_ANNOTATION
     max_possible_pairs: V_ANNOTATION
     max_collision_pairs: V_ANNOTATION
     max_contact_pairs: V_ANNOTATION
     max_collision_pairs_broad: V_ANNOTATION
-    # Pre-filtered valid collision pairs for all-vs-all broadphase
+    # Compact list of valid collision pairs. Used by all-vs-all broadphase to dispatch valid pairs to GPU threads.
     n_valid_pairs: V_ANNOTATION
-    valid_pairs_a: V_ANNOTATION
-    valid_pairs_b: V_ANNOTATION
+    valid_collision_pairs: V_ANNOTATION
     # Precomputed bounding sphere radius per geom (for sphere broadphase filter)
     geom_rbound: V_ANNOTATION
     # Precomputed OBB center and half-sizes in geom-local frame (for OBB broadphase filter)
@@ -763,8 +768,7 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         max_contact_pairs=V(dtype=gs.qd_int, shape=()),
         max_collision_pairs_broad=V(dtype=gs.qd_int, shape=()),
         n_valid_pairs=V_SCALAR_FROM(dtype=gs.qd_int, value=n_valid_pairs),
-        valid_pairs_a=V(dtype=gs.qd_int, shape=(max(n_valid_pairs, 1),)),
-        valid_pairs_b=V(dtype=gs.qd_int, shape=(max(n_valid_pairs, 1),)),
+        valid_collision_pairs=V(dtype=gs.qd_ivec2, shape=(max(n_valid_pairs, 1),)),
         geom_rbound=V(dtype=gs.qd_float, shape=(solver.n_geoms_,)),
         geom_obb_center=V(dtype=gs.qd_vec3, shape=(solver.n_geoms_,)),
         geom_obb_halfsize=V(dtype=gs.qd_vec3, shape=(solver.n_geoms_,)),
@@ -2037,6 +2041,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     integrator: int
     solver_type: int
     requires_grad: bool
+    prefer_parallel_linesearch: int = -1  # -1 = None (auto), 0 = False, 1 = True
     broadphase_traversal: int = 0
     broadphase_filter: int = gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE | gs.broadphase_filter.AABB
     enable_tiled_cholesky_mass_matrix: bool = False

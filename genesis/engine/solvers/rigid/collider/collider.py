@@ -30,8 +30,6 @@ from .broadphase import (
     func_check_collision_valid,
     func_collision_clear,
     func_broad_phase,
-    func_broad_phase_all_vs_all_clear,
-    func_broad_phase_all_vs_all,
 )
 
 from .contact import (
@@ -152,8 +150,7 @@ class Collider:
         (
             self._n_possible_pairs,
             self._collision_pair_idx,
-            self._valid_pairs_a,
-            self._valid_pairs_b,
+            self._valid_collision_pairs,
             has_terrain,
             has_non_box_plane_convex_convex,
             has_convex_specialization,
@@ -175,7 +172,7 @@ class Collider:
         # Pre-compute fields, as they are needed to initialize the collider state and info.
         vert_neighbors, vert_neighbor_start, vert_n_neighbors = self._compute_verts_connectivity()
         n_vert_neighbors = len(vert_neighbors)
-        n_valid_pairs = len(self._valid_pairs_a)
+        n_valid_pairs = len(self._valid_collision_pairs)
 
         # Initialize [info], which stores every data that must be considered mutable from Quadrants's perspective,
         # i.e. unknown at compile time, but IMMUTABLE from Genesis scene's perspective after build.
@@ -220,13 +217,16 @@ class Collider:
             self._contact0_mpr_state = array_class.get_mpr_state(self._contact0_grid_size)
             self._contact0_gjk_state = array_class.get_gjk_state_contact_only(self._contact0_grid_size)
 
+            def _round_up_64(n):
+                return (n + 63) & ~63
+
             gjk_only = self._collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
             if gjk_only:
                 self._multicontact_n_gjk_threads = gpu_cuda_cores
                 self._multicontact_n_total_threads = self._multicontact_n_gjk_threads
             else:
-                self._multicontact_n_gjk_threads = 4000
-                self._multicontact_n_total_threads = 40000
+                self._multicontact_n_gjk_threads = _round_up_64(gpu_cuda_cores // 32)
+                self._multicontact_n_total_threads = gpu_cuda_cores
             self._multicontact_max_items_per_thread = 128
             self._multicontact_mpr_state = array_class.get_mpr_state(self._multicontact_n_total_threads)
 
@@ -260,8 +260,8 @@ class Collider:
         geoms = self._solver.geoms
 
         if n_geoms == 0:
-            empty_int = np.array([], dtype=gs.np_int)
-            return 0, np.full((0, 0), fill_value=-1, dtype=gs.np_int), empty_int, empty_int, False, False, False, False
+            empty_pairs = np.empty((0, 2), dtype=gs.np_int)
+            return 0, np.full((0, 0), fill_value=-1, dtype=gs.np_int), empty_pairs, False, False, False, False
 
         # Links delegated to IPC coupler (skip pair only when BOTH are IPC-handled)
         ipc_delegated_link_idxs = set()
@@ -420,8 +420,7 @@ class Collider:
         collision_pair_idx = np.full((n_geoms, n_geoms), fill_value=-1, dtype=gs.np_int)
         collision_pair_idx[row[valid_indices], col[valid_indices]] = np.arange(n_possible_pairs, dtype=gs.np_int)
 
-        valid_pairs_a = row[valid_indices].astype(gs.np_int)
-        valid_pairs_b = col[valid_indices].astype(gs.np_int)
+        valid_collision_pairs = np.stack([row[valid_indices], col[valid_indices]], axis=1).astype(gs.np_int)
 
         # --- Compute algorithm flags from valid pairs ---
         valid_type_a = geom_type[row[valid_indices]]
@@ -470,8 +469,7 @@ class Collider:
         return (
             n_possible_pairs,
             collision_pair_idx,
-            valid_pairs_a,
-            valid_pairs_b,
+            valid_collision_pairs,
             has_any_vs_terrain,
             has_non_box_plane_convex_convex,
             has_convex_specialization,
@@ -506,9 +504,8 @@ class Collider:
         self._collider_info.collision_pair_idx.from_numpy(collision_pair_idx)
 
     def _init_valid_pairs(self):
-        if len(self._valid_pairs_a) > 0:
-            self._collider_info.valid_pairs_a.from_numpy(self._valid_pairs_a)
-            self._collider_info.valid_pairs_b.from_numpy(self._valid_pairs_b)
+        if len(self._valid_collision_pairs) > 0:
+            self._collider_info.valid_collision_pairs.from_numpy(self._valid_collision_pairs)
 
     def _init_geom_rbound(self):
         """Precompute bounding sphere radius and OBB (center + half-sizes) per geom."""
@@ -720,40 +717,19 @@ class Collider:
             return
 
         self._contact_data_cache.clear()
-        if self._solver._options.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
-            func_broad_phase_all_vs_all_clear(
-                self._solver.links_state,
-                self._solver.links_info,
-                self._collider_state,
-                self._solver._static_rigid_sim_config,
-            )
-            func_broad_phase_all_vs_all(
-                self._solver.links_state,
-                self._solver.links_info,
-                self._solver.geoms_state,
-                self._solver.geoms_info,
-                self._solver._rigid_global_info,
-                self._solver._static_rigid_sim_config,
-                self._solver.constraint_solver.constraint_state,
-                self._collider_state,
-                self._solver.equalities_info,
-                self._collider_info,
-                self._solver._errno,
-            )
-        else:
-            func_broad_phase(
-                self._solver.links_state,
-                self._solver.links_info,
-                self._solver.geoms_state,
-                self._solver.geoms_info,
-                self._solver._rigid_global_info,
-                self._solver._static_rigid_sim_config,
-                self._solver.constraint_solver.constraint_state,
-                self._collider_state,
-                self._solver.equalities_info,
-                self._collider_info,
-                self._solver._errno,
-            )
+        func_broad_phase(
+            self._solver.links_state,
+            self._solver.links_info,
+            self._solver.geoms_state,
+            self._solver.geoms_info,
+            self._solver._rigid_global_info,
+            self._solver._static_rigid_sim_config,
+            self._solver.constraint_solver.constraint_state,
+            self._collider_state,
+            self._solver.equalities_info,
+            self._collider_info,
+            self._solver._errno,
+        )
         if self._use_split_narrowphase:
             narrowphase._func_reset_narrowphase_work_queues(
                 self._collider_state,
