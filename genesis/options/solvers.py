@@ -474,10 +474,11 @@ class RigidOptions(Options):
         to ``None`` (auto: ``SAP`` on CPU or when hibernation/heterogeneous entities are enabled, ``ALL_VS_ALL`` on GPU
         otherwise). See ``gs.broadphase_traversal`` for details on each strategy.
     broadphase_filter : gs.broadphase_filter, optional
-        Broadphase filter bitmask applied to candidate pairs. ``PLANE``, ``SPHERE``, ``AABB``, and ``OBB`` can be
-        combined with ``|``. When a pair involves a plane, only the ``PLANE`` filter runs; otherwise the ``SPHERE``
-        then ``OBB`` then ``AABB`` cascade applies. SAP traversal only supports ``AABB`` and ``OBB``.
-        Defaults to ``gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB | gs.broadphase_filter.OBB``.
+        Broadphase filter bitmask selecting which filter stages to compile in. ``PLANE``, ``SPHERE``, ``AABB``, and
+        ``OBB`` can be combined with ``|``. The full chain is ``PLANE`` → ``SPHERE`` → ``AABB`` → ``OBB``; each
+        stage is only active when its bit is set. ``PLANE`` and ``SPHERE`` only apply to their respective pair types
+        (plane-involving vs non-plane). SAP traversal only supports ``AABB``.
+        Defaults to ``gs.broadphase_filter.AABB | gs.broadphase_filter.OBB``.
 
     Warning
     -------
@@ -538,7 +539,7 @@ class RigidOptions(Options):
 
     # broadphase configuration
     broadphase_traversal: gs.broadphase_traversal | None = None
-    broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.PLANE | gs.broadphase_filter.AABB | gs.broadphase_filter.OBB
+    broadphase_filter: gs.broadphase_filter = gs.broadphase_filter.AABB | gs.broadphase_filter.OBB
 
     def __init__(self, *, contact_resolve_time: float | None = None, **data):
         super().__init__(**data)
@@ -548,10 +549,10 @@ class RigidOptions(Options):
     def model_post_init(self, context):
         super().model_post_init(context)
         if self.broadphase_traversal == gs.broadphase_traversal.SAP:
-            unsupported = self.broadphase_filter & (gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE)
-            if unsupported:
+            non_aabb = self.broadphase_filter & ~gs.broadphase_filter.AABB
+            if non_aabb:
                 gs.raise_exception(
-                    f"SAP traversal does not support PLANE/SPHERE filters, got {self.broadphase_filter!r}"
+                    f"SAP traversal only supports AABB filter, got {self.broadphase_filter!r}"
                 )
         if self.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL and self.use_hibernation:
             gs.raise_exception("ALL_VS_ALL broadphase traversal does not support hibernation")

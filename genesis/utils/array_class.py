@@ -2043,7 +2043,7 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     requires_grad: bool
     prefer_parallel_linesearch: int = -1  # -1 = None (auto), 0 = False, 1 = True
     broadphase_traversal: int = 0
-    broadphase_filter: int = gs.broadphase_filter.PLANE | gs.broadphase_filter.SPHERE | gs.broadphase_filter.AABB
+    broadphase_filter: int = gs.broadphase_filter.AABB | gs.broadphase_filter.OBB
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
     tiled_n_dofs_per_entity: int = -1
