@@ -577,7 +577,23 @@ def constraint_solver_kernel_masked_clear(
 
 
 @qd.func
-def add_collision_constraints(
+def compute_contact_prefix_sum(
+    collider_state: array_class.ColliderState,
+    static_rigid_sim_config: qd.template(),
+):
+    _B = collider_state.n_contacts.shape[0]
+
+    qd.loop_config(serialize=True)
+    for i_b in range(_B):
+        if i_b == 0:
+            collider_state.n_contacts_prefix_sum[0] = 0
+        collider_state.n_contacts_prefix_sum[i_b + 1] = (
+            collider_state.n_contacts_prefix_sum[i_b] + collider_state.n_contacts[i_b]
+        )
+
+
+@qd.func
+def add_collision_constraints_work(
     links_info: array_class.LinksInfo,
     links_state: array_class.LinksState,
     dofs_state: array_class.DofsState,
@@ -590,10 +606,25 @@ def add_collision_constraints(
 
     _B = dofs_state.ctrl_mode.shape[1]
     n_dofs = dofs_state.ctrl_mode.shape[0]
+    max_contact_pairs = collider_state.contact_data.link_a.shape[0]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        for i_col in range(collider_state.n_contacts[i_b]):
+    for flat_idx in range(max_contact_pairs * _B):
+        if flat_idx < collider_state.n_contacts_prefix_sum[_B]:
+            # Binary search prefix_sum to find i_b such that prefix_sum[i_b] <= flat_idx < prefix_sum[i_b+1]
+            lo = 0
+            hi = _B
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if collider_state.n_contacts_prefix_sum[mid + 1] <= flat_idx:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            i_b = lo
+            i_col = flat_idx - collider_state.n_contacts_prefix_sum[i_b]
+
+            collision_con_start = constraint_state.n_constraints[i_b]
+
             contact_data_link_a = collider_state.contact_data.link_a[i_col, i_b]
             contact_data_link_b = collider_state.contact_data.link_b[i_col, i_b]
 
@@ -618,7 +649,7 @@ def add_collision_constraints(
                 d = (2 * (i % 2) - 1) * (d1 if i < 2 else d2)
                 n = d * contact_data_friction - contact_data_normal
 
-                n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
+                n_con = collision_con_start + i_col * 4 + i
                 if qd.static(static_rigid_sim_config.sparse_solve):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                         i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
@@ -674,6 +705,46 @@ def add_collision_constraints(
                 constraint_state.diag[n_con, i_b] = diag
                 constraint_state.aref[n_con, i_b] = aref
                 constraint_state.efc_D[n_con, i_b] = 1 / diag
+
+
+@qd.func
+def update_n_constraints_collision(
+    constraint_state: array_class.ConstraintState,
+    collider_state: array_class.ColliderState,
+    static_rigid_sim_config: qd.template(),
+):
+    _B = collider_state.n_contacts.shape[0]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        constraint_state.n_constraints[i_b] = constraint_state.n_constraints[i_b] + collider_state.n_contacts[i_b] * 4
+
+
+@qd.func
+def add_collision_constraints(
+    links_info: array_class.LinksInfo,
+    links_state: array_class.LinksState,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    collider_state: array_class.ColliderState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    compute_contact_prefix_sum(collider_state=collider_state, static_rigid_sim_config=static_rigid_sim_config)
+    add_collision_constraints_work(
+        links_info=links_info,
+        links_state=links_state,
+        dofs_state=dofs_state,
+        constraint_state=constraint_state,
+        collider_state=collider_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+    update_n_constraints_collision(
+        constraint_state=constraint_state,
+        collider_state=collider_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
 
 
 @qd.func
