@@ -1704,8 +1704,7 @@ def _func_narrowphase_multicontact_parallel(
     max_items_per_thread: qd.template(),
 ):
     """Like _func_narrowphase_multicontact_mixed but MPR perturbation probes
-    run in parallel across 4 lanes of a warp (sub-warp groups).  GJK path
-    is unchanged.  CUDA-only — requires warp shuffle intrinsics."""
+    run in parallel across 4 lanes of a subgroup.  GJK path is unchanged."""
     for i_tid in range(n_total_threads):
         if i_tid < qd.static(n_gjk_threads):
             # === GJK partition: unchanged ===
@@ -1747,8 +1746,7 @@ def _func_narrowphase_multicontact_parallel(
                 )
         else:
             # === MPR partition: parallel perturbation probes (groups of 4) ===
-            MASK = qd.u32(0xFFFFFFFF)
-            lane_id = i_tid % 32
+            lane_id = qd.simt.subgroup.invocation_id()
             probe_id = lane_id % 4
             group_base = (lane_id // 4) * 4
 
@@ -1757,17 +1755,22 @@ def _func_narrowphase_multicontact_parallel(
                 raw_idx = gs.qd_int(0)
                 if probe_id == 0:
                     raw_idx = qd.atomic_add(collider_state.narrowphase_work_queues.mpr_work_counter[0], 1)
-                idx = qd.simt.warp.shfl_sync_i32(MASK, raw_idx, group_base)
+                idx = qd.simt.subgroup.shuffle(raw_idx, qd.u32(group_base))
 
-                # Groups in the same warp may exhaust the queue at different
+                # Groups in the same subgroup may exhaust the queue at different
                 # times.  We must NOT break until every group is done,
-                # otherwise the remaining groups' shfl_sync calls would hang
+                # otherwise the remaining groups' shuffle calls would hang
                 # waiting for the departed lanes.
                 have_work_i = gs.qd_int(0)
                 if idx < collider_state.narrowphase_work_queues.mpr_queue_size[0]:
                     have_work_i = gs.qd_int(1)
-                warp_has_work = qd.simt.warp.any_nonzero(MASK, have_work_i)
-                if warp_has_work == 0:
+                # Subgroup-wide OR reduction (covers subgroup sizes up to 32)
+                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 1))
+                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 2))
+                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 4))
+                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 8))
+                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 16))
+                if have_work_i == 0:
                     break
 
                 # Defaults for lanes/groups without work (safe for shuffles)
@@ -1886,8 +1889,8 @@ def _func_narrowphase_multicontact_parallel(
                 upgrade_i = gs.qd_int(0)
                 if my_needs_upgrade:
                     upgrade_i = gs.qd_int(1)
-                upgrade_i = upgrade_i | qd.simt.warp.shfl_xor_i32(MASK, upgrade_i, 1)
-                upgrade_i = upgrade_i | qd.simt.warp.shfl_xor_i32(MASK, upgrade_i, 2)
+                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 1))
+                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 2))
                 any_upgrade = upgrade_i != 0
 
                 # 4b: Collect all 4 probe results (all lanes execute shuffles)
@@ -1898,7 +1901,7 @@ def _func_narrowphase_multicontact_parallel(
                 p0_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 0))
                 p0_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 0))
                 p0_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 0))
-                p0_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 0)
+                p0_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 0))
 
                 p1_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 1))
                 p1_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 1))
@@ -1907,7 +1910,7 @@ def _func_narrowphase_multicontact_parallel(
                 p1_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 1))
                 p1_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 1))
                 p1_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 1))
-                p1_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 1)
+                p1_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 1))
 
                 p2_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 2))
                 p2_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 2))
@@ -1916,7 +1919,7 @@ def _func_narrowphase_multicontact_parallel(
                 p2_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 2))
                 p2_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 2))
                 p2_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 2))
-                p2_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 2)
+                p2_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 2))
 
                 p3_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 3))
                 p3_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 3))
@@ -1925,7 +1928,7 @@ def _func_narrowphase_multicontact_parallel(
                 p3_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 3))
                 p3_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 3))
                 p3_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 3))
-                p3_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 3)
+                p3_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 3))
 
                 # ── Phase 5: dedup + write (lane 0 only, skip if no work) ──
                 if have_work_i != 0:
