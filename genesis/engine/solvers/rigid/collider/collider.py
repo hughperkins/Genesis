@@ -6,6 +6,7 @@ including broad-phase (sweep-and-prune), narrow-phase (convex-convex, SDF-based,
 terrain), and contact management.
 """
 
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -642,7 +643,7 @@ class Collider:
 
     def _call_multicontact(self):
         kernel_fn = narrowphase._func_narrowphase_multicontact_mixed
-        if gs.device.type == "cuda":
+        if gs.device.type == "cuda" and not os.environ.get("GS_DISABLE_PARALLEL_PERTURB"):
             kernel_fn = narrowphase._func_narrowphase_multicontact_parallel
         kernel_fn(
             self._solver.links_state,
