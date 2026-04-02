@@ -1710,7 +1710,7 @@ def _func_narrowphase_multicontact_parallel(
     run in parallel across 4 threads using block-level shared memory.
     Requires n_gjk_threads to be a multiple of _PARALLEL_BLOCK_DIM so that
     no block mixes GJK and MPR threads (needed for block.sync correctness)."""
-    qd.loop_config(block_dim=_PARALLEL_BLOCK_DIM)
+    qd.loop_config(block_dim=qd.static(_PARALLEL_BLOCK_DIM))
     for i_tid in range(n_total_threads):
         if i_tid < qd.static(n_gjk_threads):
             # === GJK partition: unchanged ===
@@ -1754,21 +1754,21 @@ def _func_narrowphase_multicontact_parallel(
             # === MPR partition: parallel perturbation probes (groups of 4) ===
             # n_gjk_threads must be a multiple of _PARALLEL_BLOCK_DIM so every
             # block is purely GJK or purely MPR — needed for block.sync safety.
-            tid = i_tid % _PARALLEL_BLOCK_DIM
+            tid = i_tid % qd.static(_PARALLEL_BLOCK_DIM)
             probe_id = tid % 4
             group_id = tid // 4
             group_base_tid = group_id * 4
 
-            sh_pos_x = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_pos_y = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_pos_z = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_norm_x = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_norm_y = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_norm_z = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_pen = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
-            sh_valid = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), qd.i32)
-            sh_upgrade = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), qd.i32)
-            sh_idx = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM // 4,), qd.i32)
+            sh_pos_x = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_pos_y = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_pos_z = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_norm_x = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_norm_y = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_norm_z = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_pen = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), gs.qd_float)
+            sh_valid = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), qd.i32)
+            sh_upgrade = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM),), qd.i32)
+            sh_idx = qd.simt.block.SharedArray((qd.static(_PARALLEL_BLOCK_DIM) // 4,), qd.i32)
             sh_any_work = qd.simt.block.SharedArray((1,), qd.i32)
 
             for _iter in range(max_items_per_thread):
