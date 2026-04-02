@@ -641,7 +641,10 @@ class Collider:
         )
 
     def _call_multicontact(self):
-        narrowphase._func_narrowphase_multicontact_mixed(
+        kernel_fn = narrowphase._func_narrowphase_multicontact_mixed
+        if gs.device.type == "cuda":
+            kernel_fn = narrowphase._func_narrowphase_multicontact_parallel
+        kernel_fn(
             self._solver.links_state,
             self._solver.links_info,
             self._solver.geoms_state,
