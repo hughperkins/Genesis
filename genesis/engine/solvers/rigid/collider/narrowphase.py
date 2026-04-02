@@ -1676,6 +1676,15 @@ def _func_narrowphase_multicontact_mixed(
                 )
 
 
+@qd.func
+def _shfl_float(mask, val, src_lane):
+    """Precision-agnostic warp shuffle for scalar floats."""
+    if qd.static(gs.qd_float == qd.f64):
+        return qd.simt.warp.shfl_sync_f64(mask, val, src_lane)
+    else:
+        return qd.simt.warp.shfl_sync_f32(mask, val, src_lane)
+
+
 @qd.kernel(fastcache=gs.use_fastcache)
 def _func_narrowphase_multicontact_parallel(
     links_state: array_class.LinksState,
@@ -1890,49 +1899,40 @@ def _func_narrowphase_multicontact_parallel(
                 any_upgrade = upgrade_i != 0
 
                 # 4b: Collect all 4 probe results (all lanes execute shuffles)
-                # Cast to f32 for shuffle (quadrants has no shfl_sync_f64)
-                _pos0 = qd.cast(my_pos[0], qd.f32)
-                _pos1 = qd.cast(my_pos[1], qd.f32)
-                _pos2 = qd.cast(my_pos[2], qd.f32)
-                _nrm0 = qd.cast(my_norm[0], qd.f32)
-                _nrm1 = qd.cast(my_norm[1], qd.f32)
-                _nrm2 = qd.cast(my_norm[2], qd.f32)
-                _penf = qd.cast(my_pen, qd.f32)
-
-                p0_px = qd.simt.warp.shfl_sync_f32(MASK, _pos0, group_base + 0)
-                p0_py = qd.simt.warp.shfl_sync_f32(MASK, _pos1, group_base + 0)
-                p0_pz = qd.simt.warp.shfl_sync_f32(MASK, _pos2, group_base + 0)
-                p0_nx = qd.simt.warp.shfl_sync_f32(MASK, _nrm0, group_base + 0)
-                p0_ny = qd.simt.warp.shfl_sync_f32(MASK, _nrm1, group_base + 0)
-                p0_nz = qd.simt.warp.shfl_sync_f32(MASK, _nrm2, group_base + 0)
-                p0_pen = qd.simt.warp.shfl_sync_f32(MASK, _penf, group_base + 0)
+                p0_px = _shfl_float(MASK, my_pos[0], group_base + 0)
+                p0_py = _shfl_float(MASK, my_pos[1], group_base + 0)
+                p0_pz = _shfl_float(MASK, my_pos[2], group_base + 0)
+                p0_nx = _shfl_float(MASK, my_norm[0], group_base + 0)
+                p0_ny = _shfl_float(MASK, my_norm[1], group_base + 0)
+                p0_nz = _shfl_float(MASK, my_norm[2], group_base + 0)
+                p0_pen = _shfl_float(MASK, my_pen, group_base + 0)
                 p0_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 0)
 
-                p1_px = qd.simt.warp.shfl_sync_f32(MASK, _pos0, group_base + 1)
-                p1_py = qd.simt.warp.shfl_sync_f32(MASK, _pos1, group_base + 1)
-                p1_pz = qd.simt.warp.shfl_sync_f32(MASK, _pos2, group_base + 1)
-                p1_nx = qd.simt.warp.shfl_sync_f32(MASK, _nrm0, group_base + 1)
-                p1_ny = qd.simt.warp.shfl_sync_f32(MASK, _nrm1, group_base + 1)
-                p1_nz = qd.simt.warp.shfl_sync_f32(MASK, _nrm2, group_base + 1)
-                p1_pen = qd.simt.warp.shfl_sync_f32(MASK, _penf, group_base + 1)
+                p1_px = _shfl_float(MASK, my_pos[0], group_base + 1)
+                p1_py = _shfl_float(MASK, my_pos[1], group_base + 1)
+                p1_pz = _shfl_float(MASK, my_pos[2], group_base + 1)
+                p1_nx = _shfl_float(MASK, my_norm[0], group_base + 1)
+                p1_ny = _shfl_float(MASK, my_norm[1], group_base + 1)
+                p1_nz = _shfl_float(MASK, my_norm[2], group_base + 1)
+                p1_pen = _shfl_float(MASK, my_pen, group_base + 1)
                 p1_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 1)
 
-                p2_px = qd.simt.warp.shfl_sync_f32(MASK, _pos0, group_base + 2)
-                p2_py = qd.simt.warp.shfl_sync_f32(MASK, _pos1, group_base + 2)
-                p2_pz = qd.simt.warp.shfl_sync_f32(MASK, _pos2, group_base + 2)
-                p2_nx = qd.simt.warp.shfl_sync_f32(MASK, _nrm0, group_base + 2)
-                p2_ny = qd.simt.warp.shfl_sync_f32(MASK, _nrm1, group_base + 2)
-                p2_nz = qd.simt.warp.shfl_sync_f32(MASK, _nrm2, group_base + 2)
-                p2_pen = qd.simt.warp.shfl_sync_f32(MASK, _penf, group_base + 2)
+                p2_px = _shfl_float(MASK, my_pos[0], group_base + 2)
+                p2_py = _shfl_float(MASK, my_pos[1], group_base + 2)
+                p2_pz = _shfl_float(MASK, my_pos[2], group_base + 2)
+                p2_nx = _shfl_float(MASK, my_norm[0], group_base + 2)
+                p2_ny = _shfl_float(MASK, my_norm[1], group_base + 2)
+                p2_nz = _shfl_float(MASK, my_norm[2], group_base + 2)
+                p2_pen = _shfl_float(MASK, my_pen, group_base + 2)
                 p2_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 2)
 
-                p3_px = qd.simt.warp.shfl_sync_f32(MASK, _pos0, group_base + 3)
-                p3_py = qd.simt.warp.shfl_sync_f32(MASK, _pos1, group_base + 3)
-                p3_pz = qd.simt.warp.shfl_sync_f32(MASK, _pos2, group_base + 3)
-                p3_nx = qd.simt.warp.shfl_sync_f32(MASK, _nrm0, group_base + 3)
-                p3_ny = qd.simt.warp.shfl_sync_f32(MASK, _nrm1, group_base + 3)
-                p3_nz = qd.simt.warp.shfl_sync_f32(MASK, _nrm2, group_base + 3)
-                p3_pen = qd.simt.warp.shfl_sync_f32(MASK, _penf, group_base + 3)
+                p3_px = _shfl_float(MASK, my_pos[0], group_base + 3)
+                p3_py = _shfl_float(MASK, my_pos[1], group_base + 3)
+                p3_pz = _shfl_float(MASK, my_pos[2], group_base + 3)
+                p3_nx = _shfl_float(MASK, my_norm[0], group_base + 3)
+                p3_ny = _shfl_float(MASK, my_norm[1], group_base + 3)
+                p3_nz = _shfl_float(MASK, my_norm[2], group_base + 3)
+                p3_pen = _shfl_float(MASK, my_pen, group_base + 3)
                 p3_val = qd.simt.warp.shfl_sync_i32(MASK, my_valid, group_base + 3)
 
                 # ── Phase 5: dedup + write (lane 0 only, skip if no work) ──
