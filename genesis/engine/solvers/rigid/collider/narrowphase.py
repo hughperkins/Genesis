@@ -1677,6 +1677,9 @@ def _func_narrowphase_multicontact_mixed(
 
 
 
+_PARALLEL_BLOCK_DIM = 128
+
+
 @qd.kernel(fastcache=gs.use_fastcache)
 def _func_narrowphase_multicontact_parallel(
     links_state: array_class.LinksState,
@@ -1704,7 +1707,10 @@ def _func_narrowphase_multicontact_parallel(
     max_items_per_thread: qd.template(),
 ):
     """Like _func_narrowphase_multicontact_mixed but MPR perturbation probes
-    run in parallel across 4 lanes of a subgroup.  GJK path is unchanged."""
+    run in parallel across 4 threads using block-level shared memory.
+    Requires n_gjk_threads to be a multiple of _PARALLEL_BLOCK_DIM so that
+    no block mixes GJK and MPR threads (needed for block.sync correctness)."""
+    qd.loop_config(block_dim=_PARALLEL_BLOCK_DIM)
     for i_tid in range(n_total_threads):
         if i_tid < qd.static(n_gjk_threads):
             # === GJK partition: unchanged ===
@@ -1746,34 +1752,40 @@ def _func_narrowphase_multicontact_parallel(
                 )
         else:
             # === MPR partition: parallel perturbation probes (groups of 4) ===
-            lane_id = qd.simt.subgroup.invocation_id()
-            probe_id = lane_id % 4
-            group_base = (lane_id // 4) * 4
+            # n_gjk_threads must be a multiple of _PARALLEL_BLOCK_DIM so every
+            # block is purely GJK or purely MPR — needed for block.sync safety.
+            tid = i_tid % _PARALLEL_BLOCK_DIM
+            probe_id = tid % 4
+            group_id = tid // 4
+            group_base_tid = group_id * 4
+
+            sh_pos_x = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_pos_y = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_pos_z = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_norm_x = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_norm_y = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_norm_z = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_pen = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), gs.qd_float)
+            sh_valid = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), qd.i32)
+            sh_upgrade = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM,), qd.i32)
+            sh_idx = qd.simt.block.SharedArray((_PARALLEL_BLOCK_DIM // 4,), qd.i32)
+            sh_any_work = qd.simt.block.SharedArray((1,), qd.i32)
 
             for _iter in range(max_items_per_thread):
-                # ── Phase 1: work pull (group leader only, broadcast via shuffle) ──
-                raw_idx = gs.qd_int(0)
+                # ── Phase 1: leader pulls work index, broadcast via shared mem ──
                 if probe_id == 0:
-                    raw_idx = qd.atomic_add(collider_state.narrowphase_work_queues.mpr_work_counter[0], 1)
-                idx = qd.simt.subgroup.shuffle(raw_idx, qd.u32(group_base))
+                    sh_idx[group_id] = qd.atomic_add(
+                        collider_state.narrowphase_work_queues.mpr_work_counter[0], 1
+                    )
+                if tid == 0:
+                    sh_any_work[0] = 0
 
-                # Groups in the same subgroup may exhaust the queue at different
-                # times.  We must NOT break until every group is done,
-                # otherwise the remaining groups' shuffle calls would hang
-                # waiting for the departed lanes.
-                have_work_i = gs.qd_int(0)
-                if idx < collider_state.narrowphase_work_queues.mpr_queue_size[0]:
-                    have_work_i = gs.qd_int(1)
-                # Subgroup-wide OR reduction (covers subgroup sizes up to 32)
-                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 1))
-                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 2))
-                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 4))
-                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 8))
-                have_work_i = have_work_i | qd.simt.subgroup.shuffle(have_work_i, qd.u32(lane_id ^ 16))
-                if have_work_i == 0:
-                    break
+                qd.simt.block.sync()
 
-                # Defaults for lanes/groups without work (safe for shuffles)
+                idx = sh_idx[group_id]
+                have_work = idx < collider_state.narrowphase_work_queues.mpr_queue_size[0]
+
+                # Defaults for threads without work
                 my_valid = gs.qd_int(0)
                 my_pos = qd.Vector.zero(gs.qd_float, 3)
                 my_norm = qd.Vector.zero(gs.qd_float, 3)
@@ -1788,7 +1800,9 @@ def _func_narrowphase_multicontact_parallel(
                 i_gb = gs.qd_int(0)
                 i_pair = gs.qd_int(0)
 
-                if have_work_i != 0:
+                if have_work:
+                    sh_any_work[0] = 1
+
                     i_b = collider_state.narrowphase_work_queues.mpr_i_b[idx]
                     i_ga = collider_state.narrowphase_work_queues.mpr_i_ga[idx]
                     i_gb = collider_state.narrowphase_work_queues.mpr_i_gb[idx]
@@ -1797,7 +1811,7 @@ def _func_narrowphase_multicontact_parallel(
                     normal_0 = collider_state.narrowphase_work_queues.mpr_normal_0[idx]
                     penetration_0 = collider_state.narrowphase_work_queues.mpr_penetration_0[idx]
 
-                    # ── Phase 2: setup (all lanes in group, same result) ──
+                    # ── Phase 2: setup (all threads in group, same result) ──
                     EPS = rigid_global_info.EPS[None]
                     ga_pos_original = geoms_state.pos[i_ga, i_b]
                     ga_quat_original = geoms_state.quat[i_ga, i_b]
@@ -1813,7 +1827,7 @@ def _func_narrowphase_multicontact_parallel(
                         rigid_global_info, static_rigid_sim_config,
                     )
 
-                    # ── Phase 3: each lane runs its perturbation probe ──
+                    # ── Phase 3: each thread runs its perturbation probe ──
                     i_det = probe_id + 1
                     axis = (2 * (i_det % 2) - 1) * axis_0 + (1 - 2 * ((i_det // 2) % 2)) * axis_1
                     qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
@@ -1883,55 +1897,29 @@ def _func_narrowphase_multicontact_parallel(
                         my_pen = penetration
                         my_valid = gs.qd_int(1)
 
-                # ── Phase 4: shuffle coordination (ALL UNCONDITIONAL) ──
-
-                # 4a: GJK upgrade reduction (all lanes, tree reduce via XOR)
+                # ── Phase 4: write results to shared memory ──
                 upgrade_i = gs.qd_int(0)
                 if my_needs_upgrade:
                     upgrade_i = gs.qd_int(1)
-                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 1))
-                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 2))
-                any_upgrade = upgrade_i != 0
+                sh_pos_x[tid] = my_pos[0]
+                sh_pos_y[tid] = my_pos[1]
+                sh_pos_z[tid] = my_pos[2]
+                sh_norm_x[tid] = my_norm[0]
+                sh_norm_y[tid] = my_norm[1]
+                sh_norm_z[tid] = my_norm[2]
+                sh_pen[tid] = my_pen
+                sh_valid[tid] = my_valid
+                sh_upgrade[tid] = upgrade_i
 
-                # 4b: Collect all 4 probe results (all lanes execute shuffles)
-                p0_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 0))
-                p0_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 0))
-                p0_pz = qd.simt.subgroup.shuffle(my_pos[2], qd.u32(group_base + 0))
-                p0_nx = qd.simt.subgroup.shuffle(my_norm[0], qd.u32(group_base + 0))
-                p0_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 0))
-                p0_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 0))
-                p0_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 0))
-                p0_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 0))
+                qd.simt.block.sync()
 
-                p1_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 1))
-                p1_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 1))
-                p1_pz = qd.simt.subgroup.shuffle(my_pos[2], qd.u32(group_base + 1))
-                p1_nx = qd.simt.subgroup.shuffle(my_norm[0], qd.u32(group_base + 1))
-                p1_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 1))
-                p1_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 1))
-                p1_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 1))
-                p1_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 1))
+                # ── Phase 5: gather + dedup + write (leader only) ──
+                if have_work:
+                    any_upgrade = False
+                    for k in range(4):
+                        if sh_upgrade[group_base_tid + k] != 0:
+                            any_upgrade = True
 
-                p2_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 2))
-                p2_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 2))
-                p2_pz = qd.simt.subgroup.shuffle(my_pos[2], qd.u32(group_base + 2))
-                p2_nx = qd.simt.subgroup.shuffle(my_norm[0], qd.u32(group_base + 2))
-                p2_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 2))
-                p2_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 2))
-                p2_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 2))
-                p2_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 2))
-
-                p3_px = qd.simt.subgroup.shuffle(my_pos[0], qd.u32(group_base + 3))
-                p3_py = qd.simt.subgroup.shuffle(my_pos[1], qd.u32(group_base + 3))
-                p3_pz = qd.simt.subgroup.shuffle(my_pos[2], qd.u32(group_base + 3))
-                p3_nx = qd.simt.subgroup.shuffle(my_norm[0], qd.u32(group_base + 3))
-                p3_ny = qd.simt.subgroup.shuffle(my_norm[1], qd.u32(group_base + 3))
-                p3_nz = qd.simt.subgroup.shuffle(my_norm[2], qd.u32(group_base + 3))
-                p3_pen = qd.simt.subgroup.shuffle(my_pen, qd.u32(group_base + 3))
-                p3_val = qd.simt.subgroup.shuffle(my_valid, qd.u32(group_base + 3))
-
-                # ── Phase 5: dedup + write (lane 0 only, skip if no work) ──
-                if have_work_i != 0:
                     if any_upgrade:
                         if probe_id == 0:
                             local_idx = qd.atomic_add(
@@ -1954,51 +1942,11 @@ def _func_narrowphase_multicontact_parallel(
                                 lcn[0, k] = normal_0[k]
                             lpen[0, 0] = penetration_0
 
-                            probe_pos = qd.Matrix.zero(gs.qd_float, 4, 3)
-                            probe_nrm = qd.Matrix.zero(gs.qd_float, 4, 3)
-                            probe_pen = qd.Matrix.zero(gs.qd_float, 4, 1)
-                            probe_val = qd.Matrix.zero(gs.qd_float, 4, 1)
-
-                            probe_pos[0, 0] = p0_px
-                            probe_pos[0, 1] = p0_py
-                            probe_pos[0, 2] = p0_pz
-                            probe_nrm[0, 0] = p0_nx
-                            probe_nrm[0, 1] = p0_ny
-                            probe_nrm[0, 2] = p0_nz
-                            probe_pen[0, 0] = p0_pen
-                            probe_val[0, 0] = gs.qd_float(p0_val)
-
-                            probe_pos[1, 0] = p1_px
-                            probe_pos[1, 1] = p1_py
-                            probe_pos[1, 2] = p1_pz
-                            probe_nrm[1, 0] = p1_nx
-                            probe_nrm[1, 1] = p1_ny
-                            probe_nrm[1, 2] = p1_nz
-                            probe_pen[1, 0] = p1_pen
-                            probe_val[1, 0] = gs.qd_float(p1_val)
-
-                            probe_pos[2, 0] = p2_px
-                            probe_pos[2, 1] = p2_py
-                            probe_pos[2, 2] = p2_pz
-                            probe_nrm[2, 0] = p2_nx
-                            probe_nrm[2, 1] = p2_ny
-                            probe_nrm[2, 2] = p2_nz
-                            probe_pen[2, 0] = p2_pen
-                            probe_val[2, 0] = gs.qd_float(p2_val)
-
-                            probe_pos[3, 0] = p3_px
-                            probe_pos[3, 1] = p3_py
-                            probe_pos[3, 2] = p3_pz
-                            probe_nrm[3, 0] = p3_nx
-                            probe_nrm[3, 1] = p3_ny
-                            probe_nrm[3, 2] = p3_nz
-                            probe_pen[3, 0] = p3_pen
-                            probe_val[3, 0] = gs.qd_float(p3_val)
-
                             for i_p in range(4):
-                                if probe_val[i_p, 0] > 0.5:
+                                p_tid = group_base_tid + i_p
+                                if sh_valid[p_tid] > 0:
                                     cp = qd.Vector(
-                                        [probe_pos[i_p, 0], probe_pos[i_p, 1], probe_pos[i_p, 2]],
+                                        [sh_pos_x[p_tid], sh_pos_y[p_tid], sh_pos_z[p_tid]],
                                         dt=gs.qd_float,
                                     )
                                     repeated = False
@@ -2010,12 +1958,15 @@ def _func_narrowphase_multicontact_parallel(
                                             if (cp - prev).norm() < tolerance:
                                                 repeated = True
                                     if not repeated:
-                                        pen_p = probe_pen[i_p, 0]
+                                        pen_p = sh_pen[p_tid]
                                         if pen_p > -tolerance:
                                             pen_p = qd.max(pen_p, 0.0)
-                                            for k in qd.static(range(3)):
-                                                lcp[n_con, k] = probe_pos[i_p, k]
-                                                lcn[n_con, k] = probe_nrm[i_p, k]
+                                            lcp[n_con, 0] = sh_pos_x[p_tid]
+                                            lcp[n_con, 1] = sh_pos_y[p_tid]
+                                            lcp[n_con, 2] = sh_pos_z[p_tid]
+                                            lcn[n_con, 0] = sh_norm_x[p_tid]
+                                            lcn[n_con, 1] = sh_norm_y[p_tid]
+                                            lcn[n_con, 2] = sh_norm_z[p_tid]
                                             lpen[n_con, 0] = pen_p
                                             n_con = n_con + 1
 
@@ -2046,6 +1997,11 @@ def _func_narrowphase_multicontact_parallel(
                                         )
                                 else:
                                     errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
+
+                if sh_any_work[0] == 0:
+                    break
+
+                qd.simt.block.sync()
 
 
 @qd.kernel

@@ -219,16 +219,18 @@ class Collider:
             self._contact0_mpr_state = array_class.get_mpr_state(self._contact0_grid_size)
             self._contact0_gjk_state = array_class.get_gjk_state_contact_only(self._contact0_grid_size)
 
-            def _round_up_64(n):
-                return (n + 63) & ~63
+            BD = narrowphase._PARALLEL_BLOCK_DIM
+
+            def _round_up_bd(n):
+                return (n + BD - 1) & ~(BD - 1)
 
             gjk_only = self._collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.GJK, CCD_ALGORITHM_CODE.MJ_GJK)
             if gjk_only:
-                self._multicontact_n_gjk_threads = gpu_cuda_cores
+                self._multicontact_n_gjk_threads = _round_up_bd(gpu_cuda_cores)
                 self._multicontact_n_total_threads = self._multicontact_n_gjk_threads
             else:
-                self._multicontact_n_gjk_threads = _round_up_64(gpu_cuda_cores // 32)
-                self._multicontact_n_total_threads = gpu_cuda_cores
+                self._multicontact_n_gjk_threads = _round_up_bd(gpu_cuda_cores // 32)
+                self._multicontact_n_total_threads = _round_up_bd(gpu_cuda_cores)
             self._multicontact_max_items_per_thread = 128
             self._multicontact_mpr_state = array_class.get_mpr_state(self._multicontact_n_total_threads)
 
@@ -643,7 +645,7 @@ class Collider:
 
     def _call_multicontact(self):
         kernel_fn = narrowphase._func_narrowphase_multicontact_mixed
-        if gs.device.type == "cuda" and not os.environ.get("GS_DISABLE_PARALLEL_PERTURB"):
+        if gs.device.type != "cpu" and not os.environ.get("GS_DISABLE_PARALLEL_PERTURB"):
             kernel_fn = narrowphase._func_narrowphase_multicontact_parallel
         kernel_fn(
             self._solver.links_state,
