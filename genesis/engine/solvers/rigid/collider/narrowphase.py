@@ -1124,6 +1124,15 @@ def _func_multicontact_run_detection(
 
 
 @qd.func
+def subgroup_reduce_or(value, lane_id, n_bits: qd.template()):
+    """Butterfly OR reduction across 2**n_bits lanes of the subgroup."""
+    result = value
+    for _s in qd.static(range(n_bits)):
+        result = result | qd.simt.subgroup.shuffle(result, qd.u32(lane_id ^ (1 << _s)))
+    return result
+
+
+@qd.func
 def _func_mpr_single_probe(
     i_det,
     contact_pos_0: qd.types.vector(3, dtype=gs.qd_float),
@@ -1810,12 +1819,9 @@ def _func_narrowphase_multicontact_parallel(
                 my_group_has_work = gs.qd_int(0)
                 if idx < collider_state.narrowphase_work_queues.mpr_queue_size[0]:
                     my_group_has_work = gs.qd_int(1)
-                # Subgroup-wide OR butterfly reduction (covers subgroup sizes up to 32).
                 # All lanes must stay alive until no group has work, otherwise
                 # departed lanes would deadlock the remaining groups' shuffles.
-                any_subgroup_has_work = my_group_has_work
-                for _s in qd.static(range(5)):
-                    any_subgroup_has_work = any_subgroup_has_work | qd.simt.subgroup.shuffle(any_subgroup_has_work, qd.u32(lane_id ^ (1 << _s)))
+                any_subgroup_has_work = subgroup_reduce_or(my_group_has_work, lane_id, 5)
                 if any_subgroup_has_work == 0:
                     break
 
@@ -1878,13 +1884,11 @@ def _func_narrowphase_multicontact_parallel(
 
                 # ── Phase 4: shuffle coordination (ALL UNCONDITIONAL) ──
 
-                # 4a: GJK upgrade reduction (all lanes, tree reduce via XOR)
+                # 4a: GJK upgrade reduction (all lanes in group)
                 upgrade_i = gs.qd_int(0)
                 if my_needs_upgrade:
                     upgrade_i = gs.qd_int(1)
-                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 1))
-                upgrade_i = upgrade_i | qd.simt.subgroup.shuffle(upgrade_i, qd.u32(lane_id ^ 2))
-                any_upgrade = upgrade_i != 0
+                any_upgrade = subgroup_reduce_or(upgrade_i, lane_id, 2) != 0
 
                 # 4b: Shuffle-gather all 4 probe results into matrices
                 probe_pos = qd.Matrix.zero(gs.qd_float, 4, 3)
