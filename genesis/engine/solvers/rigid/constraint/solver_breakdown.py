@@ -1348,15 +1348,10 @@ def _kernel_solve_gpu_graph(
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
     while qd.graph_do_while(graph_counter):
-        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
-            _func_parallel_linesearch_p0(
-                dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
-            )
-            _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
-        else:
-            _func_iterative_linesearch(
-                dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
-            )
+        _func_parallel_linesearch_p0(
+            dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
+        )
+        _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             _func_cg_only_save_prev_grad(constraint_state, static_rigid_sim_config)
         _func_update_constraint_forces(constraint_state, static_rigid_sim_config)
