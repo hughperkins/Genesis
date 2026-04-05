@@ -96,6 +96,526 @@ def _ls_eval_cost_grad(
     return cost, grad
 
 
+# Block size for the iterative bracket-search linesearch.
+_LS_ITER_BLOCK = 32
+
+
+@qd.func
+def _eval_constraint_at_alpha(
+    alpha,
+    i_c,
+    i_b,
+    ne,
+    nef,
+    constraint_state: array_class.ConstraintState,
+):
+    """Evaluate a single constraint's cost/grad/hess contribution at a given alpha.
+
+    Returns (cost, grad, hess) for the variable part (friction + contact only).
+    Equality constraints are handled via precomputed constant coefficients.
+    """
+    Jaref_c = constraint_state.Jaref[i_c, i_b]
+    jv_c = constraint_state.jv[i_c, i_b]
+    D = constraint_state.efc_D[i_c, i_b]
+    x = Jaref_c + alpha * jv_c
+    jvD = jv_c * D
+    jv2D = jv_c * jvD
+
+    ec = gs.qd_float(0.0)
+    eg = gs.qd_float(0.0)
+    eh = gs.qd_float(0.0)
+
+    if i_c < nef:
+        f_val = constraint_state.efc_frictionloss[i_c, i_b]
+        r_val = constraint_state.diag[i_c, i_b]
+        rf = r_val * f_val
+        if x <= -rf:
+            ec = f_val * (-0.5 * rf - x)
+            eg = -f_val * jv_c
+        elif x >= rf:
+            ec = f_val * (-0.5 * rf + x)
+            eg = f_val * jv_c
+        else:
+            ec = 0.5 * D * x * x
+            eg = jvD * x
+            eh = jv2D
+    else:
+        if x < 0:
+            ec = 0.5 * D * x * x
+            eg = jvD * x
+            eh = jv2D
+
+    return ec, eg, eh
+
+
+@qd.func
+def _reduce_3(sh_a, sh_b, sh_c, tid):
+    """Tree-reduce 3 shared arrays of size _LS_ITER_BLOCK in-place. Result in index 0."""
+    _K = qd.static(_LS_ITER_BLOCK)
+    qd.simt.block.sync()
+    stride = _K // 2
+    while stride > 0:
+        if tid < stride:
+            sh_a[tid] += sh_a[tid + stride]
+            sh_b[tid] += sh_b[tid + stride]
+            sh_c[tid] += sh_c[tid + stride]
+        qd.simt.block.sync()
+        stride //= 2
+
+
+@qd.func
+def _reduce_6(sh_a, sh_b, sh_c, sh_d, sh_e, sh_f, tid):
+    """Tree-reduce 6 shared arrays of size _LS_ITER_BLOCK in-place. Result in index 0."""
+    _K = qd.static(_LS_ITER_BLOCK)
+    qd.simt.block.sync()
+    stride = _K // 2
+    while stride > 0:
+        if tid < stride:
+            sh_a[tid] += sh_a[tid + stride]
+            sh_b[tid] += sh_b[tid + stride]
+            sh_c[tid] += sh_c[tid + stride]
+            sh_d[tid] += sh_d[tid + stride]
+            sh_e[tid] += sh_e[tid + stride]
+            sh_f[tid] += sh_f[tid + stride]
+        qd.simt.block.sync()
+        stride //= 2
+
+
+@qd.func
+def _reduce_9(sh_a, sh_b, sh_c, sh_d, sh_e, sh_f, sh_g, sh_h, sh_i, tid):
+    """Tree-reduce 9 shared arrays of size _LS_ITER_BLOCK in-place. Result in index 0."""
+    _K = qd.static(_LS_ITER_BLOCK)
+    qd.simt.block.sync()
+    stride = _K // 2
+    while stride > 0:
+        if tid < stride:
+            sh_a[tid] += sh_a[tid + stride]
+            sh_b[tid] += sh_b[tid + stride]
+            sh_c[tid] += sh_c[tid + stride]
+            sh_d[tid] += sh_d[tid + stride]
+            sh_e[tid] += sh_e[tid + stride]
+            sh_f[tid] += sh_f[tid + stride]
+            sh_g[tid] += sh_g[tid + stride]
+            sh_h[tid] += sh_h[tid + stride]
+            sh_i[tid] += sh_i[tid + stride]
+        qd.simt.block.sync()
+        stride //= 2
+
+
+@qd.func
+def _tighter_bracket(old_grad, new_grad):
+    """True if new_grad is closer to zero from the same sign as old_grad."""
+    return (old_grad < new_grad and new_grad < 0.0) or (old_grad > new_grad and new_grad > 0.0)
+
+
+@qd.func
+def _func_iterative_linesearch(
+    dofs_info: array_class.DofsInfo,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Fused iterative bracket-search linesearch with fully cooperative constraint evaluation.
+
+    One block of K threads per env.  All phases — mv, jv, p0 evaluation, bracket search, and alpha apply — are fused
+    into a single grid launch.  The bracket iteration evaluates three candidate step sizes per iteration (Newton from
+    lo, Newton from hi, midpoint) with all K threads cooperating on the constraint reduction.  No phase serializes to
+    a single thread.
+
+    Algorithm:
+      1. Cooperative mv = M @ search, jv = J @ search.
+      2. Cooperative p0 evaluation (cost, gradient, curvature at alpha=0).
+      3. Newton step from p0 → initial bracket endpoint.
+      4. Bracket iteration: evaluate 3 candidate alphas cooperatively, swap bracket endpoints toward the gradient
+         zero-crossing.
+      5. Pick best alpha, apply to qacc, Ma, Jaref.
+    """
+    _B = constraint_state.grad.shape[1]
+    _K = qd.static(_LS_ITER_BLOCK)
+
+    qd.loop_config(name="iterative_linesearch", block_dim=_K)
+    for i_flat in range(_B * _K):
+        tid = i_flat % _K
+        i_b = i_flat // _K
+
+        sh0 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh1 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh2 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh3 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh4 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh5 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh6 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh7 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+        sh8 = qd.simt.block.SharedArray((_K,), gs.qd_float)
+
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            n_dofs = constraint_state.search.shape[0]
+            n_con = constraint_state.n_constraints[i_b]
+            ne = constraint_state.n_constraints_equality[i_b]
+            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+            EPS = rigid_global_info.EPS[None]
+
+            # ── mv = M @ search (cooperative over DOFs) ──────────────────────────────────────────────────────────────
+            i_d1 = tid
+            while i_d1 < n_dofs:
+                I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+                i_e = dofs_info.entity_idx[I_d1]
+                mv_val = gs.qd_float(0.0)
+                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    mv_val += rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+                constraint_state.mv[i_d1, i_b] = mv_val
+                i_d1 += _K
+
+            # ── jv = J @ search (cooperative over constraints) ───────────────────────────────────────────────────────
+            i_c = tid
+            while i_c < n_con:
+                jv_val = gs.qd_float(0.0)
+                if qd.static(static_rigid_sim_config.sparse_solve):
+                    for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                        i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                        jv_val += constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+                else:
+                    for i_d in range(n_dofs):
+                        jv_val += constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+                constraint_state.jv[i_c, i_b] = jv_val
+                i_c += _K
+
+            qd.simt.block.sync()
+
+            # ── DOF reduction: snorm², quad_gauss coefficients ───────────────────────────────────────────────────────
+            loc_snorm_sq = gs.qd_float(0.0)
+            loc_qg1 = gs.qd_float(0.0)
+            loc_qg2 = gs.qd_float(0.0)
+            i_d = tid
+            while i_d < n_dofs:
+                s = constraint_state.search[i_d, i_b]
+                loc_snorm_sq += s * s
+                loc_qg1 += s * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
+                loc_qg2 += 0.5 * s * constraint_state.mv[i_d, i_b]
+                i_d += _K
+
+            sh0[tid] = loc_snorm_sq
+            sh1[tid] = loc_qg1
+            sh2[tid] = loc_qg2
+            _reduce_3(sh0, sh1, sh2, tid)
+
+            snorm = qd.sqrt(sh0[0])
+            qg_0 = constraint_state.gauss[i_b]
+            qg_1 = sh1[0]
+            qg_2 = sh2[0]
+
+            if snorm < EPS:
+                if tid == 0:
+                    constraint_state.improved[i_b] = False
+            else:
+                # ── Constraint reduction: eq_sum + p0 (cost/grad/hess at alpha=0) ────────────────────────────────────
+                loc_eq0 = gs.qd_float(0.0)
+                loc_eq1 = gs.qd_float(0.0)
+                loc_eq2 = gs.qd_float(0.0)
+                loc_p0c = gs.qd_float(0.0)
+                loc_p0g = gs.qd_float(0.0)
+                loc_p0h = gs.qd_float(0.0)
+
+                i_c = tid
+                while i_c < n_con:
+                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                    jv_c = constraint_state.jv[i_c, i_b]
+                    D = constraint_state.efc_D[i_c, i_b]
+                    qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+                    qf_1 = D * (jv_c * Jaref_c)
+                    qf_2 = D * (0.5 * jv_c * jv_c)
+
+                    if i_c < ne:
+                        loc_eq0 += qf_0
+                        loc_eq1 += qf_1
+                        loc_eq2 += qf_2
+                        loc_p0c += qf_0
+                        loc_p0g += qf_1
+                        loc_p0h += qf_2
+                    elif i_c < nef:
+                        f = constraint_state.efc_frictionloss[i_c, i_b]
+                        r = constraint_state.diag[i_c, i_b]
+                        rf = r * f
+                        ln = Jaref_c <= -rf
+                        lp = Jaref_c >= rf
+                        if ln or lp:
+                            qf_0 = ln * f * (-0.5 * rf - Jaref_c) + lp * f * (-0.5 * rf + Jaref_c)
+                            qf_1 = ln * (-f * jv_c) + lp * (f * jv_c)
+                            qf_2 = 0.0
+                        loc_p0c += qf_0
+                        loc_p0g += qf_1
+                        loc_p0h += qf_2
+                    else:
+                        active = Jaref_c < 0
+                        loc_p0c += qf_0 * active
+                        loc_p0g += qf_1 * active
+                        loc_p0h += qf_2 * active
+
+                    i_c += _K
+
+                sh0[tid] = loc_eq0
+                sh1[tid] = loc_eq1
+                sh2[tid] = loc_eq2
+                sh3[tid] = loc_p0c
+                sh4[tid] = loc_p0g
+                sh5[tid] = loc_p0h
+                _reduce_6(sh0, sh1, sh2, sh3, sh4, sh5, tid)
+
+                # Constant quadratic coefficients (DOF + equality), reused for every alpha evaluation
+                const_0 = qg_0 + sh0[0]
+                const_1 = qg_1 + sh1[0]
+                const_2 = qg_2 + sh2[0]
+
+                p0_cost = qg_0 + sh3[0]
+                p0_grad = qg_1 + sh4[0]
+                p0_hess = 2.0 * (qg_2 + sh5[0])
+
+                # Adaptive linesearch tolerance
+                scale = rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs)
+                gtol = qd.max(
+                    rigid_global_info.tolerance[None] * rigid_global_info.ls_tolerance[None] * snorm * scale, EPS
+                )
+
+                # ── Initial Newton step from p0 ─────────────────────────────────────────────────────────────────────
+                init_alpha = gs.qd_float(0.0)
+                if p0_hess > EPS:
+                    init_alpha = -p0_grad / p0_hess
+
+                # ── Cooperative eval at init_alpha (friction + contact only) ─────────────────────────────────────────
+                loc_vc = gs.qd_float(0.0)
+                loc_vg = gs.qd_float(0.0)
+                loc_vh = gs.qd_float(0.0)
+                i_c = ne + tid
+                while i_c < n_con:
+                    ec, eg, eh = _eval_constraint_at_alpha(
+                        init_alpha, i_c, i_b, ne, nef, constraint_state
+                    )
+                    loc_vc += ec
+                    loc_vg += eg
+                    loc_vh += eh
+                    i_c += _K
+
+                sh0[tid] = loc_vc
+                sh1[tid] = loc_vg
+                sh2[tid] = loc_vh
+                _reduce_3(sh0, sh1, sh2, tid)
+
+                init_cost = const_0 + init_alpha * const_1 + init_alpha * init_alpha * const_2 + sh0[0]
+                init_grad = const_1 + 2.0 * init_alpha * const_2 + sh1[0]
+                init_hess = 2.0 * const_2 + sh2[0]
+
+                # ── Bracket setup ────────────────────────────────────────────────────────────────────────────────────
+                best_alpha = gs.qd_float(0.0)
+
+                if qd.abs(init_grad) < gtol and init_cost < p0_cost:
+                    best_alpha = init_alpha
+                else:
+                    # lo = bracket endpoint with more-negative gradient
+                    # hi = bracket endpoint with more-positive gradient
+                    if init_grad < p0_grad:
+                        lo_a = init_alpha
+                        lo_c = init_cost
+                        lo_g = init_grad
+                        lo_h = init_hess
+                        hi_a = gs.qd_float(0.0)
+                        hi_c = p0_cost
+                        hi_g = p0_grad
+                        hi_h = p0_hess
+                    else:
+                        lo_a = gs.qd_float(0.0)
+                        lo_c = p0_cost
+                        lo_g = p0_grad
+                        lo_h = p0_hess
+                        hi_a = init_alpha
+                        hi_c = init_cost
+                        hi_g = init_grad
+                        hi_h = init_hess
+
+                    # ── Bracket iteration ────────────────────────────────────────────────────────────────────────────
+                    max_ls_iter = rigid_global_info.ls_iterations[None]
+                    ls_done = False
+                    ls_iter = 0
+                    while not ls_done and ls_iter < max_ls_iter:
+                        ls_iter += 1
+
+                        # Three candidate alphas: Newton from lo, Newton from hi, midpoint
+                        cand_a = lo_a - lo_g / lo_h if lo_h > EPS else lo_a
+                        cand_b = hi_a - hi_g / hi_h if hi_h > EPS else hi_a
+                        cand_c = 0.5 * (lo_a + hi_a)
+
+                        # ── Cooperative 3-alpha constraint eval (friction + contact) ─────────────────────────────────
+                        loc_ac = gs.qd_float(0.0)
+                        loc_ag = gs.qd_float(0.0)
+                        loc_ah = gs.qd_float(0.0)
+                        loc_bc = gs.qd_float(0.0)
+                        loc_bg = gs.qd_float(0.0)
+                        loc_bh = gs.qd_float(0.0)
+                        loc_cc = gs.qd_float(0.0)
+                        loc_cg = gs.qd_float(0.0)
+                        loc_ch = gs.qd_float(0.0)
+
+                        i_c = ne + tid
+                        while i_c < n_con:
+                            Jaref_c = constraint_state.Jaref[i_c, i_b]
+                            jv_c = constraint_state.jv[i_c, i_b]
+                            D = constraint_state.efc_D[i_c, i_b]
+                            jvD = jv_c * D
+                            jv2D = jv_c * jvD
+
+                            xa = Jaref_c + cand_a * jv_c
+                            xb = Jaref_c + cand_b * jv_c
+                            xc = Jaref_c + cand_c * jv_c
+
+                            if i_c < nef:
+                                f_val = constraint_state.efc_frictionloss[i_c, i_b]
+                                r_val = constraint_state.diag[i_c, i_b]
+                                rf = r_val * f_val
+
+                                if xa <= -rf:
+                                    loc_ac += f_val * (-0.5 * rf - xa)
+                                    loc_ag += -f_val * jv_c
+                                elif xa >= rf:
+                                    loc_ac += f_val * (-0.5 * rf + xa)
+                                    loc_ag += f_val * jv_c
+                                else:
+                                    loc_ac += 0.5 * D * xa * xa
+                                    loc_ag += jvD * xa
+                                    loc_ah += jv2D
+
+                                if xb <= -rf:
+                                    loc_bc += f_val * (-0.5 * rf - xb)
+                                    loc_bg += -f_val * jv_c
+                                elif xb >= rf:
+                                    loc_bc += f_val * (-0.5 * rf + xb)
+                                    loc_bg += f_val * jv_c
+                                else:
+                                    loc_bc += 0.5 * D * xb * xb
+                                    loc_bg += jvD * xb
+                                    loc_bh += jv2D
+
+                                if xc <= -rf:
+                                    loc_cc += f_val * (-0.5 * rf - xc)
+                                    loc_cg += -f_val * jv_c
+                                elif xc >= rf:
+                                    loc_cc += f_val * (-0.5 * rf + xc)
+                                    loc_cg += f_val * jv_c
+                                else:
+                                    loc_cc += 0.5 * D * xc * xc
+                                    loc_cg += jvD * xc
+                                    loc_ch += jv2D
+                            else:
+                                if xa < 0:
+                                    loc_ac += 0.5 * D * xa * xa
+                                    loc_ag += jvD * xa
+                                    loc_ah += jv2D
+                                if xb < 0:
+                                    loc_bc += 0.5 * D * xb * xb
+                                    loc_bg += jvD * xb
+                                    loc_bh += jv2D
+                                if xc < 0:
+                                    loc_cc += 0.5 * D * xc * xc
+                                    loc_cg += jvD * xc
+                                    loc_ch += jv2D
+
+                            i_c += _K
+
+                        sh0[tid] = loc_ac
+                        sh1[tid] = loc_ag
+                        sh2[tid] = loc_ah
+                        sh3[tid] = loc_bc
+                        sh4[tid] = loc_bg
+                        sh5[tid] = loc_bh
+                        sh6[tid] = loc_cc
+                        sh7[tid] = loc_cg
+                        sh8[tid] = loc_ch
+                        _reduce_9(sh0, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, tid)
+
+                        # Total = const(alpha) + variable contribution
+                        a_cost = const_0 + cand_a * const_1 + cand_a * cand_a * const_2 + sh0[0]
+                        a_grad = const_1 + 2.0 * cand_a * const_2 + sh1[0]
+                        a_hess = 2.0 * const_2 + sh2[0]
+
+                        b_cost = const_0 + cand_b * const_1 + cand_b * cand_b * const_2 + sh3[0]
+                        b_grad = const_1 + 2.0 * cand_b * const_2 + sh4[0]
+                        b_hess = 2.0 * const_2 + sh5[0]
+
+                        c_cost = const_0 + cand_c * const_1 + cand_c * cand_c * const_2 + sh6[0]
+                        c_grad = const_1 + 2.0 * cand_c * const_2 + sh7[0]
+                        c_hess = 2.0 * const_2 + sh8[0]
+
+                        # ── Bracket swap: try each candidate against lo, then hi ─────────────────────────────────────
+                        swap_lo = False
+                        if _tighter_bracket(lo_g, a_grad):
+                            lo_a = cand_a
+                            lo_c = a_cost
+                            lo_g = a_grad
+                            lo_h = a_hess
+                            swap_lo = True
+                        if _tighter_bracket(lo_g, c_grad):
+                            lo_a = cand_c
+                            lo_c = c_cost
+                            lo_g = c_grad
+                            lo_h = c_hess
+                            swap_lo = True
+                        if _tighter_bracket(lo_g, b_grad):
+                            lo_a = cand_b
+                            lo_c = b_cost
+                            lo_g = b_grad
+                            lo_h = b_hess
+                            swap_lo = True
+
+                        swap_hi = False
+                        if _tighter_bracket(hi_g, b_grad):
+                            hi_a = cand_b
+                            hi_c = b_cost
+                            hi_g = b_grad
+                            hi_h = b_hess
+                            swap_hi = True
+                        if _tighter_bracket(hi_g, c_grad):
+                            hi_a = cand_c
+                            hi_c = c_cost
+                            hi_g = c_grad
+                            hi_h = c_hess
+                            swap_hi = True
+                        if _tighter_bracket(hi_g, a_grad):
+                            hi_a = cand_a
+                            hi_c = a_cost
+                            hi_g = a_grad
+                            hi_h = a_hess
+                            swap_hi = True
+
+                        # Converged: no progress, or gradient small enough at either bracket endpoint
+                        ls_done = (
+                            (not swap_lo and not swap_hi)
+                            or (lo_g < 0.0 and lo_g > -gtol)
+                            or (hi_g > 0.0 and hi_g < gtol)
+                        )
+
+                        # Track best alpha: pick the bracket endpoint with lower cost, if it improved over p0
+                        if lo_c < p0_cost or hi_c < p0_cost:
+                            if lo_c <= hi_c:
+                                best_alpha = lo_a
+                            else:
+                                best_alpha = hi_a
+
+                # ── Apply alpha ──────────────────────────────────────────────────────────────────────────────────────
+                if qd.abs(best_alpha) < EPS:
+                    if tid == 0:
+                        constraint_state.improved[i_b] = False
+                else:
+                    i_d = tid
+                    while i_d < n_dofs:
+                        constraint_state.qacc[i_d, i_b] += constraint_state.search[i_d, i_b] * best_alpha
+                        constraint_state.Ma[i_d, i_b] += constraint_state.mv[i_d, i_b] * best_alpha
+                        i_d += _K
+                    i_c = tid
+                    while i_c < n_con:
+                        constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * best_alpha
+                        i_c += _K
+
+
 @qd.func
 def _func_parallel_linesearch_p0(
     dofs_info: array_class.DofsInfo,
@@ -820,12 +1340,10 @@ def _kernel_solve_gpu_graph(
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
     while qd.graph_do_while(graph_counter):
-        # Fused: mv + jv + snorm + quad_gauss + eq_sum + p0_cost
-        _func_parallel_linesearch_p0(
+        # Fused iterative bracket-search linesearch: mv, jv, p0, bracket iteration, alpha apply
+        _func_iterative_linesearch(
             dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
         )
-        # Fused: grid search + bisection + apply alpha
-        _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             _func_cg_only_save_prev_grad(constraint_state, static_rigid_sim_config)
         _func_update_constraint_forces(constraint_state, static_rigid_sim_config)
@@ -854,7 +1372,8 @@ def func_solve_decomposed(
     _n_iterations,
 ):
     """
-    GPU graph accelerated solver loop with parallel grid-search linesearch and GPU-side iteration via graph_do_while.
+    GPU graph accelerated solver loop with iterative bracket-search linesearch and GPU-side iteration via
+    graph_do_while.
 
     On CUDA SM 9.0+ (Hopper), the entire iteration loop runs on the GPU with no host involvement. On older CUDA GPUs,
     falls back to a host-side do-while loop that still benefits from CUDA graph kernel launch batching. On other GPUs,
