@@ -406,207 +406,302 @@ def _func_iterative_linesearch(
                 init_grad = const_1 + 2.0 * init_alpha * const_2 + sh1[0]
                 init_hess = 2.0 * const_2 + sh2[0]
 
-                # ── Bracket setup ────────────────────────────────────────────────────────────────────────────────────
+                # ── Phase 1b: p0 cost fallback (match old linesearch) ──────────────────────────────────────────────
                 best_alpha = gs.qd_float(0.0)
+                max_ls_iter = rigid_global_info.ls_iterations[None]
 
-                if qd.abs(init_grad) < gtol and init_cost < p0_cost:
-                    best_alpha = init_alpha
+                cur_a = init_alpha
+                cur_c = init_cost
+                cur_g = init_grad
+                cur_h = init_hess
+                if p0_cost < init_cost:
+                    cur_a = gs.qd_float(0.0)
+                    cur_c = p0_cost
+                    cur_g = p0_grad
+                    cur_h = p0_hess
+
+                if qd.abs(cur_g) < gtol:
+                    best_alpha = cur_a
                 else:
-                    # lo = bracket endpoint with more-negative gradient
-                    # hi = bracket endpoint with more-positive gradient
-                    lo_a = gs.qd_float(0.0)
-                    lo_c = gs.qd_float(0.0)
-                    lo_g = gs.qd_float(0.0)
-                    lo_h = gs.qd_float(0.0)
-                    hi_a = gs.qd_float(0.0)
-                    hi_c = gs.qd_float(0.0)
-                    hi_g = gs.qd_float(0.0)
-                    hi_h = gs.qd_float(0.0)
-                    if init_grad < p0_grad:
-                        lo_a = init_alpha
-                        lo_c = init_cost
-                        lo_g = init_grad
-                        lo_h = init_hess
-                        hi_a = gs.qd_float(0.0)
-                        hi_c = p0_cost
-                        hi_g = p0_grad
-                        hi_h = p0_hess
-                    else:
-                        lo_a = gs.qd_float(0.0)
-                        lo_c = p0_cost
-                        lo_g = p0_grad
-                        lo_h = p0_hess
-                        hi_a = init_alpha
-                        hi_c = init_cost
-                        hi_g = init_grad
-                        hi_h = init_hess
-
-                    # ── Bracket iteration ────────────────────────────────────────────────────────────────────────────
-                    max_ls_iter = rigid_global_info.ls_iterations[None]
-                    ls_done = False
+                    # ── Phase 2: Newton chase — follow Newton steps until gradient sign change ──────────────────
+                    direction = gs.qd_int(1) if cur_g < 0.0 else gs.qd_int(-1)
+                    prev_a = cur_a
+                    prev_c = cur_c
+                    prev_g = cur_g
+                    prev_h = cur_h
+                    prev_updated = False
+                    chase_done = False
                     ls_iter = 0
-                    while not ls_done and ls_iter < max_ls_iter:
+
+                    while cur_g * direction <= -gtol and ls_iter < max_ls_iter:
                         ls_iter += 1
+                        prev_a = cur_a
+                        prev_c = cur_c
+                        prev_g = cur_g
+                        prev_h = cur_h
+                        prev_updated = True
 
-                        # Three candidate alphas: Newton from lo, Newton from hi, midpoint
-                        cand_a = lo_a - lo_g / lo_h if lo_h > EPS else lo_a
-                        cand_b = hi_a - hi_g / hi_h if hi_h > EPS else hi_a
-                        cand_c = 0.5 * (lo_a + hi_a)
+                        next_a = cur_a - cur_g / cur_h if cur_h > EPS else cur_a
 
-                        # ── Cooperative 3-alpha constraint eval (friction + contact) ─────────────────────────────────
-                        loc_ac = gs.qd_float(0.0)
-                        loc_ag = gs.qd_float(0.0)
-                        loc_ah = gs.qd_float(0.0)
-                        loc_bc = gs.qd_float(0.0)
-                        loc_bg = gs.qd_float(0.0)
-                        loc_bh = gs.qd_float(0.0)
-                        loc_cc = gs.qd_float(0.0)
-                        loc_cg = gs.qd_float(0.0)
-                        loc_ch = gs.qd_float(0.0)
-
+                        # ── Cooperative eval at next_a (friction + contact) ────────────────────────────────────
+                        loc_vc = gs.qd_float(0.0)
+                        loc_vg = gs.qd_float(0.0)
+                        loc_vh = gs.qd_float(0.0)
                         i_c = ne + tid
                         while i_c < n_con:
-                            Jaref_c = constraint_state.Jaref[i_c, i_b]
-                            jv_c = constraint_state.jv[i_c, i_b]
-                            D = constraint_state.efc_D[i_c, i_b]
-                            jvD = jv_c * D
-                            jv2D = jv_c * jvD
-
-                            xa = Jaref_c + cand_a * jv_c
-                            xb = Jaref_c + cand_b * jv_c
-                            xc = Jaref_c + cand_c * jv_c
-
-                            if i_c < nef:
-                                f_val = constraint_state.efc_frictionloss[i_c, i_b]
-                                r_val = constraint_state.diag[i_c, i_b]
-                                rf = r_val * f_val
-
-                                if xa <= -rf:
-                                    loc_ac += f_val * (-0.5 * rf - xa)
-                                    loc_ag += -f_val * jv_c
-                                elif xa >= rf:
-                                    loc_ac += f_val * (-0.5 * rf + xa)
-                                    loc_ag += f_val * jv_c
-                                else:
-                                    loc_ac += 0.5 * D * xa * xa
-                                    loc_ag += jvD * xa
-                                    loc_ah += jv2D
-
-                                if xb <= -rf:
-                                    loc_bc += f_val * (-0.5 * rf - xb)
-                                    loc_bg += -f_val * jv_c
-                                elif xb >= rf:
-                                    loc_bc += f_val * (-0.5 * rf + xb)
-                                    loc_bg += f_val * jv_c
-                                else:
-                                    loc_bc += 0.5 * D * xb * xb
-                                    loc_bg += jvD * xb
-                                    loc_bh += jv2D
-
-                                if xc <= -rf:
-                                    loc_cc += f_val * (-0.5 * rf - xc)
-                                    loc_cg += -f_val * jv_c
-                                elif xc >= rf:
-                                    loc_cc += f_val * (-0.5 * rf + xc)
-                                    loc_cg += f_val * jv_c
-                                else:
-                                    loc_cc += 0.5 * D * xc * xc
-                                    loc_cg += jvD * xc
-                                    loc_ch += jv2D
-                            else:
-                                if xa < 0:
-                                    loc_ac += 0.5 * D * xa * xa
-                                    loc_ag += jvD * xa
-                                    loc_ah += jv2D
-                                if xb < 0:
-                                    loc_bc += 0.5 * D * xb * xb
-                                    loc_bg += jvD * xb
-                                    loc_bh += jv2D
-                                if xc < 0:
-                                    loc_cc += 0.5 * D * xc * xc
-                                    loc_cg += jvD * xc
-                                    loc_ch += jv2D
-
+                            ec, eg, eh = _eval_constraint_at_alpha(
+                                next_a, i_c, i_b, ne, nef, constraint_state
+                            )
+                            loc_vc += ec
+                            loc_vg += eg
+                            loc_vh += eh
                             i_c += _K
 
-                        sh0[tid] = loc_ac
-                        sh1[tid] = loc_ag
-                        sh2[tid] = loc_ah
-                        sh3[tid] = loc_bc
-                        sh4[tid] = loc_bg
-                        sh5[tid] = loc_bh
-                        sh6[tid] = loc_cc
-                        sh7[tid] = loc_cg
-                        sh8[tid] = loc_ch
-                        _reduce_9(sh0, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, tid)
+                        sh0[tid] = loc_vc
+                        sh1[tid] = loc_vg
+                        sh2[tid] = loc_vh
+                        _reduce_3(sh0, sh1, sh2, tid)
 
-                        # Total = const(alpha) + variable contribution
-                        a_cost = const_0 + cand_a * const_1 + cand_a * cand_a * const_2 + sh0[0]
-                        a_grad = const_1 + 2.0 * cand_a * const_2 + sh1[0]
-                        a_hess = 2.0 * const_2 + sh2[0]
+                        cur_a = next_a
+                        cur_c = const_0 + next_a * const_1 + next_a * next_a * const_2 + sh0[0]
+                        cur_g = const_1 + 2.0 * next_a * const_2 + sh1[0]
+                        cur_h = 2.0 * const_2 + sh2[0]
 
-                        b_cost = const_0 + cand_b * const_1 + cand_b * cand_b * const_2 + sh3[0]
-                        b_grad = const_1 + 2.0 * cand_b * const_2 + sh4[0]
-                        b_hess = 2.0 * const_2 + sh5[0]
+                        if qd.abs(cur_g) < gtol:
+                            best_alpha = cur_a
+                            chase_done = True
 
-                        c_cost = const_0 + cand_c * const_1 + cand_c * cand_c * const_2 + sh6[0]
-                        c_grad = const_1 + 2.0 * cand_c * const_2 + sh7[0]
-                        c_hess = 2.0 * const_2 + sh8[0]
-
-                        # ── Bracket swap: try each candidate against lo, then hi ─────────────────────────────────────
-                        swap_lo = False
-                        if _tighter_bracket(lo_g, a_grad) or (lo_g >= 0.0 and a_grad < 0.0):
-                            lo_a = cand_a
-                            lo_c = a_cost
-                            lo_g = a_grad
-                            lo_h = a_hess
-                            swap_lo = True
-                        if _tighter_bracket(lo_g, c_grad) or (lo_g >= 0.0 and c_grad < 0.0):
-                            lo_a = cand_c
-                            lo_c = c_cost
-                            lo_g = c_grad
-                            lo_h = c_hess
-                            swap_lo = True
-                        if _tighter_bracket(lo_g, b_grad) or (lo_g >= 0.0 and b_grad < 0.0):
-                            lo_a = cand_b
-                            lo_c = b_cost
-                            lo_g = b_grad
-                            lo_h = b_hess
-                            swap_lo = True
-
-                        swap_hi = False
-                        if _tighter_bracket(hi_g, b_grad) or (hi_g <= 0.0 and b_grad > 0.0):
-                            hi_a = cand_b
-                            hi_c = b_cost
-                            hi_g = b_grad
-                            hi_h = b_hess
-                            swap_hi = True
-                        if _tighter_bracket(hi_g, c_grad) or (hi_g <= 0.0 and c_grad > 0.0):
-                            hi_a = cand_c
-                            hi_c = c_cost
-                            hi_g = c_grad
-                            hi_h = c_hess
-                            swap_hi = True
-                        if _tighter_bracket(hi_g, a_grad) or (hi_g <= 0.0 and a_grad > 0.0):
-                            hi_a = cand_a
-                            hi_c = a_cost
-                            hi_g = a_grad
-                            hi_h = a_hess
-                            swap_hi = True
-
-                        # Converged: no progress, or gradient small enough at either bracket endpoint
-                        ls_done = (
-                            (not swap_lo and not swap_hi)
-                            or (lo_g < 0.0 and lo_g > -gtol)
-                            or (hi_g > 0.0 and hi_g < gtol)
-                        )
-
-                        # Track best alpha: pick the bracket endpoint with lower cost, if it improved over p0
-                        if lo_c < p0_cost or hi_c < p0_cost:
-                            if lo_c <= hi_c:
-                                best_alpha = lo_a
+                    if not chase_done:
+                        if ls_iter >= max_ls_iter:
+                            if cur_c < p0_cost:
+                                best_alpha = cur_a
+                        elif not prev_updated:
+                            if cur_c < p0_cost:
+                                best_alpha = cur_a
+                        else:
+                            # ── Phase 3: Bracket refinement ────────────────────────────────────────────────────
+                            # prev and cur now bracket the gradient zero-crossing
+                            lo_a = gs.qd_float(0.0)
+                            lo_c = gs.qd_float(0.0)
+                            lo_g = gs.qd_float(0.0)
+                            lo_h = gs.qd_float(0.0)
+                            hi_a = gs.qd_float(0.0)
+                            hi_c = gs.qd_float(0.0)
+                            hi_g = gs.qd_float(0.0)
+                            hi_h = gs.qd_float(0.0)
+                            if cur_g < prev_g:
+                                lo_a = cur_a
+                                lo_c = cur_c
+                                lo_g = cur_g
+                                lo_h = cur_h
+                                hi_a = prev_a
+                                hi_c = prev_c
+                                hi_g = prev_g
+                                hi_h = prev_h
                             else:
-                                best_alpha = hi_a
+                                lo_a = prev_a
+                                lo_c = prev_c
+                                lo_g = prev_g
+                                lo_h = prev_h
+                                hi_a = cur_a
+                                hi_c = cur_c
+                                hi_g = cur_g
+                                hi_h = cur_h
+
+                            ls_done = False
+                            while not ls_done and ls_iter < max_ls_iter:
+                                ls_iter += 1
+
+                                cand_a = lo_a - lo_g / lo_h if lo_h > EPS else lo_a
+                                cand_b = hi_a - hi_g / hi_h if hi_h > EPS else hi_a
+                                cand_c = 0.5 * (lo_a + hi_a)
+
+                                # ── Cooperative 3-alpha constraint eval (friction + contact) ───────────────────
+                                loc_ac = gs.qd_float(0.0)
+                                loc_ag = gs.qd_float(0.0)
+                                loc_ah = gs.qd_float(0.0)
+                                loc_bc = gs.qd_float(0.0)
+                                loc_bg = gs.qd_float(0.0)
+                                loc_bh = gs.qd_float(0.0)
+                                loc_cc = gs.qd_float(0.0)
+                                loc_cg = gs.qd_float(0.0)
+                                loc_ch = gs.qd_float(0.0)
+
+                                i_c = ne + tid
+                                while i_c < n_con:
+                                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                                    jv_c = constraint_state.jv[i_c, i_b]
+                                    D = constraint_state.efc_D[i_c, i_b]
+                                    jvD = jv_c * D
+                                    jv2D = jv_c * jvD
+
+                                    xa = Jaref_c + cand_a * jv_c
+                                    xb = Jaref_c + cand_b * jv_c
+                                    xc = Jaref_c + cand_c * jv_c
+
+                                    if i_c < nef:
+                                        f_val = constraint_state.efc_frictionloss[i_c, i_b]
+                                        r_val = constraint_state.diag[i_c, i_b]
+                                        rf = r_val * f_val
+
+                                        if xa <= -rf:
+                                            loc_ac += f_val * (-0.5 * rf - xa)
+                                            loc_ag += -f_val * jv_c
+                                        elif xa >= rf:
+                                            loc_ac += f_val * (-0.5 * rf + xa)
+                                            loc_ag += f_val * jv_c
+                                        else:
+                                            loc_ac += 0.5 * D * xa * xa
+                                            loc_ag += jvD * xa
+                                            loc_ah += jv2D
+
+                                        if xb <= -rf:
+                                            loc_bc += f_val * (-0.5 * rf - xb)
+                                            loc_bg += -f_val * jv_c
+                                        elif xb >= rf:
+                                            loc_bc += f_val * (-0.5 * rf + xb)
+                                            loc_bg += f_val * jv_c
+                                        else:
+                                            loc_bc += 0.5 * D * xb * xb
+                                            loc_bg += jvD * xb
+                                            loc_bh += jv2D
+
+                                        if xc <= -rf:
+                                            loc_cc += f_val * (-0.5 * rf - xc)
+                                            loc_cg += -f_val * jv_c
+                                        elif xc >= rf:
+                                            loc_cc += f_val * (-0.5 * rf + xc)
+                                            loc_cg += f_val * jv_c
+                                        else:
+                                            loc_cc += 0.5 * D * xc * xc
+                                            loc_cg += jvD * xc
+                                            loc_ch += jv2D
+                                    else:
+                                        if xa < 0:
+                                            loc_ac += 0.5 * D * xa * xa
+                                            loc_ag += jvD * xa
+                                            loc_ah += jv2D
+                                        if xb < 0:
+                                            loc_bc += 0.5 * D * xb * xb
+                                            loc_bg += jvD * xb
+                                            loc_bh += jv2D
+                                        if xc < 0:
+                                            loc_cc += 0.5 * D * xc * xc
+                                            loc_cg += jvD * xc
+                                            loc_ch += jv2D
+
+                                    i_c += _K
+
+                                sh0[tid] = loc_ac
+                                sh1[tid] = loc_ag
+                                sh2[tid] = loc_ah
+                                sh3[tid] = loc_bc
+                                sh4[tid] = loc_bg
+                                sh5[tid] = loc_bh
+                                sh6[tid] = loc_cc
+                                sh7[tid] = loc_cg
+                                sh8[tid] = loc_ch
+                                _reduce_9(sh0, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, tid)
+
+                                a_cost = const_0 + cand_a * const_1 + cand_a * cand_a * const_2 + sh0[0]
+                                a_grad = const_1 + 2.0 * cand_a * const_2 + sh1[0]
+                                a_hess = 2.0 * const_2 + sh2[0]
+
+                                b_cost = const_0 + cand_b * const_1 + cand_b * cand_b * const_2 + sh3[0]
+                                b_grad = const_1 + 2.0 * cand_b * const_2 + sh4[0]
+                                b_hess = 2.0 * const_2 + sh5[0]
+
+                                c_cost = const_0 + cand_c * const_1 + cand_c * cand_c * const_2 + sh6[0]
+                                c_grad = const_1 + 2.0 * cand_c * const_2 + sh7[0]
+                                c_hess = 2.0 * const_2 + sh8[0]
+
+                                # ── Convergence check among candidates ─────────────────────────────────────────
+                                alphas_0 = cand_a
+                                alphas_1 = cand_b
+                                alphas_2 = cand_c
+                                costs_0 = a_cost
+                                costs_1 = b_cost
+                                costs_2 = c_cost
+                                grads_0 = a_grad
+                                grads_1 = b_grad
+                                grads_2 = c_grad
+
+                                best_found = False
+                                best_cand_cost = gs.qd_float(0.0)
+                                if qd.abs(grads_0) < gtol and (not best_found or costs_0 < best_cand_cost):
+                                    best_alpha = alphas_0
+                                    best_cand_cost = costs_0
+                                    best_found = True
+                                if qd.abs(grads_1) < gtol and (not best_found or costs_1 < best_cand_cost):
+                                    best_alpha = alphas_1
+                                    best_cand_cost = costs_1
+                                    best_found = True
+                                if qd.abs(grads_2) < gtol and (not best_found or costs_2 < best_cand_cost):
+                                    best_alpha = alphas_2
+                                    best_cand_cost = costs_2
+                                    best_found = True
+
+                                if best_found:
+                                    ls_done = True
+                                else:
+                                    # ── Bracket swap ───────────────────────────────────────────────────────────
+                                    swap_lo = False
+                                    if _tighter_bracket(lo_g, a_grad):
+                                        lo_a = cand_a
+                                        lo_c = a_cost
+                                        lo_g = a_grad
+                                        lo_h = a_hess
+                                        swap_lo = True
+                                    if _tighter_bracket(lo_g, c_grad):
+                                        lo_a = cand_c
+                                        lo_c = c_cost
+                                        lo_g = c_grad
+                                        lo_h = c_hess
+                                        swap_lo = True
+                                    if _tighter_bracket(lo_g, b_grad):
+                                        lo_a = cand_b
+                                        lo_c = b_cost
+                                        lo_g = b_grad
+                                        lo_h = b_hess
+                                        swap_lo = True
+
+                                    swap_hi = False
+                                    if _tighter_bracket(hi_g, b_grad):
+                                        hi_a = cand_b
+                                        hi_c = b_cost
+                                        hi_g = b_grad
+                                        hi_h = b_hess
+                                        swap_hi = True
+                                    if _tighter_bracket(hi_g, c_grad):
+                                        hi_a = cand_c
+                                        hi_c = c_cost
+                                        hi_g = c_grad
+                                        hi_h = c_hess
+                                        swap_hi = True
+                                    if _tighter_bracket(hi_g, a_grad):
+                                        hi_a = cand_a
+                                        hi_c = a_cost
+                                        hi_g = a_grad
+                                        hi_h = a_hess
+                                        swap_hi = True
+
+                                    if not swap_lo and not swap_hi:
+                                        if c_cost < p0_cost:
+                                            best_alpha = cand_c
+                                        ls_done = True
+                                    elif (lo_g < 0.0 and lo_g > -gtol) or (hi_g > 0.0 and hi_g < gtol):
+                                        if lo_c < p0_cost or hi_c < p0_cost:
+                                            if lo_c <= hi_c:
+                                                best_alpha = lo_a
+                                            else:
+                                                best_alpha = hi_a
+                                        ls_done = True
+
+                            if not ls_done:
+                                if lo_c <= hi_c and lo_c < p0_cost:
+                                    best_alpha = lo_a
+                                elif hi_c <= lo_c and hi_c < p0_cost:
+                                    best_alpha = hi_a
 
                 # ── Apply alpha ──────────────────────────────────────────────────────────────────────────────────────
                 if qd.abs(best_alpha) < EPS:
