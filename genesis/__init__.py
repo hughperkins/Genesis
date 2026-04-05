@@ -32,9 +32,6 @@ from .utils import redirect_libc_stderr, set_random_seed, get_device
 
 
 _IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
-# FIXME: qd.Field does not support zero-copy on Metal for 'torch<=2.9.1'.
-# See: https://github.com/pytorch/pytorch/pull/168193
-_TORCH_MPS_SUPPORT_DLPACK_FIELD = tuple(map(int, torch.__version__.replace("+", ".").split(".")[:3])) > (2, 9, 1)
 if _IS_OLD_TORCH:
     warn("'torch<2.8.0' is not supported. Please upgrade pytorch manually: https://pytorch.org/get-started/locally/")
 
@@ -151,10 +148,10 @@ def init(
     use_ndarray, use_fastcache = _use_ndarray, _use_fastcache
 
     # Unlike dynamic vs static array mode, and fastcache, zero-copy can be toggle on/off between init without issue
+    # Quadrants now handles per-object zero-copy compatibility internally (Metal field
+    # support, 0-dim ScalarField, etc.) so we only gate on backend/device consistency.
     _use_zerocopy = bool(int(os.environ["GS_ENABLE_ZEROCOPY"])) if "GS_ENABLE_ZEROCOPY" in os.environ else None
     if _use_zerocopy:
-        if backend == _gs_backend.metal and not _use_ndarray and not _TORCH_MPS_SUPPORT_DLPACK_FIELD:
-            raise_exception("Zero-copy not supported for static array mode on Apple Metal if 'torch<=2.9.1'.")
         if (backend == _gs_backend.metal and device.type != "mps") or (
             backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type != "cuda"
         ):
@@ -166,7 +163,7 @@ def init(
     if (
         (backend == gs.cpu and device.type == "cpu")
         or (backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type == "cuda")
-        or (backend == _gs_backend.metal and device.type == "mps" and (_use_ndarray or _TORCH_MPS_SUPPORT_DLPACK_FIELD))
+        or (backend == _gs_backend.metal and device.type == "mps")
     ):
         if _use_zerocopy is None:
             _use_zerocopy = True
@@ -327,11 +324,6 @@ def init(
     if _IS_OLD_TORCH:
         logger.warning(
             "'torch<2.8.0' is not supported. Please upgrade pytorch manually: https://pytorch.org/get-started/locally/"
-        )
-    elif backend == _gs_backend.metal and not _TORCH_MPS_SUPPORT_DLPACK_FIELD:
-        logger.warning(
-            "'torch<2.9.1' does not supported zero-copy on Apple Metal. Consider upgrading pytorch to improve "
-            "runtime performance: https://pytorch.org/get-started/locally/"
         )
 
     msg_options = ", ".join(

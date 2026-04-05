@@ -20,18 +20,10 @@ import psutil
 import pyglet
 import torch
 
-from quadrants.lang.util import to_pytorch_type, to_numpy_type
-from quadrants._kernels import tensor_to_ext_arr, matrix_to_ext_arr, ndarray_to_ext_arr, ndarray_matrix_to_ext_arr
-
 import genesis as gs
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-# FIXME: qd.Field does not support zero-copy on Metal for 'torch<=2.9.1'.
-# See: https://github.com/pytorch/pytorch/pull/168193
-TORCH_MPS_SUPPORT_DLPACK_FIELD = tuple(map(int, torch.__version__.replace("+", ".").split(".")[:3])) > (2, 9, 1)
 
 
 class DeprecationError(Exception):
@@ -399,142 +391,6 @@ def has_display() -> bool:
 
 # -------------------------------------- QUADRANTS SPECIALIZATION --------------------------------------
 
-_to_torch_type_fast = functools.lru_cache(maxsize=None)(to_pytorch_type)
-_to_numpy_type_fast = functools.lru_cache(maxsize=None)(to_numpy_type)
-
-TO_EXT_ARR_FAST_MAP = dict(
-    (
-        (qd.ScalarField, tensor_to_ext_arr),
-        (qd.MatrixField, matrix_to_ext_arr),
-        (qd.ScalarNdarray, ndarray_to_ext_arr),
-        (qd.MatrixNdarray, ndarray_matrix_to_ext_arr),
-    )
-)
-
-
-def qd_to_python(
-    value: qd.Field | qd.Ndarray,
-    transpose: bool = False,
-    copy: bool | None = None,
-    to_torch: bool = True,
-) -> torch.Tensor | np.ndarray:
-    """Converts a Quadrants field / ndarray instance to a PyTorch tensor / Numpy array.
-
-    Args:
-        value (qd.Field | qd.Ndarray): Field or Ndarray to be converted.
-        transpose (bool, optional): Whether to move the last batch dimension in front. Defaults to False.
-        copy (bool, optional): Wether to enforce returning a copy no matter what. None to avoid copy if possible
-        without raising an exception if not.
-        to_torch (bool): Whether to convert to Torch tensor or Numpy array. Defaults to True.
-    """
-    # Get batch size if possible
-    try:
-        batch_shape = value.shape
-    except AttributeError:
-        if isinstance(value, qd.Matrix):
-            raise ValueError("Tensor of type 'qd.Vector', 'qd.Matrix' not supported.")
-        raise
-
-    # Check if copy mode is supported while setting default mode if not specified.
-    # FIXME: Torch>2.9.1 still does not support bytes_offset for 0-dim dlpack.
-    data_type = type(value)
-    is_field = issubclass(data_type, qd.Field)
-    use_zerocopy = gs.use_zerocopy and (
-        (TORCH_MPS_SUPPORT_DLPACK_FIELD or gs.backend != gs.metal or not is_field)
-        and (batch_shape or not issubclass(data_type, qd.ScalarField))
-    )
-    if not use_zerocopy or (not to_torch and gs.backend != gs.cpu):
-        if copy is False:
-            gs.raise_exception(
-                "Specifying 'copy=False' is not supported if 'gs.use_zerocopy=False' or ('to_torch=False' and "
-                "'gs.backend != gs.cpu')."
-            )
-        copy = True
-    elif copy is None:
-        copy = False
-
-    # Leverage zero-copy if enabled
-    if use_zerocopy:
-        while True:
-            try:
-                if to_torch or gs.backend != gs.cpu:
-                    out = value._T_tc if transpose else value._tc
-                else:
-                    out = value._T_np if transpose else value._np
-                break
-            except AttributeError:
-                # "Cache" no-owning python-side views of the original Quadrants memory buffer as a hidden attribute
-                value_tc = torch.utils.dlpack.from_dlpack(value.to_dlpack())
-                if issubclass(data_type, qd.MatrixField) and value.m == 1:
-                    value_tc = value_tc.reshape((*batch_shape, value.n))
-                value._tc = value_tc
-                value._T_tc = value_tc.movedim(batch_ndim - 1, 0) if (batch_ndim := len(batch_shape)) > 1 else value_tc
-                if gs.backend == gs.cpu:
-                    value._np = value_tc.numpy()
-                    value._T_np = value._T_tc.numpy()
-
-        # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually.
-        # Quadrants and PyTorch MPS use separate Metal command queues, so `qd.sync()` only guarantees Quadrants
-        # writes are complete. A subsequent `.clone()` is queued on the MPS stream and may execute *after* the next
-        # Quadrants kernel overwrites the source buffer. We must also synchronize MPS after cloning.
-        if gs.backend == gs.metal:
-            qd.sync()
-
-        if copy:
-            if to_torch:
-                out = out.clone()
-                if gs.backend == gs.metal:
-                    torch.mps.synchronize()
-            elif gs.backend != gs.cpu:
-                out = tensor_to_array(out)
-            else:
-                out = out.copy()
-        return out
-
-    # Extract value as a whole.
-    # Note that this is usually much faster than using a custom kernel to extract a slice.
-    # The implementation is based on `quadrants.lang.(ScalarField | MatrixField).to_torch`.
-    is_metal = gs.device.type == "mps"
-    out_dtype = _to_torch_type_fast(value.dtype) if to_torch else _to_numpy_type_fast(value.dtype)
-    if issubclass(data_type, (qd.ScalarField, qd.ScalarNdarray)):
-        if to_torch:
-            out = torch.zeros(batch_shape, dtype=out_dtype, device="cpu" if is_metal else gs.device)
-        else:
-            out = np.zeros(batch_shape, dtype=out_dtype)
-        TO_EXT_ARR_FAST_MAP[data_type](value, out)
-    elif issubclass(data_type, qd.MatrixField):
-        as_vector = value.m == 1
-        shape_ext = (value.n,) if as_vector else (value.n, value.m)
-        if to_torch:
-            out = torch.empty(batch_shape + shape_ext, dtype=out_dtype, device="cpu" if is_metal else gs.device)
-        else:
-            out = np.zeros(batch_shape + shape_ext, dtype=out_dtype)
-        TO_EXT_ARR_FAST_MAP[data_type](value, out, as_vector)
-    elif issubclass(data_type, (qd.VectorNdarray, qd.MatrixNdarray)):
-        layout_is_aos = 1
-        as_vector = issubclass(data_type, qd.VectorNdarray)
-        shape_ext = (value.n,) if as_vector else (value.n, value.m)
-        if to_torch:
-            out = torch.empty(batch_shape + shape_ext, dtype=out_dtype, device="cpu" if is_metal else gs.device)
-        else:
-            out = np.zeros(batch_shape + shape_ext, dtype=out_dtype)
-        TO_EXT_ARR_FAST_MAP[qd.MatrixNdarray](value, out, layout_is_aos, as_vector)
-    else:
-        gs.raise_exception(f"Unsupported type '{type(value)}'.")
-    if to_torch and is_metal:
-        out = out.to(gs.device)
-
-    # Transpose if necessary and requested.
-    # Note that it is worth transposing here before slicing, as it preserve row-major memory alignment in case of
-    # advanced masking, which would spare computation later on if expected from the user.
-    if transpose and (batch_ndim := len(batch_shape)) > 1:
-        if to_torch:
-            out = out.movedim(batch_ndim - 1, 0)
-        else:
-            out = np.moveaxis(out, batch_ndim - 1, 0)
-
-    return out
-
 
 def indices_to_mask(
     *indices: Any, keepdim: bool = True, to_torch: bool = True, boolean_mask: bool = False, raise_if_fancy: bool = False
@@ -637,23 +493,19 @@ def qd_to_torch(
         copy (bool, optional): Wether to enforce returning a copy no matter what. None to avoid copy if possible
         without raising an exception if not.
     """
-    # Try efficient shortcut first and only fallback to standard branching if necessary.
-    # FIXME: Ideally one should detect if slicing would require a copy to avoid enforcing copy here.
-    if gs.use_zerocopy:
-        try:
-            tensor = value._T_tc if transpose else value._tc
-            # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually.
-            # See comment in `qd_to_python` for details on the MPS command queue race condition.
-            if gs.backend == gs.metal:
-                qd.sync()
-            if copy:
-                tensor = tensor.clone()
-                if gs.backend == gs.metal:
-                    torch.mps.synchronize()
-        except AttributeError:
-            tensor = qd_to_python(value, transpose, copy=copy, to_torch=True)
-    else:
-        tensor = qd_to_python(value, transpose, copy=copy, to_torch=True)
+    if copy is None and not gs.use_zerocopy:
+        copy = True
+
+    tensor = value.to_torch(copy=copy)
+
+    # Quadrants and PyTorch MPS use separate Metal command queues, so we must
+    # ensure Quadrants writes are visible before the tensor is read on the
+    # PyTorch side. This is only relevant for the zero-copy (DLPack) path.
+    if copy is not True and gs.backend == gs.metal:
+        qd.sync()
+
+    if transpose and (batch_ndim := len(value.shape)) > 1:
+        tensor = tensor.movedim(batch_ndim - 1, 0)
 
     if row_mask is None and col_mask is None:
         return tensor
@@ -690,9 +542,16 @@ def qd_to_numpy(
         copy (bool, optional): Wether to enforce returning a copy no matter what. None to avoid copy if possible
         without raising an exception if not.
     """
-    tensor = qd_to_python(value, transpose, copy=copy, to_torch=False)
+    if copy is None and not gs.use_zerocopy:
+        copy = True
+
+    arr = value.to_numpy(copy=copy)
+
+    if transpose and (batch_ndim := len(value.shape)) > 1:
+        arr = np.moveaxis(arr, batch_ndim - 1, 0)
+
     if row_mask is None and col_mask is None:
-        return tensor
+        return arr
 
     raise_if_fancy = copy is False
     if len(value.shape) < 2:
@@ -703,7 +562,7 @@ def qd_to_numpy(
         )
     else:
         mask = indices_to_mask(row_mask, col_mask, to_torch=False, keepdim=keepdim, raise_if_fancy=raise_if_fancy)
-    return tensor[mask]
+    return arr[mask]
 
 
 def sanitize_index(
