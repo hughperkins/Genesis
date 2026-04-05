@@ -555,19 +555,19 @@ def _func_iterative_linesearch(
 
                         # ── Bracket swap: try each candidate against lo, then hi ─────────────────────────────────────
                         swap_lo = False
-                        if _tighter_bracket(lo_g, a_grad):
+                        if _tighter_bracket(lo_g, a_grad) or (lo_g >= 0.0 and a_grad < 0.0):
                             lo_a = cand_a
                             lo_c = a_cost
                             lo_g = a_grad
                             lo_h = a_hess
                             swap_lo = True
-                        if _tighter_bracket(lo_g, c_grad):
+                        if _tighter_bracket(lo_g, c_grad) or (lo_g >= 0.0 and c_grad < 0.0):
                             lo_a = cand_c
                             lo_c = c_cost
                             lo_g = c_grad
                             lo_h = c_hess
                             swap_lo = True
-                        if _tighter_bracket(lo_g, b_grad):
+                        if _tighter_bracket(lo_g, b_grad) or (lo_g >= 0.0 and b_grad < 0.0):
                             lo_a = cand_b
                             lo_c = b_cost
                             lo_g = b_grad
@@ -575,19 +575,19 @@ def _func_iterative_linesearch(
                             swap_lo = True
 
                         swap_hi = False
-                        if _tighter_bracket(hi_g, b_grad):
+                        if _tighter_bracket(hi_g, b_grad) or (hi_g <= 0.0 and b_grad > 0.0):
                             hi_a = cand_b
                             hi_c = b_cost
                             hi_g = b_grad
                             hi_h = b_hess
                             swap_hi = True
-                        if _tighter_bracket(hi_g, c_grad):
+                        if _tighter_bracket(hi_g, c_grad) or (hi_g <= 0.0 and c_grad > 0.0):
                             hi_a = cand_c
                             hi_c = c_cost
                             hi_g = c_grad
                             hi_h = c_hess
                             swap_hi = True
-                        if _tighter_bracket(hi_g, a_grad):
+                        if _tighter_bracket(hi_g, a_grad) or (hi_g <= 0.0 and a_grad > 0.0):
                             hi_a = cand_a
                             hi_c = a_cost
                             hi_g = a_grad
@@ -1348,10 +1348,9 @@ def _kernel_solve_gpu_graph(
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
     while qd.graph_do_while(graph_counter):
-        _func_parallel_linesearch_p0(
+        _func_iterative_linesearch(
             dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
         )
-        _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             _func_cg_only_save_prev_grad(constraint_state, static_rigid_sim_config)
         _func_update_constraint_forces(constraint_state, static_rigid_sim_config)
