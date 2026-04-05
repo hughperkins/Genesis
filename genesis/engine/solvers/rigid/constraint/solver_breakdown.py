@@ -414,6 +414,14 @@ def _func_iterative_linesearch(
                 else:
                     # lo = bracket endpoint with more-negative gradient
                     # hi = bracket endpoint with more-positive gradient
+                    lo_a = gs.qd_float(0.0)
+                    lo_c = gs.qd_float(0.0)
+                    lo_g = gs.qd_float(0.0)
+                    lo_h = gs.qd_float(0.0)
+                    hi_a = gs.qd_float(0.0)
+                    hi_c = gs.qd_float(0.0)
+                    hi_g = gs.qd_float(0.0)
+                    hi_h = gs.qd_float(0.0)
                     if init_grad < p0_grad:
                         lo_a = init_alpha
                         lo_c = init_cost
