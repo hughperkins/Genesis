@@ -371,6 +371,8 @@ def _func_iterative_linesearch(
                 p0_cost = qg_0 + sh3[0]
                 p0_grad = qg_1 + sh4[0]
                 p0_hess = 2.0 * (qg_2 + sh5[0])
+                if p0_hess <= 0.0:
+                    p0_hess = EPS
 
                 # Adaptive linesearch tolerance
                 scale = rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs)
@@ -379,9 +381,7 @@ def _func_iterative_linesearch(
                 )
 
                 # ── Initial Newton step from p0 ─────────────────────────────────────────────────────────────────────
-                init_alpha = gs.qd_float(0.0)
-                if p0_hess > EPS:
-                    init_alpha = -p0_grad / p0_hess
+                init_alpha = -p0_grad / p0_hess
 
                 # ── Cooperative eval at init_alpha (friction + contact only) ─────────────────────────────────────────
                 loc_vc = gs.qd_float(0.0)
@@ -405,6 +405,8 @@ def _func_iterative_linesearch(
                 init_cost = const_0 + init_alpha * const_1 + init_alpha * init_alpha * const_2 + sh0[0]
                 init_grad = const_1 + 2.0 * init_alpha * const_2 + sh1[0]
                 init_hess = 2.0 * const_2 + sh2[0]
+                if init_hess <= 0.0:
+                    init_hess = EPS
 
                 # ── Phase 1b: p0 cost fallback (match old linesearch) ──────────────────────────────────────────────
                 best_alpha = gs.qd_float(0.0)
@@ -441,7 +443,7 @@ def _func_iterative_linesearch(
                         prev_h = cur_h
                         prev_updated = True
 
-                        next_a = cur_a - cur_g / cur_h if cur_h > EPS else cur_a
+                        next_a = cur_a - cur_g / cur_h
 
                         # ── Cooperative eval at next_a (friction + contact) ────────────────────────────────────
                         loc_vc = gs.qd_float(0.0)
@@ -466,6 +468,8 @@ def _func_iterative_linesearch(
                         cur_c = const_0 + next_a * const_1 + next_a * next_a * const_2 + sh0[0]
                         cur_g = const_1 + 2.0 * next_a * const_2 + sh1[0]
                         cur_h = 2.0 * const_2 + sh2[0]
+                        if cur_h <= 0.0:
+                            cur_h = EPS
 
                         if qd.abs(cur_g) < gtol:
                             best_alpha = cur_a
@@ -512,8 +516,8 @@ def _func_iterative_linesearch(
                             while not ls_done and ls_iter < max_ls_iter:
                                 ls_iter += 1
 
-                                cand_a = lo_a - lo_g / lo_h if lo_h > EPS else lo_a
-                                cand_b = hi_a - hi_g / hi_h if hi_h > EPS else hi_a
+                                cand_a = lo_a - lo_g / lo_h
+                                cand_b = hi_a - hi_g / hi_h
                                 cand_c = 0.5 * (lo_a + hi_a)
 
                                 # ── Cooperative 3-alpha constraint eval (friction + contact) ───────────────────
@@ -606,14 +610,20 @@ def _func_iterative_linesearch(
                                 a_cost = const_0 + cand_a * const_1 + cand_a * cand_a * const_2 + sh0[0]
                                 a_grad = const_1 + 2.0 * cand_a * const_2 + sh1[0]
                                 a_hess = 2.0 * const_2 + sh2[0]
+                                if a_hess <= 0.0:
+                                    a_hess = EPS
 
                                 b_cost = const_0 + cand_b * const_1 + cand_b * cand_b * const_2 + sh3[0]
                                 b_grad = const_1 + 2.0 * cand_b * const_2 + sh4[0]
                                 b_hess = 2.0 * const_2 + sh5[0]
+                                if b_hess <= 0.0:
+                                    b_hess = EPS
 
                                 c_cost = const_0 + cand_c * const_1 + cand_c * cand_c * const_2 + sh6[0]
                                 c_grad = const_1 + 2.0 * cand_c * const_2 + sh7[0]
                                 c_hess = 2.0 * const_2 + sh8[0]
+                                if c_hess <= 0.0:
+                                    c_hess = EPS
 
                                 # ── Convergence check among candidates ─────────────────────────────────────────
                                 alphas_0 = cand_a
@@ -686,8 +696,7 @@ def _func_iterative_linesearch(
                                         swap_hi = True
 
                                     if not swap_lo and not swap_hi:
-                                        if c_cost < p0_cost:
-                                            best_alpha = cand_c
+                                        best_alpha = cand_c
                                         ls_done = True
                                     elif (lo_g < 0.0 and lo_g > -gtol) or (hi_g > 0.0 and hi_g < gtol):
                                         if lo_c < p0_cost or hi_c < p0_cost:
