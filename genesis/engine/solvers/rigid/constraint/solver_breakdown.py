@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import quadrants as qd
 
@@ -1451,10 +1453,20 @@ def _kernel_solve_gpu_graph(
     static_rigid_sim_config: qd.template(),
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
+    _use_parallel_for_cg = qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.CG
+        and os.environ.get("GS_LINESEARCH_ALWAYS_ITERATIVE", "0") != "1"
+    )
     while qd.graph_do_while(graph_counter):
-        _func_iterative_linesearch(
-            dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
-        )
+        if qd.static(_use_parallel_for_cg):
+            _func_parallel_linesearch_p0(
+                dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
+            )
+            _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
+        else:
+            _func_iterative_linesearch(
+                dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
+            )
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             _func_cg_only_save_prev_grad(constraint_state, static_rigid_sim_config)
         _func_update_constraint_forces(constraint_state, static_rigid_sim_config)
