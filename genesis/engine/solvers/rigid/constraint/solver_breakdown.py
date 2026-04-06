@@ -436,13 +436,34 @@ def _func_iterative_linesearch(
                     cur_g = p0_grad
                     cur_h = p0_hess
 
-                if qd.abs(cur_g) < gtol:
+                # When p0_cost < init_cost AND gradients span zero, the chase would
+                # start from p0 and take one Newton step to init_alpha (which we already
+                # evaluated).  Skip the chase entirely and set the bracket directly.
+                if p0_cost < init_cost and p0_grad * init_grad < 0.0 and qd.abs(p0_grad) >= gtol and qd.abs(init_grad) >= gtol:
+                    need_bracket = True
+                    ls_iter = 1
+                    if init_grad < p0_grad:
+                        lo_a = init_alpha
+                        lo_c = init_cost
+                        lo_g = init_grad
+                        lo_h = init_hess
+                        hi_a = gs.qd_float(0.0)
+                        hi_c = p0_cost
+                        hi_g = p0_grad
+                        hi_h = p0_hess
+                    else:
+                        lo_a = gs.qd_float(0.0)
+                        lo_c = p0_cost
+                        lo_g = p0_grad
+                        lo_h = p0_hess
+                        hi_a = init_alpha
+                        hi_c = init_cost
+                        hi_g = init_grad
+                        hi_h = init_hess
+                elif qd.abs(cur_g) < gtol:
                     best_alpha = cur_a
                 else:
                     # ── Phase 2: Newton chase — follow Newton steps until gradient sign change ──────────────
-                    # Cap the chase at 1 step when p0 & init already bracket the zero-crossing,
-                    # because the first step just re-evaluates init_alpha which we already have.
-                    max_chase = gs.qd_int(1) if p0_grad * init_grad < 0.0 else max_ls_iter
                     direction = gs.qd_int(1) if cur_g < 0.0 else gs.qd_int(-1)
                     prev_a = cur_a
                     prev_c = cur_c
@@ -451,7 +472,7 @@ def _func_iterative_linesearch(
                     prev_updated = False
                     chase_done = False
 
-                    while cur_g * direction <= -gtol and ls_iter < max_chase:
+                    while cur_g * direction <= -gtol and ls_iter < max_ls_iter:
                         ls_iter += 1
                         prev_a = cur_a
                         prev_c = cur_c
