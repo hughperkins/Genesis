@@ -426,13 +426,20 @@ def _func_iterative_linesearch(
                 hi_g = gs.qd_float(0.0)
                 hi_h = gs.qd_float(0.0)
 
-                if qd.abs(init_grad) < gtol:
-                    best_alpha = init_alpha
-                elif qd.abs(p0_grad) < gtol:
-                    best_alpha = gs.qd_float(0.0)
-                else:
-                    # ── Phase 2: Set up bracket from {p0, init} and go straight to refinement ────────────
+                cur_a = init_alpha
+                cur_c = init_cost
+                cur_g = init_grad
+                cur_h = init_hess
+                if p0_cost < init_cost:
+                    cur_a = gs.qd_float(0.0)
+                    cur_c = p0_cost
+                    cur_g = p0_grad
+                    cur_h = p0_hess
+
+                if p0_cost < init_cost and p0_grad * init_grad < 0.0 and qd.abs(p0_grad) >= gtol and qd.abs(init_grad) >= gtol:
+                    # Bracket already spans zero and chase would just re-eval init_alpha
                     need_bracket = True
+                    ls_iter = 1
                     if init_grad < p0_grad:
                         lo_a = init_alpha
                         lo_c = init_cost
@@ -451,6 +458,85 @@ def _func_iterative_linesearch(
                         hi_c = init_cost
                         hi_g = init_grad
                         hi_h = init_hess
+                elif qd.abs(cur_g) < gtol:
+                    best_alpha = cur_a
+                else:
+                    # ── Phase 2: Newton chase — follow Newton steps until gradient sign change ──────────────
+                    direction = gs.qd_int(1) if cur_g < 0.0 else gs.qd_int(-1)
+                    prev_a = cur_a
+                    prev_c = cur_c
+                    prev_g = cur_g
+                    prev_h = cur_h
+                    prev_updated = False
+                    chase_done = False
+
+                    while cur_g * direction <= -gtol and ls_iter < max_ls_iter:
+                        ls_iter += 1
+                        prev_a = cur_a
+                        prev_c = cur_c
+                        prev_g = cur_g
+                        prev_h = cur_h
+                        prev_updated = True
+
+                        next_a = cur_a - cur_g / cur_h
+
+                        # ── Cooperative eval at next_a (friction + contact) ────────────────────────────────
+                        loc_vc = gs.qd_float(0.0)
+                        loc_vg = gs.qd_float(0.0)
+                        loc_vh = gs.qd_float(0.0)
+                        i_c = ne + tid
+                        while i_c < n_con:
+                            ec, eg, eh = _eval_constraint_at_alpha(
+                                next_a, i_c, i_b, ne, nef, constraint_state
+                            )
+                            loc_vc += ec
+                            loc_vg += eg
+                            loc_vh += eh
+                            i_c += _K
+
+                        sh0[tid] = loc_vc
+                        sh1[tid] = loc_vg
+                        sh2[tid] = loc_vh
+                        _reduce_3(sh0, sh1, sh2, tid)
+
+                        cur_a = next_a
+                        cur_c = const_0 + next_a * const_1 + next_a * next_a * const_2 + sh0[0]
+                        cur_g = const_1 + 2.0 * next_a * const_2 + sh1[0]
+                        cur_h = 2.0 * const_2 + sh2[0]
+                        if cur_h <= 0.0:
+                            cur_h = EPS
+
+                        if qd.abs(cur_g) < gtol:
+                            best_alpha = cur_a
+                            chase_done = True
+
+                    if not chase_done:
+                        if ls_iter >= max_ls_iter:
+                            if cur_c < p0_cost:
+                                best_alpha = cur_a
+                        elif not prev_updated:
+                            if cur_c < p0_cost:
+                                best_alpha = cur_a
+                        else:
+                            need_bracket = True
+                            if cur_g < prev_g:
+                                lo_a = cur_a
+                                lo_c = cur_c
+                                lo_g = cur_g
+                                lo_h = cur_h
+                                hi_a = prev_a
+                                hi_c = prev_c
+                                hi_g = prev_g
+                                hi_h = prev_h
+                            else:
+                                lo_a = prev_a
+                                lo_c = prev_c
+                                lo_g = prev_g
+                                lo_h = prev_h
+                                hi_a = cur_a
+                                hi_c = cur_c
+                                hi_g = cur_g
+                                hi_h = cur_h
 
                 if need_bracket:
                     # ── Phase 3: Bracket refinement ────────────────────────────────────────────────────────
