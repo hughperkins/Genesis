@@ -1,5 +1,7 @@
 import os
 
+_LINESEARCH_ALWAYS_ITERATIVE = os.environ.get("GS_LINESEARCH_ALWAYS_ITERATIVE", "0") == "1"
+
 import numpy as np
 import quadrants as qd
 
@@ -1455,7 +1457,7 @@ def _kernel_solve_gpu_graph(
 ):
     _use_parallel_for_cg = qd.static(
         static_rigid_sim_config.solver_type == gs.constraint_solver.CG
-        and os.environ.get("GS_LINESEARCH_ALWAYS_ITERATIVE", "0") != "1"
+        and not _LINESEARCH_ALWAYS_ITERATIVE
     )
     while qd.graph_do_while(graph_counter):
         if qd.static(_use_parallel_for_cg):
