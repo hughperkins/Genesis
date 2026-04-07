@@ -503,14 +503,35 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def cpu_preinit(pytestconfig):
+    level = os.environ.get("QD_CPU_PREINIT", "")
     if pytestconfig.getoption("--cpu-preinit", False):
-        import genesis as gs
+        level = level or "init"
+    if not level:
+        return
+
+    import genesis as gs
+
+    if level == "init":
         print("[cpu_preinit] Running gs.init(cpu, seed=0) + gs.destroy()...", flush=True)
         gs.init(backend=gs.cpu, seed=0, logging_level="warning")
         gs.destroy()
-        gc.collect()
-        gc.collect()
-        print("[cpu_preinit] Done.", flush=True)
+    elif level == "sim":
+        print("[cpu_preinit] Running CPU simulation (box + 200 steps)...", flush=True)
+        gs.init(backend=gs.cpu, seed=0, logging_level="warning")
+        scene = gs.Scene(show_viewer=False, show_FPS=False)
+        scene.add_entity(gs.morphs.Box(size=(0.5, 0.5, 0.5), pos=(0, 0, 1)))
+        scene.add_entity(gs.morphs.Plane())
+        scene.build()
+        for _ in range(200):
+            scene.step()
+        gs.destroy()
+    else:
+        print(f"[cpu_preinit] Unknown level '{level}', skipping.", flush=True)
+        return
+
+    gc.collect()
+    gc.collect()
+    print("[cpu_preinit] Done.", flush=True)
 
 
 @pytest.fixture(scope="session")
