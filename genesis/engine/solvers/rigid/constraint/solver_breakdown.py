@@ -1,9 +1,16 @@
+import os
+import time
+
 import numpy as np
 import quadrants as qd
 
 import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.solvers.rigid.constraint import solver
+
+_ITER_DIAG = os.environ.get("QD_ITER_DIAG", "") == "1"
+_FORCE_ITERS = int(os.environ.get("QD_FORCE_ITERS", "0")) or None
+_iter_diag_call_count = 0
 
 # --- Parallel linesearch constants ---
 # Number of candidate step sizes evaluated simultaneously per env.
@@ -1020,7 +1027,16 @@ def func_solve_decomposed(
     """
     if _n_iterations <= 0:
         return
-    constraint_state.graph_counter.from_numpy(np.array(_n_iterations, dtype=np.int32))
+    effective_iters = _FORCE_ITERS if _FORCE_ITERS is not None else _n_iterations
+    constraint_state.graph_counter.from_numpy(np.array(effective_iters, dtype=np.int32))
+
+    global _iter_diag_call_count
+    _do_diag = _ITER_DIAG and _iter_diag_call_count < 20
+
+    if _do_diag:
+        qd.sync()
+        t0 = time.perf_counter()
+
     _kernel_solve_graph(
         dofs_info,
         entities_info,
@@ -1030,3 +1046,13 @@ def func_solve_decomposed(
         static_rigid_sim_config,
         constraint_state.graph_counter,
     )
+
+    if _do_diag:
+        qd.sync()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        remaining = constraint_state.graph_counter.to_numpy()
+        print(f"[ITER_DIAG] call={_iter_diag_call_count} n_iter={effective_iters} "
+              f"remaining={remaining} iters_done={effective_iters - remaining} "
+              f"elapsed={elapsed_ms:.2f}ms", flush=True)
+
+    _iter_diag_call_count += 1
