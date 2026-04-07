@@ -1051,8 +1051,18 @@ def func_solve_decomposed(
         qd.sync()
         elapsed_ms = (time.perf_counter() - t0) * 1000
         remaining = constraint_state.graph_counter.to_numpy()
+        graph_info = ""
+        try:
+            from quadrants.lang import impl as _impl
+            prog = _impl.get_runtime().prog
+            graph_info = (f" graph_used={prog.get_graph_cache_used_on_last_call()}"
+                          f" graph_nodes={prog.get_graph_num_nodes_on_last_call()}"
+                          f" graph_builds={prog.get_graph_total_builds()}"
+                          f" graph_cache={prog.get_graph_cache_size()}")
+        except Exception:
+            pass
         print(f"[ITER_DIAG] call={_iter_diag_call_count} n_iter={effective_iters} "
               f"remaining={remaining} iters_done={effective_iters - remaining} "
-              f"elapsed={elapsed_ms:.2f}ms", flush=True)
+              f"elapsed={elapsed_ms:.2f}ms{graph_info}", flush=True)
 
     _iter_diag_call_count += 1
