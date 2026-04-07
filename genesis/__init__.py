@@ -265,7 +265,7 @@ def init(
     if seed is not None:
         global SEED
         SEED = seed
-        set_random_seed(SEED)
+        set_random_seed(SEED, cuda=(backend != _gs_backend.cpu))
         qd_init_kwargs.update(
             random_seed=seed,
         )

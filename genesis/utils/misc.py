@@ -151,14 +151,15 @@ def assert_built(method):
     return wrapper
 
 
-def set_random_seed(seed):
+def set_random_seed(seed, cuda=True):
     # Note: we don't set seed for quadrants, since Quadrants doesn't support stochastic operations in gradient computation.
     # Therefore, we only allow deterministic Quadrants operations.
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if cuda:
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_device(backend: gs.constants.backend, device_idx: Optional[int] = None):

@@ -1,0 +1,28 @@
+{
+  "os": "Linux-6.8.12-680-6063-coreweave-amd64-f81899c8-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2026-04-04T09:33:51.113492Z",
+  "args": [
+    "--in-file",
+    "/mnt/data/artifacts/speed_test_3ce37cd2-dca5-4817-8cc4-7010ed1fb8b6_20260404_092245.txt",
+    "--project",
+    "genesis-benchmarks-2",
+    "--metrics",
+    "compile_time",
+    "runtime_fps",
+    "realtime_factor",
+    "--run-prefix",
+    "speed"
+  ],
+  "program": "/root/workspace/tests/upload_benchmarks_table_to_wandb.py",
+  "codePath": "tests/upload_benchmarks_table_to_wandb.py",
+  "codePathLocal": "tests/upload_benchmarks_table_to_wandb.py",
+  "git": {
+    "remote": "https://github.com/Genesis-Embodied-AI/Genesis",
+    "commit": "0ba6d0b89482c2faec80aae42931d5733764f382"
+  },
+  "root": "/root/workspace",
+  "host": "rtx-209-181",
+  "executable": "/venv/bin/python",
+  "writerId": "o56b0s2hk5dshsgo7a5ywb1sysuc560e"
+}
