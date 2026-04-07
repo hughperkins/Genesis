@@ -493,6 +493,24 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="speed_test.txt",
         help="Base filepath for speed test reports (default: speed_test.txt).",
     )
+    parser.addoption(
+        "--cpu-preinit",
+        action="store_true",
+        default=False,
+        help="Run gs.init(cpu)+gs.destroy() before any test to test regression hypothesis.",
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cpu_preinit(pytestconfig):
+    if pytestconfig.getoption("--cpu-preinit", False):
+        import genesis as gs
+        print("[cpu_preinit] Running gs.init(cpu, seed=0) + gs.destroy()...", flush=True)
+        gs.init(backend=gs.cpu, seed=0, logging_level="warning")
+        gs.destroy()
+        gc.collect()
+        gc.collect()
+        print("[cpu_preinit] Done.", flush=True)
 
 
 @pytest.fixture(scope="session")
