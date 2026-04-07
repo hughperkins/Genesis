@@ -151,18 +151,12 @@ def assert_built(method):
     return wrapper
 
 
-def set_random_seed(seed, cuda=True):
+def set_random_seed(seed):
     # Note: we don't set seed for quadrants, since Quadrants doesn't support stochastic operations in gradient computation.
     # Therefore, we only allow deterministic Quadrants operations.
     random.seed(seed)
     np.random.seed(seed)
-    if cuda:
-        torch.manual_seed(seed)
-    else:
-        # torch.manual_seed() internally calls torch.cuda.manual_seed_all(),
-        # which initializes the CUDA runtime. Use the CPU-only generator
-        # to avoid premature CUDA init that degrades graph replay perf.
-        torch.default_generator.manual_seed(seed)
+    torch.manual_seed(seed)
 
 
 def get_device(backend: gs.constants.backend, device_idx: Optional[int] = None):

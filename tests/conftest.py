@@ -515,9 +515,10 @@ def cpu_preinit(pytestconfig):
         print("[cpu_preinit] Running gs.init(cpu, seed=0) + gs.destroy()...", flush=True)
         gs.init(backend=gs.cpu, seed=0, logging_level="warning")
         gs.destroy()
-    elif level == "sim":
-        print("[cpu_preinit] Running CPU simulation (box + 200 steps)...", flush=True)
-        gs.init(backend=gs.cpu, seed=0, logging_level="warning")
+    elif level in ("sim", "sim64"):
+        prec = "64" if level == "sim64" else "32"
+        print(f"[cpu_preinit] Running CPU simulation (box + 200 steps, precision={prec})...", flush=True)
+        gs.init(backend=gs.cpu, seed=0, logging_level="warning", precision=prec)
         scene = gs.Scene(show_viewer=False, show_FPS=False)
         scene.add_entity(gs.morphs.Box(size=(0.5, 0.5, 0.5), pos=(0, 0, 1)))
         scene.add_entity(gs.morphs.Plane())

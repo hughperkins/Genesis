@@ -220,6 +220,11 @@ def init(
     qd_ivec3 = qd.types.vector(3, qd_int)
     qd_ivec4 = qd.types.vector(4, qd_int)
 
+    # Refresh module-level Tile16x16 in solver if it was imported with a different dtype
+    _solver_mod = sys.modules.get("genesis.engine.solvers.rigid.constraint.solver")
+    if _solver_mod is not None:
+        _solver_mod.Tile16x16 = qd.types.Tile16x16(dtype=qd_float)
+
     # Update torch default dtype and device, just in case
     torch.set_default_device(device)
     torch.set_default_dtype(tc_float)
@@ -265,7 +270,7 @@ def init(
     if seed is not None:
         global SEED
         SEED = seed
-        set_random_seed(SEED, cuda=(backend != _gs_backend.cpu))
+        set_random_seed(SEED)
         qd_init_kwargs.update(
             random_seed=seed,
         )
