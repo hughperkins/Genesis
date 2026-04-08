@@ -1681,11 +1681,9 @@ def func_cholesky_factor_direct_tiled(
             k0 = kb * qd.simt.Tile16x16.SIZE
 
             # Load diagonal tile H[k,k], padding out-of-bounds rows with identity
-            L_kk = qd.simt.Tile16x16(dtype=gs.qd_float)
-            if k0 + tid < n_dofs:
-                L_kk[:] = constraint_state.nt_H[i_b, k0 : k0 + qd.simt.Tile16x16.SIZE, k0:n_dofs]
-            else:
-                L_kk.eye_()
+            k1 = qd.min(k0 + qd.simt.Tile16x16.SIZE, n_dofs)
+            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:n_dofs]
 
             # Subtract prior-column contributions: L_kk -= sum_j L[k,j] @ L[k,j]^T
             for jb in range(kb):
@@ -1700,11 +1698,11 @@ def func_cholesky_factor_direct_tiled(
             # Solve off-diagonal tiles: L[i,k] = (H[i,k] - sum_j L[i,j] L[k,j]^T) @ inv(L[k,k]^T)
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * qd.simt.Tile16x16.SIZE
+                i1 = qd.min(i0 + qd.simt.Tile16x16.SIZE, n_dofs)
 
                 # Load off-diagonal tile H[i,k]
-                L_ik = qd.simt.Tile16x16(dtype=gs.qd_float)
-                if i0 + tid < n_dofs:
-                    L_ik[:] = constraint_state.nt_H[i_b, i0 : i0 + qd.simt.Tile16x16.SIZE, k0:n_dofs]
+                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik[:] = constraint_state.nt_H[i_b, i0:i1, k0:n_dofs]
 
                 # Subtract prior-column contributions: L_ik -= sum_j L[i,j] @ L[k,j]^T
                 for jb in range(kb):
@@ -1718,12 +1716,10 @@ def func_cholesky_factor_direct_tiled(
                 L_kk.solve_triangular_(L_ik)
 
                 # Write L[i,k] back to global memory
-                if i0 + tid < n_dofs:
-                    constraint_state.nt_H[i_b, i0 : i0 + qd.simt.Tile16x16.SIZE, k0:n_dofs] = L_ik
+                constraint_state.nt_H[i_b, i0:i1, k0:n_dofs] = L_ik
 
             # Write L[k,k] back to global memory
-            if k0 + tid < n_dofs:
-                constraint_state.nt_H[i_b, k0 : k0 + qd.simt.Tile16x16.SIZE, k0:n_dofs] = L_kk
+            constraint_state.nt_H[i_b, k0:k1, k0:n_dofs] = L_kk
 
 
 @qd.func
@@ -1766,11 +1762,9 @@ def func_cholesky_and_solve_fused_tiled(
             k0 = kb * qd.simt.Tile16x16.SIZE
 
             # Load diagonal tile H[k,k], padding out-of-bounds rows with identity
-            L_kk = qd.simt.Tile16x16(dtype=gs.qd_float)
-            if k0 + tid < n_dofs:
-                L_kk[:] = constraint_state.nt_H[i_b, k0 : k0 + qd.simt.Tile16x16.SIZE, k0:n_dofs]
-            else:
-                L_kk.eye_()
+            k1 = qd.min(k0 + qd.simt.Tile16x16.SIZE, n_dofs)
+            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:n_dofs]
 
             # Subtract prior-column contributions from shared memory
             for jb in range(kb):
@@ -1785,11 +1779,11 @@ def func_cholesky_and_solve_fused_tiled(
             # Solve off-diagonal tiles and store in shared memory (not global)
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * qd.simt.Tile16x16.SIZE
+                i1 = qd.min(i0 + qd.simt.Tile16x16.SIZE, n_dofs)
 
                 # Load off-diagonal tile H[i,k]
-                L_ik = qd.simt.Tile16x16(dtype=gs.qd_float)
-                if i0 + tid < n_dofs:
-                    L_ik[:] = constraint_state.nt_H[i_b, i0 : i0 + qd.simt.Tile16x16.SIZE, k0:n_dofs]
+                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik[:] = constraint_state.nt_H[i_b, i0:i1, k0:n_dofs]
 
                 # Subtract prior-column contributions from shared memory
                 for jb in range(kb):
@@ -1803,12 +1797,10 @@ def func_cholesky_and_solve_fused_tiled(
                 L_kk.solve_triangular_(L_ik)
 
                 # Write L[i,k] to shared memory
-                if i0 + tid < n_dofs:
-                    L_sh[i0 : i0 + qd.simt.Tile16x16.SIZE, k0:n_dofs] = L_ik
+                L_sh[i0:i1, k0:n_dofs] = L_ik
 
             # Write L[k,k] to shared memory
-            if k0 + tid < n_dofs:
-                L_sh[k0 : k0 + qd.simt.Tile16x16.SIZE, k0:n_dofs] = L_kk
+            L_sh[k0:k1, k0:n_dofs] = L_kk
 
         # --- Scalar triangular solve using L from shared memory ---
         # No longer using 16x16 tiles; the 16 threads parallelize each row's
