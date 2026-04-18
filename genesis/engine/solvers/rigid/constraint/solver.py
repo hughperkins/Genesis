@@ -2650,7 +2650,7 @@ def func_linesearch_batch(
             static_rigid_sim_config=static_rigid_sim_config,
         )
         p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
-            i_b, p0_alpha - p0_deriv_0 / p0_deriv_1, constraint_state, rigid_global_info
+            i_b, p0_alpha - p0_deriv_0 / p0_deriv_1, constraint_state, rigid_global_info, static_rigid_sim_config
         )
 
         if p0_cost < p1_cost:
