@@ -5,6 +5,7 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.array_class as array_class
+from genesis.engine.solvers.rigid.constraint import layout as cs_layout
 from genesis.engine.solvers.rigid.constraint import solver
 
 # --- Parallel linesearch constants ---
@@ -154,7 +155,7 @@ def _func_parallel_linesearch_p0(
                 else:
                     for i_d in range(n_dofs):
                         jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
-                constraint_state.jv[i_c, i_b] = jv_val
+                cs_layout.set_jv(constraint_state, static_rigid_sim_config, i_c, i_b, jv_val)
                 i_c += _T
 
             qd.simt.block.sync()  # Ensure mv and jv are written before Phase 1 reads them
@@ -218,9 +219,9 @@ def _func_parallel_linesearch_p0(
 
                 i_c = tid
                 while i_c < n_con:
-                    Jaref_c = constraint_state.Jaref[i_c, i_b]
-                    jv_c = constraint_state.jv[i_c, i_b]
-                    D = constraint_state.efc_D[i_c, i_b]
+                    Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
                     qf_0 = D * (0.5 * Jaref_c * Jaref_c)
                     qf_1 = D * (jv_c * Jaref_c)
                     qf_2 = D * (0.5 * jv_c * jv_c)
@@ -235,8 +236,8 @@ def _func_parallel_linesearch_p0(
                         local_constraint_hess += qf_2
                     elif i_c < nef:
                         # Friction: check linear regime at alpha=0
-                        f = constraint_state.efc_frictionloss[i_c, i_b]
-                        r = constraint_state.diag[i_c, i_b]
+                        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
                         rf = r * f
                         linear_neg = Jaref_c <= -rf
                         linear_pos = Jaref_c >= rf
@@ -307,6 +308,7 @@ def _func_parallel_linesearch_p0(
 def _func_parallel_linesearch_eval(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Decomposed solver eval kernel: serial refinement from Newton step + cooperative apply.
 
@@ -337,6 +339,7 @@ def _func_parallel_linesearch_eval(
                     alpha_newton,
                     constraint_state,
                     rigid_global_info,
+                    static_rigid_sim_config,
                 )
                 if p0_cost < p1_cost:
                     p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = solver.func_ls_point_fn_opt(
@@ -344,6 +347,7 @@ def _func_parallel_linesearch_eval(
                         gs.qd_float(0.0),
                         constraint_state,
                         rigid_global_info,
+                        static_rigid_sim_config,
                     )
 
                 if p1_cost < p0_cost:
@@ -360,6 +364,7 @@ def _func_parallel_linesearch_eval(
                         gtol,
                         constraint_state,
                         rigid_global_info,
+                        static_rigid_sim_config,
                     )
                     # Skip status 7 (brackets stalled, midpoint non-improving) to preserve
                     # the validated p1_alpha already written above
@@ -390,7 +395,13 @@ def _func_parallel_linesearch_eval(
                 # Apply to constraints (strided over threads)
                 i_c = tid
                 while i_c < n_con_apply:
-                    constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha_apply
+                    cs_layout.add_Jaref(
+                        constraint_state,
+                        static_rigid_sim_config,
+                        i_c,
+                        i_b,
+                        cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b) * alpha_apply,
+                    )
                     i_c += _K
 
 
@@ -428,24 +439,37 @@ def _func_update_constraint_forces(
             nef = ne + constraint_state.n_constraints_frictionloss[i_b]
 
             if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+                constraint_state.prev_active[i_c, i_b] = cs_layout.get_active(
+                    constraint_state, static_rigid_sim_config, i_c, i_b
+                )
 
-            constraint_state.active[i_c, i_b] = True
+            cs_layout.set_active(constraint_state, static_rigid_sim_config, i_c, i_b, True)
             floss_force = gs.qd_float(0.0)
 
             if ne <= i_c and i_c < nef:
-                f = constraint_state.efc_frictionloss[i_c, i_b]
-                r = constraint_state.diag[i_c, i_b]
+                f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
                 rf = r * f
-                linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                constraint_state.active[i_c, i_b] = not (linear_neg or linear_pos)
+                Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                linear_neg = Jaref_c <= -rf
+                linear_pos = Jaref_c >= rf
+                cs_layout.set_active(
+                    constraint_state, static_rigid_sim_config, i_c, i_b, not (linear_neg or linear_pos)
+                )
                 floss_force = linear_neg * f + linear_pos * -f
             elif nef <= i_c:
-                constraint_state.active[i_c, i_b] = constraint_state.Jaref[i_c, i_b] < 0
+                cs_layout.set_active(
+                    constraint_state,
+                    static_rigid_sim_config,
+                    i_c,
+                    i_b,
+                    cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b) < 0,
+                )
 
             constraint_state.efc_force[i_c, i_b] = floss_force + (
-                -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+                -cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
             )
 
 
@@ -502,19 +526,20 @@ def _func_update_constraint_cost(
 
             # Constraint cost: quadratic + friction linear
             for i_c in range(n_con):
+                Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
                 cost_i += 0.5 * (
-                    constraint_state.Jaref[i_c, i_b] ** 2
-                    * constraint_state.efc_D[i_c, i_b]
-                    * constraint_state.active[i_c, i_b]
+                    Jaref_c ** 2
+                    * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
                 )
                 if ne <= i_c and i_c < nef:
-                    f = constraint_state.efc_frictionloss[i_c, i_b]
-                    r = constraint_state.diag[i_c, i_b]
+                    f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
                     rf = r * f
-                    linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                    linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                    cost_i += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b]) + linear_pos * f * (
-                        -0.5 * rf + constraint_state.Jaref[i_c, i_b]
+                    linear_neg = Jaref_c <= -rf
+                    linear_pos = Jaref_c >= rf
+                    cost_i += linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (
+                        -0.5 * rf + Jaref_c
                     )
 
             constraint_state.gauss[i_b] = gauss_i
@@ -528,7 +553,11 @@ def _func_newton_only_nt_hessian(
     static_rigid_sim_config: qd.template(),
 ):
     """Step 4: Newton Hessian update (Newton only)"""
-    solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+    solver.func_hessian_direct_tiled(
+        constraint_state=constraint_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,
@@ -637,7 +666,7 @@ def _kernel_solve_graph(
             dofs_info, entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
         )
         # Fused: refinement + apply alpha
-        _func_parallel_linesearch_eval(constraint_state, rigid_global_info)
+        _func_parallel_linesearch_eval(constraint_state, rigid_global_info, static_rigid_sim_config)
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             _func_cg_only_save_prev_grad(constraint_state, static_rigid_sim_config)
         _func_update_constraint_forces(constraint_state, static_rigid_sim_config)

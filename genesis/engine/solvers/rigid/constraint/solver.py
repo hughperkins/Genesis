@@ -14,6 +14,7 @@ from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tens
 
 from ..collider.contact_island import ContactIsland
 from . import backward as backward_constraint_solver
+from . import layout as cs_layout
 from . import noslip as constraint_noslip
 
 
@@ -702,9 +703,9 @@ def add_collision_constraints(
                 diag *= 2 * contact_data_friction * contact_data_friction * (1 - imp) / imp
                 diag = qd.max(diag, EPS)
 
-                constraint_state.diag[n_con, i_b] = diag
+                cs_layout.set_diag(constraint_state, static_rigid_sim_config, n_con, i_b, diag)
                 constraint_state.aref[n_con, i_b] = aref
-                constraint_state.efc_D[n_con, i_b] = 1 / diag
+                cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, n_con, i_b, 1 / diag)
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
@@ -821,9 +822,9 @@ def func_equality_connect(
 
         diag = qd.max(invweight * (1.0 - imp) / imp, EPS)
 
-        constraint_state.diag[n_con, i_b] = diag
+        cs_layout.set_diag(constraint_state, static_rigid_sim_config, n_con, i_b, diag)
         constraint_state.aref[n_con, i_b] = aref
-        constraint_state.efc_D[n_con, i_b] = 1.0 / diag
+        cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, n_con, i_b, 1.0 / diag)
 
 
 @qd.func
@@ -901,9 +902,9 @@ def func_equality_joint(
 
     diag = qd.max(invweight * (1.0 - imp) / imp, EPS)
 
-    constraint_state.diag[n_con, i_b] = diag
+    cs_layout.set_diag(constraint_state, static_rigid_sim_config, n_con, i_b, diag)
     constraint_state.aref[n_con, i_b] = aref
-    constraint_state.efc_D[n_con, i_b] = 1.0 / diag
+    cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, n_con, i_b, 1.0 / diag)
 
     # Populate jac_relevant_dofs for this joint-equality constraint.
     # Without this, sparse iterations see 0 relevant DOFs and produce
@@ -1155,9 +1156,9 @@ def func_equality_weld(
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel, pos_error[i])
         diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
 
-        constraint_state.diag[n_con, i_b] = diag
+        cs_layout.set_diag(constraint_state, static_rigid_sim_config, n_con, i_b, diag)
         constraint_state.aref[n_con, i_b] = aref
-        constraint_state.efc_D[n_con, i_b] = 1.0 / diag
+        cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, n_con, i_b, 1.0 / diag)
 
     # --- Orientation part (next 3 constraints) ---
     n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 3)
@@ -1212,9 +1213,9 @@ def func_equality_weld(
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel[i_con - n_con], rot_error[i_con - n_con])
         diag = qd.max(invweight[1] * (1.0 - imp) / imp, EPS)
 
-        constraint_state.diag[i_con, i_b] = diag
+        cs_layout.set_diag(constraint_state, static_rigid_sim_config, i_con, i_b, diag)
         constraint_state.aref[i_con, i_b] = aref
-        constraint_state.efc_D[i_con, i_b] = 1.0 / diag
+        cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, i_con, i_b, 1.0 / diag)
 
 
 @qd.func
@@ -1259,9 +1260,9 @@ def add_joint_limit_constraints(
                         diag = qd.max(dofs_info.invweight[I_d] * (1 - imp) / imp, EPS)
 
                         n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
-                        constraint_state.diag[n_con, i_b] = diag
+                        cs_layout.set_diag(constraint_state, static_rigid_sim_config, n_con, i_b, diag)
                         constraint_state.aref[n_con, i_b] = aref
-                        constraint_state.efc_D[n_con, i_b] = 1 / diag
+                        cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, n_con, i_b, 1 / diag)
 
                         if qd.static(static_rigid_sim_config.sparse_solve):
                             for i_d2_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
@@ -1321,10 +1322,12 @@ def add_frictionloss_constraints(
                         i_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
                         qd.atomic_add(constraint_state.n_constraints_frictionloss[i_b], 1)
 
-                        constraint_state.diag[i_con, i_b] = diag
+                        cs_layout.set_diag(constraint_state, static_rigid_sim_config, i_con, i_b, diag)
                         constraint_state.aref[i_con, i_b] = aref
-                        constraint_state.efc_D[i_con, i_b] = 1.0 / diag
-                        constraint_state.efc_frictionloss[i_con, i_b] = dofs_info.frictionloss[I_d]
+                        cs_layout.set_efc_D(constraint_state, static_rigid_sim_config, i_con, i_b, 1.0 / diag)
+                        cs_layout.set_efc_frictionloss(
+                            constraint_state, static_rigid_sim_config, i_con, i_b, dofs_info.frictionloss[I_d]
+                        )
                         for i_d2 in range(n_dofs):
                             constraint_state.jac[i_con, i_d2, i_b] = gs.qd_float(0.0)
                         constraint_state.jac[i_con, i_d, i_b] = jac
@@ -1480,8 +1483,8 @@ def func_hessian_direct_batch(
                             constraint_state.nt_H[i_b, row, col]
                             + constraint_state.jac[i_c, col, i_b]
                             * constraint_state.jac[i_c, row, i_b]
-                            * constraint_state.efc_D[i_c, i_b]
-                            * constraint_state.active[i_c, i_b]
+                            * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                            * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
                         )
     else:
         for i_d1, i_c in qd.ndrange(n_dofs, constraint_state.n_constraints[i_b]):
@@ -1491,8 +1494,8 @@ def func_hessian_direct_batch(
                         constraint_state.nt_H[i_b, i_d1, i_d2]
                         + constraint_state.jac[i_c, i_d2, i_b]
                         * constraint_state.jac[i_c, i_d1, i_b]
-                        * constraint_state.efc_D[i_c, i_b]
-                        * constraint_state.active[i_c, i_b]
+                        * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
                     )
 
     # Compute `H += M`
@@ -1508,6 +1511,7 @@ def func_hessian_direct_batch(
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Compute the Hessian matrix `H = M + J.T @ D @ J of the optimization problem for all environment at once.
 
@@ -1558,7 +1562,8 @@ def func_hessian_direct_tiled(
             n_conts_tile = qd.min(MAX_CONSTRAINTS_PER_BLOCK, n_c - i_c_start)
             while i_c_ < n_conts_tile:
                 efc_D[i_c_] = (
-                    constraint_state.efc_D[i_c_start + i_c_, i_b] * constraint_state.active[i_c_start + i_c_, i_b]
+                    cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c_start + i_c_, i_b)
+                    * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c_start + i_c_, i_b)
                 )
                 i_c_ = i_c_ + BLOCK_DIM
 
@@ -1802,7 +1807,7 @@ def func_hessian_and_cholesky_factor_direct(
             )
     else:
         # GPU
-        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        func_hessian_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
@@ -1816,6 +1821,7 @@ def func_hessian_and_cholesky_factor_direct(
 def func_build_changed_constraint_list(
     i_b,
     constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
 ):
     """Build a compact list of constraint indices whose active state changed.
 
@@ -1824,7 +1830,9 @@ def func_build_changed_constraint_list(
     """
     n_changed = 0
     for i_c in range(constraint_state.n_constraints[i_b]):
-        if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
+        if cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b) ^ constraint_state.prev_active[
+            i_c, i_b
+        ]:
             constraint_state.incr_changed_idx[n_changed, i_b] = i_c
             n_changed += 1
     constraint_state.incr_n_changed[i_b] = n_changed
@@ -1835,6 +1843,7 @@ def func_hessian_and_cholesky_factor_incremental_dense_batch(
     i_b,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ) -> bool:
     EPS = rigid_global_info.EPS[None]
 
@@ -1843,8 +1852,8 @@ def func_hessian_and_cholesky_factor_incremental_dense_batch(
     is_degenerated = False
     for idx in range(constraint_state.incr_n_changed[i_b]):
         i_c = constraint_state.incr_changed_idx[idx, i_b]
-        sign = 1.0 if constraint_state.active[i_c, i_b] else -1.0
-        efc_D_sqrt = qd.sqrt(constraint_state.efc_D[i_c, i_b])
+        sign = 1.0 if cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b) else -1.0
+        efc_D_sqrt = qd.sqrt(cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b))
 
         for i_d in range(n_dofs):
             constraint_state.nt_vec[i_d, i_b] = constraint_state.jac[i_c, i_d, i_b] * efc_D_sqrt
@@ -1879,14 +1888,15 @@ def func_hessian_and_cholesky_factor_incremental_sparse_batch(
     i_b,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ) -> bool:
     EPS = rigid_global_info.EPS[None]
 
     is_degenerated = False
     for idx in range(constraint_state.incr_n_changed[i_b]):
         i_c = constraint_state.incr_changed_idx[idx, i_b]
-        sign = 1.0 if constraint_state.active[i_c, i_b] else -1.0
-        efc_D_sqrt = qd.sqrt(constraint_state.efc_D[i_c, i_b])
+        sign = 1.0 if cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b) else -1.0
+        efc_D_sqrt = qd.sqrt(cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b))
 
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
             i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
@@ -1929,11 +1939,11 @@ def func_hessian_and_cholesky_factor_incremental_batch(
     is_degenerated = False
     if qd.static(static_rigid_sim_config.sparse_solve):
         is_degenerated = func_hessian_and_cholesky_factor_incremental_sparse_batch(
-            i_b, constraint_state, rigid_global_info
+            i_b, constraint_state, rigid_global_info, static_rigid_sim_config
         )
     else:
         is_degenerated = func_hessian_and_cholesky_factor_incremental_dense_batch(
-            i_b, constraint_state, rigid_global_info
+            i_b, constraint_state, rigid_global_info, static_rigid_sim_config
         )
     return is_degenerated
 
@@ -2124,7 +2134,7 @@ def func_ls_init_and_eval_p0_opt(
         else:
             for i_d in range(n_dofs):
                 jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
-        constraint_state.jv[i_c, i_b] = jv
+        cs_layout.set_jv(constraint_state, static_rigid_sim_config, i_c, i_b, jv)
 
     # -- quad_gauss (same as original func_ls_init) --
     quad_gauss_1 = gs.qd_float(0.0)
@@ -2150,9 +2160,9 @@ def func_ls_init_and_eval_p0_opt(
     # Recompute quad on the fly from Jaref, jv, efc_D — avoids writing/reading the quad array entirely.
     # 3 loads per constraint (Jaref, jv, D) + ~8 FLOPs, vs 3 writes + 3 reads through global memory.
     for i_c in range(n_con):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
         qf_1 = D * (jv_c * Jaref_c)
         qf_2 = D * (0.5 * jv_c * jv_c)
@@ -2167,8 +2177,8 @@ def func_ls_init_and_eval_p0_opt(
             quad_total_2 = quad_total_2 + qf_2
         elif i_c < nef:
             # Friction: check linear regime at x=Jaref (alpha=0)
-            f = constraint_state.efc_frictionloss[i_c, i_b]
-            r = constraint_state.diag[i_c, i_b]
+            f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+            r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
             rf = r * f
             linear_neg = Jaref_c <= -rf
             linear_pos = Jaref_c >= rf
@@ -2209,6 +2219,7 @@ def func_ls_point_fn_opt(
     alpha,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Evaluate linesearch cost, gradient, and curvature at a single candidate alpha.
 
@@ -2229,11 +2240,11 @@ def func_ls_point_fn_opt(
 
     # Friction constraints [ne, nef): 5 loads (Jaref, jv, D, f, diag) + recompute quad
     for i_c in range(ne, nef):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
-        f = constraint_state.efc_frictionloss[i_c, i_b]
-        r = constraint_state.diag[i_c, i_b]
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
         qf_1 = D * (jv_c * Jaref_c)
         qf_2 = D * (0.5 * jv_c * jv_c)
@@ -2251,9 +2262,9 @@ def func_ls_point_fn_opt(
 
     # Contact constraints [nef, n_con): 3 loads (Jaref, jv, D) + recompute quad
     for i_c in range(nef, n_con):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
         x = Jaref_c + alpha * jv_c
         active = x < 0
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
@@ -2282,6 +2293,7 @@ def func_ls_point_fn_3alphas_opt(
     alpha_2,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Evaluate linesearch cost, gradient, and curvature at three candidate alphas in a single constraint loop pass.
 
@@ -2306,11 +2318,11 @@ def func_ls_point_fn_3alphas_opt(
 
     # Friction constraints [ne, nef): 5 loads (Jaref, jv, D, f, diag) + recompute quad, eval 3 alphas
     for i_c in range(ne, nef):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
-        f = constraint_state.efc_frictionloss[i_c, i_b]
-        r = constraint_state.diag[i_c, i_b]
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
         qf_1 = D * (jv_c * Jaref_c)
         qf_2 = D * (0.5 * jv_c * jv_c)
@@ -2354,9 +2366,9 @@ def func_ls_point_fn_3alphas_opt(
 
     # Contact constraints [nef, n_con): 3 loads (Jaref, jv, D) + recompute quad, eval 3 alphas
     for i_c in range(nef, n_con):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
         qf_1 = D * (jv_c * Jaref_c)
         qf_2 = D * (0.5 * jv_c * jv_c)
@@ -2472,7 +2484,13 @@ def func_linesearch_and_apply_alpha(
 
         # Update Jaref
         for i_c in range(constraint_state.n_constraints[i_b]):
-            constraint_state.Jaref[i_c, i_b] = constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+            cs_layout.add_Jaref(
+                constraint_state,
+                static_rigid_sim_config,
+                i_c,
+                i_b,
+                cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b) * alpha,
+            )
 
 
 @qd.func
@@ -2486,6 +2504,7 @@ def func_linesearch_refine(
     gtol,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Bracketing walk + 3-alpha dual-bracket refinement.
 
@@ -2509,7 +2528,7 @@ def func_linesearch_refine(
         p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1 = p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1
         p2update = 1
         p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
-            i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info
+            i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info, static_rigid_sim_config
         )
         if qd.abs(p1_deriv_0) < gtol:
             res_alpha = p1_alpha
@@ -2530,7 +2549,7 @@ def func_linesearch_refine(
             alpha_2 = (p1_alpha + p2_alpha) * 0.5
             while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
                 costs, grads, hess = func_ls_point_fn_3alphas_opt(
-                    i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
+                    i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info, static_rigid_sim_config
                 )
                 alphas = qd.Vector([alpha_0, alpha_1, alpha_2])
                 p1_next = alpha_0
@@ -2645,7 +2664,16 @@ def func_linesearch_batch(
             res_alpha = p1_alpha
         else:
             res_alpha, ls_result = func_linesearch_refine(
-                i_b, p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1, p0_cost, gtol, constraint_state, rigid_global_info
+                i_b,
+                p1_alpha,
+                p1_cost,
+                p1_deriv_0,
+                p1_deriv_1,
+                p0_cost,
+                gtol,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
             )
             constraint_state.ls_result[i_b] = ls_result
             # Status 7: both brackets stalled and midpoint cost >= p0_cost. Reject the non-improving alpha.
@@ -2694,26 +2722,39 @@ def func_update_constraint_batch(
     # Beware 'active' does not refer to whether a constraint is active, but rather whether its quadratic cost is active
     for i_c in range(constraint_state.n_constraints[i_b]):
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-            constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
-        constraint_state.active[i_c, i_b] = True
+            constraint_state.prev_active[i_c, i_b] = cs_layout.get_active(
+                constraint_state, static_rigid_sim_config, i_c, i_b
+            )
+        cs_layout.set_active(constraint_state, static_rigid_sim_config, i_c, i_b, True)
 
         floss_force = gs.qd_float(0.0)
         if ne <= i_c and i_c < nef:  # Friction constraints
-            f = constraint_state.efc_frictionloss[i_c, i_b]
-            r = constraint_state.diag[i_c, i_b]
+            f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+            r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
             rf = r * f
-            linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-            linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-            constraint_state.active[i_c, i_b] = not (linear_neg or linear_pos)
+            Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+            linear_neg = Jaref_c <= -rf
+            linear_pos = Jaref_c >= rf
+            cs_layout.set_active(
+                constraint_state, static_rigid_sim_config, i_c, i_b, not (linear_neg or linear_pos)
+            )
             floss_force = linear_neg * f + linear_pos * -f
-            floss_cost_local = linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b])
-            floss_cost_local = floss_cost_local + linear_pos * f * (-0.5 * rf + constraint_state.Jaref[i_c, i_b])
+            floss_cost_local = linear_neg * f * (-0.5 * rf - Jaref_c)
+            floss_cost_local = floss_cost_local + linear_pos * f * (-0.5 * rf + Jaref_c)
             cost_i = cost_i + floss_cost_local
         elif nef <= i_c:  # Contact constraints
-            constraint_state.active[i_c, i_b] = constraint_state.Jaref[i_c, i_b] < 0
+            cs_layout.set_active(
+                constraint_state,
+                static_rigid_sim_config,
+                i_c,
+                i_b,
+                cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b) < 0,
+            )
 
         constraint_state.efc_force[i_c, i_b] = floss_force + (
-            -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+            -cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+            * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+            * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
         )
 
     if qd.static(static_rigid_sim_config.sparse_solve):
@@ -2743,8 +2784,11 @@ def func_update_constraint_batch(
 
     # D * (Jx - aref) ** 2
     for i_c in range(constraint_state.n_constraints[i_b]):
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
         cost_i = cost_i + 0.5 * (
-            constraint_state.Jaref[i_c, i_b] ** 2 * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+            Jaref_c ** 2
+            * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+            * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
         )
 
     constraint_state.gauss[i_b] = gauss_i
@@ -2978,7 +3022,7 @@ def _initialize_Jaref_body(
     else:
         for i_d in range(n_dofs):
             Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
-    constraint_state.Jaref[i_c, i_b] = Jaref
+    cs_layout.set_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b, Jaref)
 
 
 @qd.func
@@ -3194,7 +3238,13 @@ def func_solve_iter(
             constraint_state.Ma[i_d, i_b] = constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
 
         for i_c in range(constraint_state.n_constraints[i_b]):
-            constraint_state.Jaref[i_c, i_b] = constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+            cs_layout.add_Jaref(
+                constraint_state,
+                static_rigid_sim_config,
+                i_c,
+                i_b,
+                cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b) * alpha,
+            )
 
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
             for i_d in range(n_dofs):
@@ -3212,7 +3262,9 @@ def func_solve_iter(
         )
 
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+            func_build_changed_constraint_list(
+                i_b, constraint_state=constraint_state, static_rigid_sim_config=static_rigid_sim_config
+            )
             if qd.static(static_rigid_sim_config.sparse_solve):
                 # Bypass incremental Cholesky when sparse_solve=True. The incremental rank-1 update
                 # assumes globally descending DOF order in jac_relevant_dofs, which doesn't hold

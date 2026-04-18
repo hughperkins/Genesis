@@ -3,6 +3,8 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.array_class as array_class
 
+from genesis.engine.solvers.rigid.constraint import layout as cs_layout
+
 
 @qd.func
 def func_matvec_Ap(
@@ -41,7 +43,9 @@ def func_matvec_Ap(
             for i_d in range(n_dofs):
                 jv += constraint_state.jac[i_c, i_d, i_b] * constraint_state.bw_p[i_d, i_b]
         # only active constraints contribute
-        jv *= constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+        jv *= cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b) * cs_layout.get_active(
+            constraint_state, static_rigid_sim_config, i_c, i_b
+        )
         # out += J^T (D * J v)
         if qd.static(static_rigid_sim_config.sparse_solve):
             for k in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
@@ -210,7 +214,10 @@ def kernel_compute_gradients(
                 for i_d in range(n_dofs):
                     t += constraint_state.jac[i_c, i_d, i_b] * constraint_state.qacc[i_d, i_b]
             constraint_state.bw_w[i_c, i_b] = t - constraint_state.aref[i_c, i_b]
-            constraint_state.bw_y[i_c, i_b] = constraint_state.efc_D[i_c, i_b] * constraint_state.bw_w[i_c, i_b]
+            constraint_state.bw_y[i_c, i_b] = (
+                cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                * constraint_state.bw_w[i_c, i_b]
+            )
 
         # grads
         # force: u
@@ -222,10 +229,11 @@ def kernel_compute_gradients(
         # D: -Ju \odot w
         # J: -[u * y^T + qacc * (D \odot (Ju)^T)]
         for i_c in range(constraint_state.n_constraints[i_b]):
-            if constraint_state.active[i_c, i_b] != 0:
+            if cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b) != 0:
                 # aref: Ju \odot D
                 constraint_state.dL_daref[i_c, i_b] += (
-                    constraint_state.efc_D[i_c, i_b] * constraint_state.bw_Ju[i_c, i_b]
+                    cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * constraint_state.bw_Ju[i_c, i_b]
                 )
                 # D: -Ju \odot w
                 constraint_state.dL_defc_D[i_c, i_b] -= (
@@ -233,7 +241,10 @@ def kernel_compute_gradients(
                 )
 
                 # J: -[u * y^T + qacc * (D \odot (Ju))^T]
-                DJu_i = constraint_state.efc_D[i_c, i_b] * constraint_state.bw_Ju[i_c, i_b]
+                DJu_i = (
+                    cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * constraint_state.bw_Ju[i_c, i_b]
+                )
                 y_i = constraint_state.bw_y[i_c, i_b]
 
                 if qd.static(static_rigid_sim_config.sparse_solve):
