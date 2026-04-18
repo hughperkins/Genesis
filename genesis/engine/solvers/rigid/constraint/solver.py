@@ -2418,6 +2418,349 @@ def func_ls_point_fn_3alphas_opt(
     return costs, grads, hess
 
 
+# ----------------------------------------------------------------------
+# Subgroup-cooperative variants of the linesearch evaluators.
+# ----------------------------------------------------------------------
+# Used by the decomposed-solver linesearch (`_func_parallel_linesearch_eval`),
+# where each block has 32 threads cooperating on a single env.
+# All 32 lanes call these with their own `tid`. The constraint loop is
+# strided by 32, then `quad_total_*` accumulators are summed across the warp
+# via `subgroup.reduce_all_add(_, 5)` so every lane ends up with the same
+# scalar return values. Writes to `constraint_state.ls_it` are gated on
+# `tid == 0` to avoid 32x over-counting.
+# ----------------------------------------------------------------------
+
+
+@qd.func
+def func_ls_point_fn_opt_coop(
+    i_b,
+    tid,
+    alpha,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    quad_total_0 = gs.qd_float(0.0)
+    quad_total_1 = gs.qd_float(0.0)
+    quad_total_2 = gs.qd_float(0.0)
+    if tid == 0:
+        quad_total_0 = constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+        quad_total_1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+        quad_total_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+    for i_c in range(ne + tid, nef, 32):
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        x = Jaref_c + alpha * jv_c
+        rf = r * f
+        linear_neg = x <= -rf
+        linear_pos = x >= rf
+        if linear_neg or linear_pos:
+            qf_0 = linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
+            qf_1 = linear_neg * (-f * jv_c) + linear_pos * (f * jv_c)
+            qf_2 = 0.0
+        quad_total_0 = quad_total_0 + qf_0
+        quad_total_1 = quad_total_1 + qf_1
+        quad_total_2 = quad_total_2 + qf_2
+
+    for i_c in range(nef + tid, n_con, 32):
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        x = Jaref_c + alpha * jv_c
+        active = x < 0
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        quad_total_0 = quad_total_0 + qf_0 * active
+        quad_total_1 = quad_total_1 + qf_1 * active
+        quad_total_2 = quad_total_2 + qf_2 * active
+
+    quad_total_0 = qd.simt.subgroup.reduce_all_add(quad_total_0, 5)
+    quad_total_1 = qd.simt.subgroup.reduce_all_add(quad_total_1, 5)
+    quad_total_2 = qd.simt.subgroup.reduce_all_add(quad_total_2, 5)
+
+    cost = alpha * alpha * quad_total_2 + alpha * quad_total_1 + quad_total_0
+    grad = 2 * alpha * quad_total_2 + quad_total_1
+    hess = 2 * quad_total_2
+    if hess <= 0.0:
+        hess = rigid_global_info.EPS[None]
+
+    if tid == 0:
+        constraint_state.ls_it[i_b] = constraint_state.ls_it[i_b] + 1
+
+    return alpha, cost, grad, hess
+
+
+@qd.func
+def func_ls_point_fn_3alphas_opt_coop(
+    i_b,
+    tid,
+    alpha_0,
+    alpha_1,
+    alpha_2,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    base_0 = gs.qd_float(0.0)
+    base_1 = gs.qd_float(0.0)
+    base_2 = gs.qd_float(0.0)
+    if tid == 0:
+        base_0 = constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+        base_1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+        base_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+    t0_0, t0_1, t0_2 = base_0, base_1, base_2
+    t1_0, t1_1, t1_2 = base_0, base_1, base_2
+    t2_0, t2_1, t2_2 = base_0, base_1, base_2
+
+    for i_c in range(ne + tid, nef, 32):
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        rf = r * f
+
+        x0 = Jaref_c + alpha_0 * jv_c
+        ln0 = x0 <= -rf
+        lp0 = x0 >= rf
+        a0_qf_0, a0_qf_1, a0_qf_2 = qf_0, qf_1, qf_2
+        if ln0 or lp0:
+            a0_qf_0 = ln0 * f * (-0.5 * rf - Jaref_c) + lp0 * f * (-0.5 * rf + Jaref_c)
+            a0_qf_1 = ln0 * (-f * jv_c) + lp0 * (f * jv_c)
+            a0_qf_2 = 0.0
+        t0_0 = t0_0 + a0_qf_0
+        t0_1 = t0_1 + a0_qf_1
+        t0_2 = t0_2 + a0_qf_2
+
+        x1 = Jaref_c + alpha_1 * jv_c
+        ln1 = x1 <= -rf
+        lp1 = x1 >= rf
+        a1_qf_0, a1_qf_1, a1_qf_2 = qf_0, qf_1, qf_2
+        if ln1 or lp1:
+            a1_qf_0 = ln1 * f * (-0.5 * rf - Jaref_c) + lp1 * f * (-0.5 * rf + Jaref_c)
+            a1_qf_1 = ln1 * (-f * jv_c) + lp1 * (f * jv_c)
+            a1_qf_2 = 0.0
+        t1_0 = t1_0 + a1_qf_0
+        t1_1 = t1_1 + a1_qf_1
+        t1_2 = t1_2 + a1_qf_2
+
+        x2 = Jaref_c + alpha_2 * jv_c
+        ln2 = x2 <= -rf
+        lp2 = x2 >= rf
+        a2_qf_0, a2_qf_1, a2_qf_2 = qf_0, qf_1, qf_2
+        if ln2 or lp2:
+            a2_qf_0 = ln2 * f * (-0.5 * rf - Jaref_c) + lp2 * f * (-0.5 * rf + Jaref_c)
+            a2_qf_1 = ln2 * (-f * jv_c) + lp2 * (f * jv_c)
+            a2_qf_2 = 0.0
+        t2_0 = t2_0 + a2_qf_0
+        t2_1 = t2_1 + a2_qf_1
+        t2_2 = t2_2 + a2_qf_2
+
+    for i_c in range(nef + tid, n_con, 32):
+        Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+        jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
+        D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+
+        x0 = Jaref_c + alpha_0 * jv_c
+        x1 = Jaref_c + alpha_1 * jv_c
+        x2 = Jaref_c + alpha_2 * jv_c
+        act0 = gs.qd_bool(x0 < 0)
+        act1 = gs.qd_bool(x1 < 0)
+        act2 = gs.qd_bool(x2 < 0)
+        t0_0 = t0_0 + qf_0 * act0
+        t0_1 = t0_1 + qf_1 * act0
+        t0_2 = t0_2 + qf_2 * act0
+        t1_0 = t1_0 + qf_0 * act1
+        t1_1 = t1_1 + qf_1 * act1
+        t1_2 = t1_2 + qf_2 * act1
+        t2_0 = t2_0 + qf_0 * act2
+        t2_1 = t2_1 + qf_1 * act2
+        t2_2 = t2_2 + qf_2 * act2
+
+    t0_0 = qd.simt.subgroup.reduce_all_add(t0_0, 5)
+    t0_1 = qd.simt.subgroup.reduce_all_add(t0_1, 5)
+    t0_2 = qd.simt.subgroup.reduce_all_add(t0_2, 5)
+    t1_0 = qd.simt.subgroup.reduce_all_add(t1_0, 5)
+    t1_1 = qd.simt.subgroup.reduce_all_add(t1_1, 5)
+    t1_2 = qd.simt.subgroup.reduce_all_add(t1_2, 5)
+    t2_0 = qd.simt.subgroup.reduce_all_add(t2_0, 5)
+    t2_1 = qd.simt.subgroup.reduce_all_add(t2_1, 5)
+    t2_2 = qd.simt.subgroup.reduce_all_add(t2_2, 5)
+
+    EPS = rigid_global_info.EPS[None]
+
+    cost_0 = alpha_0 * alpha_0 * t0_2 + alpha_0 * t0_1 + t0_0
+    grad_0 = 2 * alpha_0 * t0_2 + t0_1
+    hess_0 = 2 * t0_2
+    if hess_0 <= 0.0:
+        hess_0 = EPS
+
+    cost_1 = alpha_1 * alpha_1 * t1_2 + alpha_1 * t1_1 + t1_0
+    grad_1 = 2 * alpha_1 * t1_2 + t1_1
+    hess_1 = 2 * t1_2
+    if hess_1 <= 0.0:
+        hess_1 = EPS
+
+    cost_2 = alpha_2 * alpha_2 * t2_2 + alpha_2 * t2_1 + t2_0
+    grad_2 = 2 * alpha_2 * t2_2 + t2_1
+    hess_2 = 2 * t2_2
+    if hess_2 <= 0.0:
+        hess_2 = EPS
+
+    if tid == 0:
+        constraint_state.ls_it[i_b] = constraint_state.ls_it[i_b] + 3
+
+    costs = qd.Vector([cost_0, cost_1, cost_2])
+    grads = qd.Vector([grad_0, grad_1, grad_2])
+    hess = qd.Vector([hess_0, hess_1, hess_2])
+    return costs, grads, hess
+
+
+@qd.func
+def func_linesearch_refine_coop(
+    i_b,
+    tid,
+    p1_alpha,
+    p1_cost,
+    p1_deriv_0,
+    p1_deriv_1,
+    p0_cost,
+    gtol,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Cooperative (32-lane subgroup) version of func_linesearch_refine.
+
+    All 32 lanes execute the same control flow. Reductions inside
+    ``func_ls_point_fn_*_opt_coop`` ensure ``p1_deriv_0`` etc. are uniform
+    across the warp, so all branches are uniform too.
+    """
+    res_alpha = gs.qd_float(0.0)
+    ls_result = 0
+    done = False
+
+    direction = (p1_deriv_0 < 0) * 2 - 1
+    p2update = 0
+    p2_alpha = p1_alpha
+    p2_cost = p1_cost
+    p2_deriv_0 = p1_deriv_0
+    p2_deriv_1 = p1_deriv_1
+    while p1_deriv_0 * direction <= -gtol and constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
+        p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1 = p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1
+        p2update = 1
+        p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt_coop(
+            i_b,
+            tid,
+            p1_alpha - p1_deriv_0 / p1_deriv_1,
+            constraint_state,
+            rigid_global_info,
+            static_rigid_sim_config,
+        )
+        if qd.abs(p1_deriv_0) < gtol:
+            res_alpha = p1_alpha
+            done = True
+            break
+    if not done:
+        if constraint_state.ls_it[i_b] >= rigid_global_info.ls_iterations[None]:
+            ls_result = 3
+            res_alpha = p1_alpha
+            done = True
+        if not p2update and not done:
+            ls_result = 6
+            res_alpha = p1_alpha
+            done = True
+        if not done:
+            alpha_0 = p1_alpha - p1_deriv_0 / p1_deriv_1
+            alpha_1 = p1_alpha
+            alpha_2 = (p1_alpha + p2_alpha) * 0.5
+            while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
+                costs, grads, hess = func_ls_point_fn_3alphas_opt_coop(
+                    i_b, tid, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info, static_rigid_sim_config
+                )
+                alphas = qd.Vector([alpha_0, alpha_1, alpha_2])
+                p1_next = alpha_0
+                p2_next = alpha_1
+                best_a = gs.qd_float(0.0)
+                best_c = gs.qd_float(0.0)
+                best_found = False
+                for i in qd.static(range(3)):
+                    if qd.abs(grads[i]) < gtol and (not best_found or costs[i] < best_c):
+                        best_a = alphas[i]
+                        best_c = costs[i]
+                        best_found = True
+                if best_found:
+                    res_alpha = best_a
+                    done = True
+                else:
+                    b1, p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1, p1_next = update_bracket_no_eval_local(
+                        p1_alpha,
+                        p1_cost,
+                        p1_deriv_0,
+                        p1_deriv_1,
+                        alphas,
+                        costs,
+                        grads,
+                        hess,
+                    )
+                    b2, p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1, p2_next = update_bracket_no_eval_local(
+                        p2_alpha,
+                        p2_cost,
+                        p2_deriv_0,
+                        p2_deriv_1,
+                        alphas,
+                        costs,
+                        grads,
+                        hess,
+                    )
+                    if b1 == 0 and b2 == 0:
+                        if costs[2] < p0_cost:
+                            ls_result = 0
+                        else:
+                            ls_result = 7
+                        res_alpha = alpha_2
+                        done = True
+                if done:
+                    break
+                alpha_0 = p1_next
+                alpha_1 = p2_next
+                alpha_2 = (p1_alpha + p2_alpha) * 0.5
+            if not done:
+                if p1_cost <= p2_cost and p1_cost < p0_cost:
+                    ls_result = 4
+                    res_alpha = p1_alpha
+                elif p2_cost <= p1_cost and p2_cost < p0_cost:
+                    ls_result = 4
+                    res_alpha = p2_alpha
+                else:
+                    ls_result = 5
+                    res_alpha = 0.0
+    return res_alpha, ls_result
+
+
 @qd.func
 def update_bracket_no_eval_local(
     p_alpha,

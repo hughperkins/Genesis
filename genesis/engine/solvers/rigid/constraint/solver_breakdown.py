@@ -330,32 +330,40 @@ def _func_parallel_linesearch_eval(
             gtol = constraint_state.ls_gtol[i_b]
             alpha_newton = constraint_state.ls_alpha_newton[i_b]
 
-            # === Serial linesearch refinement (thread 0) ===
-            # Gated: skip when the Newton step is zero (degenerate hessian)
-            if alpha_newton > 0.0 and tid == 0:
-                constraint_state.ls_alpha[i_b] = 0.0
-                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = solver.func_ls_point_fn_opt(
+            # === Cooperative linesearch refinement (32 lanes) ===
+            # Gated: skip when the Newton step is zero (degenerate hessian).
+            # All 32 lanes execute the refinement; the inner constraint loop
+            # is strided by 32 and accumulators are reduced via
+            # subgroup.reduce_all_add. Scalar writes to ls_alpha are still
+            # gated on tid == 0.
+            if alpha_newton > 0.0:
+                if tid == 0:
+                    constraint_state.ls_alpha[i_b] = 0.0
+                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = solver.func_ls_point_fn_opt_coop(
                     i_b,
+                    tid,
                     alpha_newton,
                     constraint_state,
                     rigid_global_info,
                     static_rigid_sim_config,
                 )
                 if p0_cost < p1_cost:
-                    p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = solver.func_ls_point_fn_opt(
+                    p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = solver.func_ls_point_fn_opt_coop(
                         i_b,
+                        tid,
                         gs.qd_float(0.0),
                         constraint_state,
                         rigid_global_info,
                         static_rigid_sim_config,
                     )
 
-                if p1_cost < p0_cost:
+                if p1_cost < p0_cost and tid == 0:
                     constraint_state.ls_alpha[i_b] = p1_alpha
 
                 if qd.abs(p1_deriv_0) > gtol:
-                    res_alpha, ls_result = solver.func_linesearch_refine(
+                    res_alpha, ls_result = solver.func_linesearch_refine_coop(
                         i_b,
+                        tid,
                         p1_alpha,
                         p1_cost,
                         p1_deriv_0,
@@ -368,7 +376,7 @@ def _func_parallel_linesearch_eval(
                     )
                     # Skip status 7 (brackets stalled, midpoint non-improving) to preserve
                     # the validated p1_alpha already written above
-                    if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
+                    if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7 and tid == 0:
                         constraint_state.ls_alpha[i_b] = res_alpha
             qd.simt.block.sync()
         else:
