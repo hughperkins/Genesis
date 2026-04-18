@@ -2452,7 +2452,8 @@ def func_ls_point_fn_opt_coop(
         quad_total_1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
         quad_total_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
 
-    for i_c in range(ne + tid, nef, 32):
+    i_c = ne + tid
+    while i_c < nef:
         Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
         jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
         D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
@@ -2472,8 +2473,10 @@ def func_ls_point_fn_opt_coop(
         quad_total_0 = quad_total_0 + qf_0
         quad_total_1 = quad_total_1 + qf_1
         quad_total_2 = quad_total_2 + qf_2
+        i_c = i_c + 32
 
-    for i_c in range(nef + tid, n_con, 32):
+    i_c = nef + tid
+    while i_c < n_con:
         Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
         jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
         D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
@@ -2485,6 +2488,7 @@ def func_ls_point_fn_opt_coop(
         quad_total_0 = quad_total_0 + qf_0 * active
         quad_total_1 = quad_total_1 + qf_1 * active
         quad_total_2 = quad_total_2 + qf_2 * active
+        i_c = i_c + 32
 
     quad_total_0 = qd.simt.subgroup.reduce_all_add(quad_total_0, 5)
     quad_total_1 = qd.simt.subgroup.reduce_all_add(quad_total_1, 5)
@@ -2529,7 +2533,8 @@ def func_ls_point_fn_3alphas_opt_coop(
     t1_0, t1_1, t1_2 = base_0, base_1, base_2
     t2_0, t2_1, t2_2 = base_0, base_1, base_2
 
-    for i_c in range(ne + tid, nef, 32):
+    i_c = ne + tid
+    while i_c < nef:
         Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
         jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
         D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
@@ -2575,8 +2580,10 @@ def func_ls_point_fn_3alphas_opt_coop(
         t2_0 = t2_0 + a2_qf_0
         t2_1 = t2_1 + a2_qf_1
         t2_2 = t2_2 + a2_qf_2
+        i_c = i_c + 32
 
-    for i_c in range(nef + tid, n_con, 32):
+    i_c = nef + tid
+    while i_c < n_con:
         Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
         jv_c = cs_layout.get_jv(constraint_state, static_rigid_sim_config, i_c, i_b)
         D = cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
@@ -2599,6 +2606,7 @@ def func_ls_point_fn_3alphas_opt_coop(
         t2_0 = t2_0 + qf_0 * act2
         t2_1 = t2_1 + qf_1 * act2
         t2_2 = t2_2 + qf_2 * act2
+        i_c = i_c + 32
 
     t0_0 = qd.simt.subgroup.reduce_all_add(t0_0, 5)
     t0_1 = qd.simt.subgroup.reduce_all_add(t0_1, 5)
