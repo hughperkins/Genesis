@@ -318,6 +318,14 @@ def get_constraint_state(constraint_solver, solver):
     _B = solver._B
     len_constraints_ = constraint_solver.len_constraints_
 
+    # Tier-1 constraint-indexed fields. Layout is selected by the static config flag;
+    # accessors in `engine/solvers/rigid/constraint/layout.py` use the same flag to
+    # pick the index order at trace time. See perso_hugh/doc/linesearch_shuffle.md.
+    if solver._static_rigid_sim_config.constraint_layout_transposed:
+        con_shape = (_B, len_constraints_)
+    else:
+        con_shape = (len_constraints_, _B)
+
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
@@ -377,15 +385,15 @@ def get_constraint_state(constraint_solver, solver):
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
         efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
-        active=V(dtype=gs.qd_bool, shape=(len_constraints_, _B)),
+        active=V(dtype=gs.qd_bool, shape=con_shape),
         prev_active=V(dtype=gs.qd_bool, shape=(len_constraints_, _B)),
-        diag=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
+        diag=V(dtype=gs.qd_float, shape=con_shape),
         aref=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        Jaref=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        efc_frictionloss=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
+        Jaref=V(dtype=gs.qd_float, shape=con_shape),
+        efc_frictionloss=V(dtype=gs.qd_float, shape=con_shape),
         efc_force=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        efc_D=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        jv=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
+        efc_D=V(dtype=gs.qd_float, shape=con_shape),
+        jv=V(dtype=gs.qd_float, shape=con_shape),
         jac=V(dtype=gs.qd_float, shape=jac_shape),
         jac_relevant_dofs=V(dtype=gs.qd_int, shape=jac_relevant_dofs_shape),
         jac_n_relevant_dofs=V(dtype=gs.qd_int, shape=jac_n_relevant_dofs_shape),
@@ -2044,6 +2052,12 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # When True, constraint-state arrays (Jaref / jv / efc_D / efc_frictionloss / diag / active)
+    # are allocated as (_B, len_constraints_) instead of (len_constraints_, _B). This unlocks
+    # coalesced cross-lane reads for subgroup-cooperative refinement in the linesearch and
+    # contiguous per-thread access on CPU. The flag is consumed via qd.static(...) inside the
+    # @qd.func accessors in `engine/solvers/rigid/constraint/layout.py`, so it is fastcache-safe.
+    constraint_layout_transposed: bool = False
     tiled_n_dofs_per_entity: int = -1
     tiled_n_dofs: int = -1
     max_n_links_per_entity: int = -1
