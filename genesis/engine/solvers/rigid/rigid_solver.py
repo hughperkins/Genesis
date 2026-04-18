@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 from typing import TYPE_CHECKING, Literal
 
@@ -418,6 +419,7 @@ class RigidSolver(KinematicSolver):
             solver_type=self._options.constraint_solver,
             broadphase_traversal=self._resolve_broadphase_traversal(),
             parallel_init=self._should_use_parallel_init(),
+            constraint_layout_transposed=os.environ.get("GS_CONSTRAINT_LAYOUT_TRANSPOSED", "0") == "1",
         )
 
         # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
