@@ -14,7 +14,7 @@ from genesis.engine.solvers.rigid.constraint import solver
 LS_PARALLEL_K = 32
 
 # Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
-_P0_BLOCK = 32
+_P0_BLOCK = 64
 _JV_BLOCK = 32
 
 # Maximum allowed alpha (prevents divergence from degenerate steps).
