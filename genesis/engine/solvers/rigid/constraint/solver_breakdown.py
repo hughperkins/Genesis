@@ -588,6 +588,7 @@ def _func_patch_hessian_delta(
                     sd = -sd
                 signed_D_sh[idx_l] = sd
                 idx_l = idx_l + BLOCK_DIM
+            qd.simt.block.sync()
 
             j = tid
             while j < n_changed * n_dofs:
