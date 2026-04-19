@@ -120,14 +120,6 @@ def _func_parallel_linesearch_p0(
         tid = i_flat % _T
         i_b = i_flat // _T
 
-        # 6 shared arrays for parallel reductions (reused across phases)
-        sh_snorm_sq = qd.simt.block.SharedArray((_T,), gs.qd_float)
-        sh_qg_grad = qd.simt.block.SharedArray((_T,), gs.qd_float)
-        sh_qg_hess = qd.simt.block.SharedArray((_T,), gs.qd_float)
-        sh_p0_cost = qd.simt.block.SharedArray((_T,), gs.qd_float)
-        sh_constraint_grad = qd.simt.block.SharedArray((_T,), gs.qd_float)
-        sh_constraint_hess = qd.simt.block.SharedArray((_T,), gs.qd_float)
-
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             n_dofs = constraint_state.search.shape[0]
             n_con = constraint_state.n_constraints[i_b]
@@ -172,24 +164,14 @@ def _func_parallel_linesearch_p0(
                 local_qg_hess += 0.5 * s * constraint_state.mv[i_d, i_b]
                 i_d += _T
 
-            sh_snorm_sq[tid] = local_snorm_sq
-            sh_qg_grad[tid] = local_qg_grad
-            sh_qg_hess[tid] = local_qg_hess
+            # Subgroup all-reduce: snorm is needed by all lanes (EPS check + Phase 2 scale).
+            # subgroupAdd returns the same value to every lane in the subgroup (block_dim=_T=32 == warp size on the
+            # target NVIDIA GPUs), so this replaces the previous shared-memory tree reduction.
+            local_snorm_sq = qd.simt.subgroup.reduce_add(local_snorm_sq)
+            local_qg_grad = qd.simt.subgroup.reduce_add(local_qg_grad)
+            local_qg_hess = qd.simt.subgroup.reduce_add(local_qg_hess)
 
-            qd.simt.block.sync()
-
-            # Tree reduction for 3 accumulators
-            stride = _T // 2
-            while stride > 0:
-                if tid < stride:
-                    sh_snorm_sq[tid] += sh_snorm_sq[tid + stride]
-                    sh_qg_grad[tid] += sh_qg_grad[tid + stride]
-                    sh_qg_hess[tid] += sh_qg_hess[tid + stride]
-                qd.simt.block.sync()
-                stride //= 2
-
-            # All threads read the reduced snorm
-            snorm = qd.sqrt(sh_snorm_sq[0])
+            snorm = qd.sqrt(local_snorm_sq)
 
             if snorm < rigid_global_info.EPS[None]:
                 # Converged — only thread 0 writes
@@ -201,8 +183,8 @@ def _func_parallel_linesearch_p0(
                 # Thread 0 writes quad_gauss to global memory
                 if tid == 0:
                     constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
-                    constraint_state.quad_gauss[1, i_b] = sh_qg_grad[0]
-                    constraint_state.quad_gauss[2, i_b] = sh_qg_hess[0]
+                    constraint_state.quad_gauss[1, i_b] = local_qg_grad
+                    constraint_state.quad_gauss[2, i_b] = local_qg_hess
 
                 # === Phase 2: Constraint cost, parallel over n_constraints ===
                 ne = constraint_state.n_constraints_equality[i_b]
@@ -256,42 +238,27 @@ def _func_parallel_linesearch_p0(
 
                     i_c += _T
 
-                # Reuse shared arrays for Phase 2 reduction
-                sh_snorm_sq[tid] = local_eq_cost
-                sh_qg_grad[tid] = local_eq_grad
-                sh_qg_hess[tid] = local_eq_hess
-                sh_p0_cost[tid] = local_p0_cost
-                sh_constraint_grad[tid] = local_constraint_grad
-                sh_constraint_hess[tid] = local_constraint_hess
-
-                qd.simt.block.sync()
-
-                # Tree reduction for 6 accumulators
-                stride = _T // 2
-                while stride > 0:
-                    if tid < stride:
-                        sh_snorm_sq[tid] += sh_snorm_sq[tid + stride]
-                        sh_qg_grad[tid] += sh_qg_grad[tid + stride]
-                        sh_qg_hess[tid] += sh_qg_hess[tid + stride]
-                        sh_p0_cost[tid] += sh_p0_cost[tid + stride]
-                        sh_constraint_grad[tid] += sh_constraint_grad[tid + stride]
-                        sh_constraint_hess[tid] += sh_constraint_hess[tid + stride]
-                    qd.simt.block.sync()
-                    stride //= 2
+                # Subgroup all-reduce for the 6 Phase-2 accumulators (replaces shared-memory tree reduction).
+                local_eq_cost = qd.simt.subgroup.reduce_add(local_eq_cost)
+                local_eq_grad = qd.simt.subgroup.reduce_add(local_eq_grad)
+                local_eq_hess = qd.simt.subgroup.reduce_add(local_eq_hess)
+                local_p0_cost = qd.simt.subgroup.reduce_add(local_p0_cost)
+                local_constraint_grad = qd.simt.subgroup.reduce_add(local_constraint_grad)
+                local_constraint_hess = qd.simt.subgroup.reduce_add(local_constraint_hess)
 
                 if tid == 0:
-                    constraint_state.eq_sum[0, i_b] = sh_snorm_sq[0]
-                    constraint_state.eq_sum[1, i_b] = sh_qg_grad[0]
-                    constraint_state.eq_sum[2, i_b] = sh_qg_hess[0]
+                    constraint_state.eq_sum[0, i_b] = local_eq_cost
+                    constraint_state.eq_sum[1, i_b] = local_eq_grad
+                    constraint_state.eq_sum[2, i_b] = local_eq_hess
                     constraint_state.ls_it[i_b] = 1
-                    constraint_state.ls_p0_cost[i_b] = constraint_state.gauss[i_b] + sh_p0_cost[0]
+                    constraint_state.ls_p0_cost[i_b] = constraint_state.gauss[i_b] + local_p0_cost
                     # Initialize best alpha, search range, and best-cost tracker for parallel linesearch
                     constraint_state.ls_alpha[i_b] = 0.0  # default: no step
 
                     # Newton step estimate from the full DOF + constraint gradient/hessian
-                    total_hess = 2.0 * (constraint_state.quad_gauss[2, i_b] + sh_constraint_hess[0])
+                    total_hess = 2.0 * (constraint_state.quad_gauss[2, i_b] + local_constraint_hess)
                     if total_hess > 0.0:
-                        total_grad = constraint_state.quad_gauss[1, i_b] + sh_constraint_grad[0]
+                        total_grad = constraint_state.quad_gauss[1, i_b] + local_constraint_grad
                         constraint_state.ls_alpha_newton[i_b] = qd.abs(total_grad / total_hess)
                     else:
                         constraint_state.ls_alpha_newton[i_b] = 0.0
