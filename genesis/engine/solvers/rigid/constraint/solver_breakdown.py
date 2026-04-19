@@ -481,45 +481,89 @@ def _func_update_constraint_forces(
     len_constraints = constraint_state.active.shape[0]
     _B = constraint_state.grad.shape[1]
 
+    # Iterate so adjacent lanes have adjacent indices in the coalescing dimension
+    # of the active layout:
+    #   - layout False  ([i_c, i_b]): inner dim is i_b → ndrange(len_constraints, _B)
+    #   - layout True   ([i_b, i_c]): inner dim is i_c → ndrange(_B, len_constraints)
     qd.loop_config(name="update_constraint_forces")
-    for i_c, i_b in qd.ndrange(len_constraints, _B):
-        if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
-            ne = constraint_state.n_constraints_equality[i_b]
-            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        for i_b, i_c in qd.ndrange(_B, len_constraints):
+            if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
 
-            if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-                constraint_state.prev_active[i_c, i_b] = cs_layout.get_active(
-                    constraint_state, static_rigid_sim_config, i_c, i_b
+                if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+                    constraint_state.prev_active[i_c, i_b] = cs_layout.get_active(
+                        constraint_state, static_rigid_sim_config, i_c, i_b
+                    )
+
+                cs_layout.set_active(constraint_state, static_rigid_sim_config, i_c, i_b, True)
+                floss_force = gs.qd_float(0.0)
+
+                if ne <= i_c and i_c < nef:
+                    f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    rf = r * f
+                    Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    linear_neg = Jaref_c <= -rf
+                    linear_pos = Jaref_c >= rf
+                    cs_layout.set_active(
+                        constraint_state, static_rigid_sim_config, i_c, i_b, not (linear_neg or linear_pos)
+                    )
+                    floss_force = linear_neg * f + linear_pos * -f
+                elif nef <= i_c:
+                    cs_layout.set_active(
+                        constraint_state,
+                        static_rigid_sim_config,
+                        i_c,
+                        i_b,
+                        cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b) < 0,
+                    )
+
+                constraint_state.efc_force[i_c, i_b] = floss_force + (
+                    -cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
                 )
+    else:
+        for i_c, i_b in qd.ndrange(len_constraints, _B):
+            if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
 
-            cs_layout.set_active(constraint_state, static_rigid_sim_config, i_c, i_b, True)
-            floss_force = gs.qd_float(0.0)
+                if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+                    constraint_state.prev_active[i_c, i_b] = cs_layout.get_active(
+                        constraint_state, static_rigid_sim_config, i_c, i_b
+                    )
 
-            if ne <= i_c and i_c < nef:
-                f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
-                r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
-                rf = r * f
-                Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
-                linear_neg = Jaref_c <= -rf
-                linear_pos = Jaref_c >= rf
-                cs_layout.set_active(
-                    constraint_state, static_rigid_sim_config, i_c, i_b, not (linear_neg or linear_pos)
+                cs_layout.set_active(constraint_state, static_rigid_sim_config, i_c, i_b, True)
+                floss_force = gs.qd_float(0.0)
+
+                if ne <= i_c and i_c < nef:
+                    f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    rf = r * f
+                    Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    linear_neg = Jaref_c <= -rf
+                    linear_pos = Jaref_c >= rf
+                    cs_layout.set_active(
+                        constraint_state, static_rigid_sim_config, i_c, i_b, not (linear_neg or linear_pos)
+                    )
+                    floss_force = linear_neg * f + linear_pos * -f
+                elif nef <= i_c:
+                    cs_layout.set_active(
+                        constraint_state,
+                        static_rigid_sim_config,
+                        i_c,
+                        i_b,
+                        cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b) < 0,
+                    )
+
+                constraint_state.efc_force[i_c, i_b] = floss_force + (
+                    -cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
                 )
-                floss_force = linear_neg * f + linear_pos * -f
-            elif nef <= i_c:
-                cs_layout.set_active(
-                    constraint_state,
-                    static_rigid_sim_config,
-                    i_c,
-                    i_b,
-                    cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b) < 0,
-                )
-
-            constraint_state.efc_force[i_c, i_b] = floss_force + (
-                -cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
-                * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
-                * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
-            )
 
 
 @qd.func
@@ -547,52 +591,118 @@ def _func_update_constraint_cost(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute gauss and cost (reductions over dofs and constraints). One thread per env."""
+    """Compute gauss and cost (reductions over dofs and constraints).
+
+    Two paths picked at compile time on constraint_layout_transposed:
+      - True:  warp-per-env cooperative path. 32 lanes stride through dofs and
+               constraints; final reduction via subgroup.reduce_all_add. Reads
+               are coalesced under [_B, len_constraints_] layout.
+      - False: legacy 1-thread-per-env serial path. Bit-identical to baseline.
+    """
     _B = constraint_state.grad.shape[1]
+    _K = qd.static(32)
 
-    qd.loop_config(name="update_constraint_cost", block_dim=32)
-    for i_b in range(_B):
-        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            n_dofs = constraint_state.qfrc_constraint.shape[0]
-            ne = constraint_state.n_constraints_equality[i_b]
-            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
-            n_con = constraint_state.n_constraints[i_b]
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        qd.loop_config(name="update_constraint_cost", block_dim=_K)
+        for i_flat in range(_B * _K):
+            tid = i_flat % _K
+            i_b = i_flat // _K
+            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                n_dofs = constraint_state.qfrc_constraint.shape[0]
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+                n_con = constraint_state.n_constraints[i_b]
 
-            constraint_state.prev_cost[i_b] = constraint_state.cost[i_b]
+                if tid == 0:
+                    constraint_state.prev_cost[i_b] = constraint_state.cost[i_b]
 
-            cost_i = gs.qd_float(0.0)
-            gauss_i = gs.qd_float(0.0)
+                cost_i = gs.qd_float(0.0)
+                gauss_i = gs.qd_float(0.0)
 
-            # Gauss cost from dofs
-            for i_d in range(n_dofs):
-                v = (
-                    0.5
-                    * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
-                    * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
-                )
-                gauss_i += v
-                cost_i += v
-
-            # Constraint cost: quadratic + friction linear
-            for i_c in range(n_con):
-                Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
-                cost_i += 0.5 * (
-                    Jaref_c ** 2
-                    * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
-                    * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
-                )
-                if ne <= i_c and i_c < nef:
-                    f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
-                    r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
-                    rf = r * f
-                    linear_neg = Jaref_c <= -rf
-                    linear_pos = Jaref_c >= rf
-                    cost_i += linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (
-                        -0.5 * rf + Jaref_c
+                # Gauss cost from dofs (lane-strided)
+                i_d = tid
+                while i_d < n_dofs:
+                    v = (
+                        0.5
+                        * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
+                        * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
                     )
+                    gauss_i += v
+                    cost_i += v
+                    i_d = i_d + _K
 
-            constraint_state.gauss[i_b] = gauss_i
-            constraint_state.cost[i_b] = cost_i
+                # Constraint cost: quadratic + friction linear (lane-strided over constraints)
+                i_c = tid
+                while i_c < n_con:
+                    Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    cost_i += 0.5 * (
+                        Jaref_c ** 2
+                        * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    )
+                    if ne <= i_c and i_c < nef:
+                        f = cs_layout.get_efc_frictionloss(
+                            constraint_state, static_rigid_sim_config, i_c, i_b
+                        )
+                        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        rf = r * f
+                        linear_neg = Jaref_c <= -rf
+                        linear_pos = Jaref_c >= rf
+                        cost_i += linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (
+                            -0.5 * rf + Jaref_c
+                        )
+                    i_c = i_c + _K
+
+                cost_i = qd.simt.subgroup.reduce_all_add(cost_i, 5)
+                gauss_i = qd.simt.subgroup.reduce_all_add(gauss_i, 5)
+
+                if tid == 0:
+                    constraint_state.gauss[i_b] = gauss_i
+                    constraint_state.cost[i_b] = cost_i
+    else:
+        qd.loop_config(name="update_constraint_cost", block_dim=32)
+        for i_b in range(_B):
+            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                n_dofs = constraint_state.qfrc_constraint.shape[0]
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+                n_con = constraint_state.n_constraints[i_b]
+
+                constraint_state.prev_cost[i_b] = constraint_state.cost[i_b]
+
+                cost_i = gs.qd_float(0.0)
+                gauss_i = gs.qd_float(0.0)
+
+                # Gauss cost from dofs
+                for i_d in range(n_dofs):
+                    v = (
+                        0.5
+                        * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
+                        * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
+                    )
+                    gauss_i += v
+                    cost_i += v
+
+                # Constraint cost: quadratic + friction linear
+                for i_c in range(n_con):
+                    Jaref_c = cs_layout.get_Jaref(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    cost_i += 0.5 * (
+                        Jaref_c ** 2
+                        * cs_layout.get_efc_D(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        * cs_layout.get_active(constraint_state, static_rigid_sim_config, i_c, i_b)
+                    )
+                    if ne <= i_c and i_c < nef:
+                        f = cs_layout.get_efc_frictionloss(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        r = cs_layout.get_diag(constraint_state, static_rigid_sim_config, i_c, i_b)
+                        rf = r * f
+                        linear_neg = Jaref_c <= -rf
+                        linear_pos = Jaref_c >= rf
+                        cost_i += linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (
+                            -0.5 * rf + Jaref_c
+                        )
+
+                constraint_state.gauss[i_b] = gauss_i
+                constraint_state.cost[i_b] = cost_i
 
 
 @qd.func
