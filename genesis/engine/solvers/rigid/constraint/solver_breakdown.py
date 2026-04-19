@@ -573,7 +573,7 @@ def _func_patch_hessian_delta(
         signed_D_sh = qd.simt.block.SharedArray((MAX_CHANGED,), gs.qd_float)
         jac_sh = qd.simt.block.SharedArray((MAX_CHANGED_JAC, MAX_DOFS), gs.qd_float)
 
-        if n_changed <= MAX_CHANGED_JAC:
+        if n_changed <= MAX_CHANGED_JAC and n_dofs <= MAX_DOFS:
             # E5 path: cache (i_c, signed_D) AND the full jac[i_c, :, i_b] row for each
             # changed constraint.  All 128 threads of the block read the SAME (i_c, i_b)
             # but DIFFERENT i_d, so the original kernel issues 128 fully-uncoalesced
