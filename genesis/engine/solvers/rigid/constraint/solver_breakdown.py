@@ -546,7 +546,9 @@ def _func_patch_hessian_delta(
     n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
     BLOCK_DIM = qd.static(128)
-    MAX_CHANGED = qd.static(constraint_state.incr_changed_idx.shape[0])
+    # Static upper bound on per-env changed-constraint count for the shared-mem cache.
+    # If the actual n_changed at runtime exceeds this, fall back to the no-cache path.
+    MAX_CHANGED = qd.static(128)
 
     qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
     for i in range(_B * BLOCK_DIM):
@@ -563,38 +565,63 @@ def _func_patch_hessian_delta(
         if n_changed == 0:
             continue
 
-        # Cooperative pre-load of (i_c, signed_D) for each changed constraint.
-        # Shape upper-bounded by incr_changed_idx.shape[0] == len_constraints_.
         ic_sh = qd.simt.block.SharedArray((MAX_CHANGED,), gs.qd_int)
         signed_D_sh = qd.simt.block.SharedArray((MAX_CHANGED,), gs.qd_float)
 
-        idx_l = tid
-        while idx_l < n_changed:
-            ic = constraint_state.incr_changed_idx[idx_l, i_b]
-            ic_sh[idx_l] = ic
-            sd = constraint_state.efc_D[ic, i_b]
-            if not constraint_state.active[ic, i_b]:
-                sd = -sd
-            signed_D_sh[idx_l] = sd
-            idx_l = idx_l + BLOCK_DIM
-        qd.simt.block.sync()
+        if n_changed <= MAX_CHANGED:
+            # Cooperative pre-load of (i_c, signed_D) for each changed constraint.
+            # Saves redundant per-(i_d1,i_d2) global reads and folds the active sign
+            # into a precomputed signed_D, removing the per-iteration branch.
+            idx_l = tid
+            while idx_l < n_changed:
+                ic = constraint_state.incr_changed_idx[idx_l, i_b]
+                ic_sh[idx_l] = ic
+                sd = constraint_state.efc_D[ic, i_b]
+                if not constraint_state.active[ic, i_b]:
+                    sd = -sd
+                signed_D_sh[idx_l] = sd
+                idx_l = idx_l + BLOCK_DIM
+            qd.simt.block.sync()
 
-        elem = tid
-        while elem < n_lower_tri:
-            i_d1, i_d2 = solver.linear_to_lower_tri(elem)
+            elem = tid
+            while elem < n_lower_tri:
+                i_d1, i_d2 = solver.linear_to_lower_tri(elem)
 
-            delta = gs.qd_float(0.0)
-            for idx in range(n_changed):
-                i_c = ic_sh[idx]
-                Ji = constraint_state.jac[i_c, i_d1, i_b]
-                if Ji != 0.0:
-                    Jj = constraint_state.jac[i_c, i_d2, i_b]
-                    if Jj != 0.0:
-                        delta = delta + signed_D_sh[idx] * Ji * Jj
+                delta = gs.qd_float(0.0)
+                for idx in range(n_changed):
+                    i_c = ic_sh[idx]
+                    Ji = constraint_state.jac[i_c, i_d1, i_b]
+                    if Ji != 0.0:
+                        Jj = constraint_state.jac[i_c, i_d2, i_b]
+                        if Jj != 0.0:
+                            delta = delta + signed_D_sh[idx] * Ji * Jj
 
-            if delta != 0.0:
-                constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
-            elem = elem + BLOCK_DIM
+                if delta != 0.0:
+                    constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
+                elem = elem + BLOCK_DIM
+        else:
+            # Fallback: original per-iteration global reads (only triggered if a
+            # workload has more than MAX_CHANGED simultaneous changes per env).
+            elem = tid
+            while elem < n_lower_tri:
+                i_d1, i_d2 = solver.linear_to_lower_tri(elem)
+
+                delta = gs.qd_float(0.0)
+                for idx in range(n_changed):
+                    i_c = constraint_state.incr_changed_idx[idx, i_b]
+                    Ji = constraint_state.jac[i_c, i_d1, i_b]
+                    if Ji != 0.0:
+                        Jj = constraint_state.jac[i_c, i_d2, i_b]
+                        if Jj != 0.0:
+                            D = constraint_state.efc_D[i_c, i_b]
+                            if constraint_state.active[i_c, i_b]:
+                                delta = delta + D * Ji * Jj
+                            else:
+                                delta = delta - D * Ji * Jj
+
+                if delta != 0.0:
+                    constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
+                elem = elem + BLOCK_DIM
 
 
 
