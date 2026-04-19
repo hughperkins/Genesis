@@ -1029,7 +1029,7 @@ def test_draw_debug(renderer, show_viewer):
     poses = gu.trans_to_T(np.zeros((2, 2, 3)))
     for i in range(2):
         poses[:, i] = gu.trans_quat_to_T(2.0 * (np.random.rand(2, 3) - 0.5), np.random.rand(2, 4))
-        scene.visualizer.context.update_debug_objects([frame_obj, sphere_obj], poses)
+        scene.update_debug_objects([frame_obj, sphere_obj], poses)
         scene.visualizer.update()
         rgb_array, *_ = cam.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=False)
         rgb_array_flat = rgb_array.reshape((-1, 3)).astype(np.int32)
@@ -1156,6 +1156,75 @@ def test_sensors_draw_debug(n_envs, renderer_type, renderer, png_snapshot):
         if renderer == "Apple Software Renderer":
             pytest.xfail("Tile ground colors are altered on Apple Software Renderer.")
 
+    assert rgb_array_to_png_bytes(rgb_arr) == png_snapshot
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
+def test_draw_debug_frustum_and_trajectory(n_envs, renderer_type, renderer, png_snapshot):
+    """Test that draw_debug_frustum and draw_debug_trajectory render visible content in the viewer."""
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.5, 0.0, 2.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+            # Force screen-independent low-quality resolution when running unit tests for consistency
+            res=(480, 320),
+            # Enable running in background thread if supported by the platform
+            run_in_thread=(sys.platform == "linux"),
+        ),
+        vis_options=gs.options.VisOptions(
+            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
+            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
+        ),
+        profiling_options=gs.options.ProfilingOptions(
+            show_FPS=False,
+        ),
+        renderer=renderer,
+        show_viewer=True,
+    )
+
+    # Add a box inside the sensor camera frustum
+    scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0.4, 0.0, 0.7),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(color=(0.2, 0.6, 1.0, 1.0)),
+    )
+
+    sensor_cam = scene.add_camera(
+        res=(640, 480),
+        pos=(0.0, 0.0, 0.9),
+        lookat=(0.8, 0.0, 0.5),
+        up=(0.0, 1.0, 0.0),
+        fov=30,
+        near=0.1,
+        far=0.7,
+        GUI=False,
+    )
+
+    scene.build(n_envs=n_envs)
+
+    scene.draw_debug_frustum(sensor_cam, color=(0.0, 1.0, 0.0, 0.3))
+
+    t = np.linspace(0, 2 * np.pi, 50)
+    positions = np.column_stack([0.8 * np.cos(t), 0.8 * np.sin(t), np.full_like(t, 0.5)])
+    scene.draw_debug_trajectory(positions, radius=0.02, color=(1.0, 0.5, 0.0, 1.0))
+
+    pyrender_viewer = scene.visualizer.viewer._pyrender_viewer
+    assert pyrender_viewer.is_active
+
+    scene.visualizer.viewer.update(auto_refresh=True, force=True)
+    rgb_arr, *_ = pyrender_viewer.render_offscreen(
+        pyrender_viewer._camera_node, pyrender_viewer._renderer, rgb=True, depth=False, seg=False, normal=False
+    )
+
+    # Apple Software Rendering has issues rendering sharp edges
+    if sys.platform == "darwin" and scene.visualizer.is_software:
+        png_snapshot.extension._blurred_kernel_size = 3
     assert rgb_array_to_png_bytes(rgb_arr) == png_snapshot
 
 

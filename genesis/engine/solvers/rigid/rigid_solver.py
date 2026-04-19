@@ -1,4 +1,5 @@
 import math
+import sys
 from typing import TYPE_CHECKING, Literal
 
 import quadrants as qd
@@ -336,6 +337,10 @@ class RigidSolver(KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
         self.n_candidate_equalities_ = max(1, self.n_equalities + self._options.max_dynamic_constraints)
 
+        # Resolve precision-dependent tolerance default
+        if self._options.tolerance is None:
+            self._options.tolerance = 1e-5 if gs.qd_float == qd.f32 else 1e-8
+
         super().build()
 
         self._init_mass_mat()
@@ -370,12 +375,30 @@ class RigidSolver(KinematicSolver):
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
 
-    def _build_static_config(self):
-        prefer_parallel_linesearch = self._options.prefer_parallel_linesearch
-        # FIXME: Enable gs.metal once Quadrants supports shared memory atomics on Apple Metal.
-        if gs.backend in (gs.cpu, gs.metal) or self._enable_mujoco_compatibility or self.sim.options.requires_grad:
-            prefer_parallel_linesearch = False
+    def _should_use_parallel_init(self):
+        """Use parallel init (ndrange over constraints+envs) when envs alone don't saturate the GPU.
 
+        Uses hardware-derived GPU core count to determine saturation threshold, following the same
+        multi-backend pattern as collider.py (line 219).
+        """
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            # NVIDIA: 128 CUDA cores per SM. AMD/ROCm: 64 stream processors per CU.
+            cores_per_unit = 64 if torch.version.hip else 128
+            gpu_cores = gpu_props.multi_processor_count * cores_per_unit
+        elif gs.backend == gs.metal:
+            # Upper-bound estimate for Apple Silicon: 40 GPU cores × 128 ALUs
+            gpu_cores = 5120
+        else:
+            # Fallback for other GPU backends (e.g. Vulkan)
+            gpu_cores = 16384
+        return self.n_envs <= gpu_cores
+
+    def _build_static_config(self):
         static_rigid_sim_config = dict(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -393,9 +416,13 @@ class RigidSolver(KinematicSolver):
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
-            prefer_parallel_linesearch={None: -1, False: 0, True: 1}[prefer_parallel_linesearch],
             broadphase_traversal=self._resolve_broadphase_traversal(),
+            parallel_init=self._should_use_parallel_init(),
         )
+
+        # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            static_rigid_sim_config["prefer_decomposed_solver"] = 0
 
         if self.is_active:
             # TODO: These alternative tiled algorithms are designed to reduce the impact of latency. However, naive
@@ -405,18 +432,8 @@ class RigidSolver(KinematicSolver):
             # be selected based on dynamic timer-based profiling instead of hard-coded heuristic.
             max_n_dofs_per_entity = max(entity.n_dofs for entity in self.entities) if self.entities else 0
             if gs.backend != gs.cpu:
-                if gs.backend == gs.metal:
-                    max_shared_mem = 32.0
-                elif gs.device.type == "cuda":
-                    from cuda.bindings import runtime  # Transitive dependency of torch CUDA
-
-                    _, max_shared_mem = runtime.cudaDeviceGetAttribute(
-                        runtime.cudaDeviceAttr.cudaDevAttrMaxSharedMemoryPerBlockOptin, gs.device.index
-                    )
-                    max_shared_mem /= 1024.0
-                else:
-                    max_shared_mem = 48.0
-                max_n_warps = int(math.sqrt(max_shared_mem * 1024 / (4 if gs.qd_float == qd.f32 else 8))) // 32
+                max_shared_bytes = qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
+                max_n_warps = int(math.sqrt(max_shared_bytes / (4 if gs.qd_float == qd.f32 else 8))) // 32
                 max_n_threads = max_n_warps * 32
 
                 enable_tiled_cholesky_mass_matrix = 8 <= max_n_dofs_per_entity <= max_n_threads and self.n_envs <= 16384
@@ -993,8 +1010,9 @@ class RigidSolver(KinematicSolver):
         return qd_to_torch(self._errno) > 0
 
     def check_errno(self):
-        # TODO: Add some class ErrorCode(IntEnum) to manage error codes x)
-        if gs.use_zerocopy:
+        # FIXME: qd.atomic_or return value is broken on Metal — always returns 0.
+        # See repro_metal_kernel_return.py. Falling back to numpy reduction.
+        if gs.use_zerocopy or sys.platform == "darwin":
             errno = np.bitwise_or.reduce(qd_to_numpy(self._errno))
         else:
             errno = kernel_bit_reduction(self._errno)
