@@ -546,9 +546,13 @@ def _func_patch_hessian_delta(
     n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
     BLOCK_DIM = qd.static(128)
-    # Static upper bound on per-env changed-constraint count for the shared-mem cache.
-    # If the actual n_changed at runtime exceeds this, fall back to the no-cache path.
+    # Static bounds for shared-memory caches.  When n_changed <= MAX_CHANGED_JAC the
+    # full jac[i_c, :, i_b] rows are cached too (E5).  When MAX_CHANGED_JAC < n_changed
+    # <= MAX_CHANGED, only the metadata cache is used (E4).  Above MAX_CHANGED, fall
+    # back to the original no-cache kernel.
     MAX_CHANGED = qd.static(128)
+    MAX_CHANGED_JAC = qd.static(8)
+    MAX_DOFS = qd.static(96)
 
     qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
     for i in range(_B * BLOCK_DIM):
@@ -567,11 +571,49 @@ def _func_patch_hessian_delta(
 
         ic_sh = qd.simt.block.SharedArray((MAX_CHANGED,), gs.qd_int)
         signed_D_sh = qd.simt.block.SharedArray((MAX_CHANGED,), gs.qd_float)
+        jac_sh = qd.simt.block.SharedArray((MAX_CHANGED_JAC, MAX_DOFS), gs.qd_float)
 
-        if n_changed <= MAX_CHANGED:
-            # Cooperative pre-load of (i_c, signed_D) for each changed constraint.
-            # Saves redundant per-(i_d1,i_d2) global reads and folds the active sign
-            # into a precomputed signed_D, removing the per-iteration branch.
+        if n_changed <= MAX_CHANGED_JAC:
+            # E5 path: cache (i_c, signed_D) AND the full jac[i_c, :, i_b] row for each
+            # changed constraint.  All 128 threads of the block read the SAME (i_c, i_b)
+            # but DIFFERENT i_d, so the original kernel issues 128 fully-uncoalesced
+            # global reads per inner-loop iteration; loading them coalesced once into
+            # shared memory eliminates the bulk of that traffic.
+            idx_l = tid
+            while idx_l < n_changed:
+                ic = constraint_state.incr_changed_idx[idx_l, i_b]
+                ic_sh[idx_l] = ic
+                sd = constraint_state.efc_D[ic, i_b]
+                if not constraint_state.active[ic, i_b]:
+                    sd = -sd
+                signed_D_sh[idx_l] = sd
+                idx_l = idx_l + BLOCK_DIM
+
+            j = tid
+            while j < n_changed * n_dofs:
+                idx = j // n_dofs
+                i_d = j % n_dofs
+                jac_sh[idx, i_d] = constraint_state.jac[ic_sh[idx], i_d, i_b]
+                j = j + BLOCK_DIM
+            qd.simt.block.sync()
+
+            elem = tid
+            while elem < n_lower_tri:
+                i_d1, i_d2 = solver.linear_to_lower_tri(elem)
+
+                delta = gs.qd_float(0.0)
+                for idx in range(n_changed):
+                    Ji = jac_sh[idx, i_d1]
+                    if Ji != 0.0:
+                        Jj = jac_sh[idx, i_d2]
+                        if Jj != 0.0:
+                            delta = delta + signed_D_sh[idx] * Ji * Jj
+
+                if delta != 0.0:
+                    constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
+                elem = elem + BLOCK_DIM
+        elif n_changed <= MAX_CHANGED:
+            # E4 path: cache only the metadata; jac reads stay in global memory.
             idx_l = tid
             while idx_l < n_changed:
                 ic = constraint_state.incr_changed_idx[idx_l, i_b]
