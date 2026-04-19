@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import quadrants as qd
+from quadrants.lang.simt._tile16 import Tile16x16Proxy as Tile16x16
 import torch
 from frozendict import frozendict
 
@@ -1703,7 +1704,7 @@ def func_cholesky_factor_direct_tiled(
     original n_dofs x n_dofs submatrix.
     """
     EPS = rigid_global_info.EPS[None]
-    N = qd.static(qd.simt.Tile16x16.SIZE)
+    N = qd.static(Tile16x16.SIZE)
 
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
@@ -1721,7 +1722,7 @@ def func_cholesky_factor_direct_tiled(
         for kb in range(N_BLOCKS):
             k0 = kb * _CHOL_TILE
 
-            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk = Tile16x16.eye(dtype=gs.qd_float)
             L_kk[:] = constraint_state.nt_H[i_b, k0:n_dofs, k0:n_dofs]
 
             for jb in range(kb):
@@ -1735,7 +1736,7 @@ def func_cholesky_factor_direct_tiled(
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * _CHOL_TILE
 
-                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik = Tile16x16.zeros(dtype=gs.qd_float)
                 L_ik[:] = constraint_state.nt_H[i_b, i0:n_dofs, k0:n_dofs]
 
                 for jb in range(kb):
@@ -1772,7 +1773,7 @@ def func_cholesky_and_solve_fused_tiled(
     """
     EPS = rigid_global_info.EPS[None]
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
-    N = qd.static(qd.simt.Tile16x16.SIZE)
+    N = qd.static(Tile16x16.SIZE)
 
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
@@ -1793,7 +1794,7 @@ def func_cholesky_and_solve_fused_tiled(
         for kb in range(N_BLOCKS):
             k0 = kb * _CHOL_TILE
 
-            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk = Tile16x16.eye(dtype=gs.qd_float)
             L_kk[:] = constraint_state.nt_H[i_b, k0:n_dofs, k0:n_dofs]
 
             for jb in range(kb):
@@ -1807,7 +1808,7 @@ def func_cholesky_and_solve_fused_tiled(
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * _CHOL_TILE
 
-                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik = Tile16x16.zeros(dtype=gs.qd_float)
                 L_ik[:] = constraint_state.nt_H[i_b, i0:n_dofs, k0:n_dofs]
 
                 for jb in range(kb):
