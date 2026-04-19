@@ -442,51 +442,75 @@ def _func_update_constraint_cost(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute gauss and cost (reductions over dofs and constraints). One thread per env."""
+    """Compute gauss and cost (reductions over dofs and constraints).
+
+    One block per env, BLOCK_DIM=32 threads cooperate.  Each thread sums
+    a strided slice of the (n_dofs + n_con) work items, then a single
+    subgroup.reduce_add tree-reduces to lane 0 which writes the result.
+    """
+    _LOG2_T = qd.static(5)  # BLOCK_DIM == 32 == 2**5
+
     _B = constraint_state.grad.shape[1]
+    BLOCK_DIM = qd.static(32)
 
-    qd.loop_config(name="update_constraint_cost", block_dim=32)
-    for i_b in range(_B):
-        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            n_dofs = constraint_state.qfrc_constraint.shape[0]
-            ne = constraint_state.n_constraints_equality[i_b]
-            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
-            n_con = constraint_state.n_constraints[i_b]
+    qd.loop_config(name="update_constraint_cost", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
 
+        n_dofs = constraint_state.qfrc_constraint.shape[0]
+        ne = constraint_state.n_constraints_equality[i_b]
+        nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+        n_con = constraint_state.n_constraints[i_b]
+
+        if tid == 0:
             constraint_state.prev_cost[i_b] = constraint_state.cost[i_b]
 
-            cost_i = gs.qd_float(0.0)
-            gauss_i = gs.qd_float(0.0)
+        local_gauss = gs.qd_float(0.0)
+        local_cost = gs.qd_float(0.0)
 
-            # Gauss cost from dofs
-            for i_d in range(n_dofs):
-                v = (
-                    0.5
-                    * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
-                    * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
+        # Gauss cost from dofs (strided slice per thread).
+        i_d = tid
+        while i_d < n_dofs:
+            v = (
+                0.5
+                * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
+                * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
+            )
+            local_gauss += v
+            local_cost += v
+            i_d = i_d + BLOCK_DIM
+
+        # Constraint cost: quadratic + (for friction range) linear (strided slice per thread).
+        i_c = tid
+        while i_c < n_con:
+            local_cost += 0.5 * (
+                constraint_state.Jaref[i_c, i_b] ** 2
+                * constraint_state.efc_D[i_c, i_b]
+                * constraint_state.active[i_c, i_b]
+            )
+            if ne <= i_c and i_c < nef:
+                f = constraint_state.efc_frictionloss[i_c, i_b]
+                r = constraint_state.diag[i_c, i_b]
+                rf = r * f
+                linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
+                linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
+                local_cost += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b]) + linear_pos * f * (
+                    -0.5 * rf + constraint_state.Jaref[i_c, i_b]
                 )
-                gauss_i += v
-                cost_i += v
+            i_c = i_c + BLOCK_DIM
 
-            # Constraint cost: quadratic + friction linear
-            for i_c in range(n_con):
-                cost_i += 0.5 * (
-                    constraint_state.Jaref[i_c, i_b] ** 2
-                    * constraint_state.efc_D[i_c, i_b]
-                    * constraint_state.active[i_c, i_b]
-                )
-                if ne <= i_c and i_c < nef:
-                    f = constraint_state.efc_frictionloss[i_c, i_b]
-                    r = constraint_state.diag[i_c, i_b]
-                    rf = r * f
-                    linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                    linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                    cost_i += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b]) + linear_pos * f * (
-                        -0.5 * rf + constraint_state.Jaref[i_c, i_b]
-                    )
+        # Tree reduction within the warp; result is on lane 0.
+        local_gauss = qd.simt.subgroup.reduce_add(local_gauss, _LOG2_T)
+        local_cost = qd.simt.subgroup.reduce_add(local_cost, _LOG2_T)
 
-            constraint_state.gauss[i_b] = gauss_i
-            constraint_state.cost[i_b] = cost_i
+        if tid == 0:
+            constraint_state.gauss[i_b] = local_gauss
+            constraint_state.cost[i_b] = local_cost
 
 
 # Number of full Hessian+Cholesky rebuilds at the start of the solver loop (after the init's iter-0 full rebuild).
