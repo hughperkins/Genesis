@@ -14,7 +14,8 @@ from genesis.engine.solvers.rigid.constraint import solver
 LS_PARALLEL_K = 32
 
 # Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
-_P0_BLOCK = 64
+_P0_BLOCK = 32  # base; gated up to 64 in _func_parallel_linesearch_p0 for the small-nv Newton legacy path
+_P0_BLOCK_LARGE = 64
 _JV_BLOCK = 32
 
 # Maximum allowed alpha (prevents divergence from degenerate steps).
@@ -113,7 +114,18 @@ def _func_parallel_linesearch_p0(
     only), and search direction update. These reuse the batch-level functions from solver.py.
     """
     _B = constraint_state.grad.shape[1]
-    _T = qd.static(_P0_BLOCK)
+    # exp18: gate _T to 64 for the small-nv Newton legacy Cholesky path (dex_hand, g1_fall, box_pyramid_3, go2_Newton).
+    # That path has many constraints / many DOF iters per env so it amortises 64 threads. Other configurations (large-nv
+    # Tile16x16 fused path on box_pyramid_4..6, plain Newton, CG) keep 32 to avoid hurting their throughput.
+    _T = qd.static(
+        _P0_BLOCK_LARGE
+        if (
+            static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+            and static_rigid_sim_config.enable_tiled_cholesky_hessian
+            and not static_rigid_sim_config.prefer_fused_cholesky_solve
+        )
+        else _P0_BLOCK
+    )
 
     qd.loop_config(name="parallel_linesearch_p0", block_dim=_T)
     for i_flat in range(_B * _T):
