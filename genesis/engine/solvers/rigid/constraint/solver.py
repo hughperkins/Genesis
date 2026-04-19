@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import quadrants as qd
-from quadrants.lang.simt.tile16 import Tile16
 import torch
 from frozendict import frozendict
 
@@ -1693,17 +1692,18 @@ def func_cholesky_factor_direct_tiled(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Blocked Cholesky factorization using Tile16 register-resident tiles.
+    """Blocked Cholesky factorization using Tile16x16 register-resident tiles.
 
-    Uses a left-looking blocked algorithm with Tile16 primitives (potrf, trsm,
-    syr_sub, ger_sub), all operating entirely in registers via subgroup shuffles.
-    No shared memory or block synchronization needed.
+    Uses a left-looking blocked algorithm with Tile16x16 primitives (cholesky_,
+    solve_triangular_, qd.outer), all operating entirely in registers via
+    subgroup shuffles.  No shared memory or block synchronization needed.
 
     When n_dofs is not a multiple of 16, partial tiles are padded with identity
     (diagonal=1, off-diagonal=0) so the factorization is correct for the
     original n_dofs x n_dofs submatrix.
     """
     EPS = rigid_global_info.EPS[None]
+    N = qd.static(qd.simt.Tile16x16.SIZE)
 
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
@@ -1721,47 +1721,35 @@ def func_cholesky_factor_direct_tiled(
         for kb in range(N_BLOCKS):
             k0 = kb * _CHOL_TILE
 
-            L_kk = Tile16()
-            if k0 + tid < n_dofs:
-                L_kk.load3d(constraint_state.nt_H, i_b, k0 + tid, k0, n_dofs)
-            else:
-                L_kk.set_identity(tid)
+            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk[:] = constraint_state.nt_H[i_b, k0:n_dofs, k0:n_dofs]
 
             for jb in range(kb):
                 j0 = jb * _CHOL_TILE
                 for t in range(_CHOL_TILE):
-                    v = gs.qd_float(0.0)
-                    if k0 + tid < n_dofs:
-                        v = constraint_state.nt_H[i_b, k0 + tid, j0 + t]
-                    L_kk.syr_sub(v)
+                    v = constraint_state.nt_H[i_b, k0:n_dofs, j0 + t]
+                    L_kk -= qd.outer(v, v)
 
-            L_kk.potrf(tid, EPS)
+            L_kk.cholesky_(EPS)
 
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * _CHOL_TILE
 
-                L_ik = Tile16()
-                if i0 + tid < n_dofs:
-                    L_ik.load3d(constraint_state.nt_H, i_b, i0 + tid, k0, n_dofs)
+                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik[:] = constraint_state.nt_H[i_b, i0:n_dofs, k0:n_dofs]
 
                 for jb in range(kb):
                     j0 = jb * _CHOL_TILE
                     for t in range(_CHOL_TILE):
-                        v_own = gs.qd_float(0.0)
-                        v_diag = gs.qd_float(0.0)
-                        if i0 + tid < n_dofs:
-                            v_own = constraint_state.nt_H[i_b, i0 + tid, j0 + t]
-                        if k0 + tid < n_dofs:
-                            v_diag = constraint_state.nt_H[i_b, k0 + tid, j0 + t]
-                        L_ik.ger_sub(v_own, v_diag)
+                        v_own = constraint_state.nt_H[i_b, i0:n_dofs, j0 + t]
+                        v_diag = constraint_state.nt_H[i_b, k0:n_dofs, j0 + t]
+                        L_ik -= qd.outer(v_own, v_diag)
 
-                L_ik.trsm(L_kk)
+                L_kk.solve_triangular_(L_ik)
 
-                if i0 + tid < n_dofs:
-                    L_ik.store3d(constraint_state.nt_H, i_b, i0 + tid, k0, n_dofs)
+                constraint_state.nt_H[i_b, i0:i0 + N, k0:n_dofs] = L_ik
 
-            if k0 + tid < n_dofs:
-                L_kk.store3d(constraint_state.nt_H, i_b, k0 + tid, k0, n_dofs)
+            constraint_state.nt_H[i_b, k0:k0 + N, k0:n_dofs] = L_kk
 
 
 @qd.func
@@ -1784,6 +1772,7 @@ def func_cholesky_and_solve_fused_tiled(
     """
     EPS = rigid_global_info.EPS[None]
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    N = qd.static(qd.simt.Tile16x16.SIZE)
 
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
@@ -1804,47 +1793,35 @@ def func_cholesky_and_solve_fused_tiled(
         for kb in range(N_BLOCKS):
             k0 = kb * _CHOL_TILE
 
-            L_kk = Tile16()
-            if k0 + tid < n_dofs:
-                L_kk.load3d(constraint_state.nt_H, i_b, k0 + tid, k0, n_dofs)
-            else:
-                L_kk.set_identity(tid)
+            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
+            L_kk[:] = constraint_state.nt_H[i_b, k0:n_dofs, k0:n_dofs]
 
             for jb in range(kb):
                 j0 = jb * _CHOL_TILE
                 for t in range(_CHOL_TILE):
-                    v = gs.qd_float(0.0)
-                    if k0 + tid < n_dofs:
-                        v = L_sh[k0 + tid, j0 + t]
-                    L_kk.syr_sub(v)
+                    v = L_sh[k0:n_dofs, j0 + t]
+                    L_kk -= qd.outer(v, v)
 
-            L_kk.potrf(tid, EPS)
+            L_kk.cholesky_(EPS)
 
             for ib in range(kb + 1, N_BLOCKS):
                 i0 = ib * _CHOL_TILE
 
-                L_ik = Tile16()
-                if i0 + tid < n_dofs:
-                    L_ik.load3d(constraint_state.nt_H, i_b, i0 + tid, k0, n_dofs)
+                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
+                L_ik[:] = constraint_state.nt_H[i_b, i0:n_dofs, k0:n_dofs]
 
                 for jb in range(kb):
                     j0 = jb * _CHOL_TILE
                     for t in range(_CHOL_TILE):
-                        v_own = gs.qd_float(0.0)
-                        v_diag = gs.qd_float(0.0)
-                        if i0 + tid < n_dofs:
-                            v_own = L_sh[i0 + tid, j0 + t]
-                        if k0 + tid < n_dofs:
-                            v_diag = L_sh[k0 + tid, j0 + t]
-                        L_ik.ger_sub(v_own, v_diag)
+                        v_own = L_sh[i0:n_dofs, j0 + t]
+                        v_diag = L_sh[k0:n_dofs, j0 + t]
+                        L_ik -= qd.outer(v_own, v_diag)
 
-                L_ik.trsm(L_kk)
+                L_kk.solve_triangular_(L_ik)
 
-                if i0 + tid < n_dofs:
-                    L_ik.store(L_sh, i0 + tid, k0, n_dofs)
+                L_sh[i0:i0 + N, k0:k0 + N] = L_ik
 
-            if k0 + tid < n_dofs:
-                L_kk.store(L_sh, k0 + tid, k0, n_dofs)
+            L_sh[k0:k0 + N, k0:k0 + N] = L_kk
 
         # --- Fused solve: Ly = grad (forward), L^T x = y (backward) ---
         # L is fully computed in L_sh. Load gradient into v_sh.
