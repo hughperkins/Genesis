@@ -478,7 +478,9 @@ def _func_update_constraint_forces(
     static_rigid_sim_config: qd.template(),
 ):
     """Compute active flags and efc_force, parallelized over (constraint, env)."""
-    len_constraints = constraint_state.active.shape[0]
+    # NB: read len_constraints from a non-transposed array (efc_force is always
+    # (len_constraints_, _B)), because `active`'s shape[0] is _B under transpose.
+    len_constraints = constraint_state.efc_force.shape[0]
     _B = constraint_state.grad.shape[1]
 
     # Iterate so adjacent lanes have adjacent indices in the coalescing dimension

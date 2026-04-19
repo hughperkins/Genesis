@@ -3400,7 +3400,9 @@ def _initialize_Jaref_parallel(
     """Parallelizes over (constraints, envs) — better when GPU is not saturated by envs alone."""
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
-    len_constraints = constraint_state.Jaref.shape[0]
+    # NB: read len_constraints from a non-transposed array (efc_force is always
+    # (len_constraints_, _B)), because Jaref.shape[0] is _B under transpose.
+    len_constraints = constraint_state.efc_force.shape[0]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_c, i_b in qd.ndrange(len_constraints, _B):
