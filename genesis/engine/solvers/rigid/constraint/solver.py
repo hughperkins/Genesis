@@ -1832,23 +1832,21 @@ def func_cholesky_and_solve_fused_tiled(
             k = k + N
         qd.simt.block.sync()
 
-        # Forward substitution: solve L @ y = grad (parallel dot with 16 threads)
+        # Forward substitution: solve L @ y = grad (parallel dot with 16 threads).
+        # Reduction result only needed on lane 0 -> use subgroup.reduce_add (shuffle-down tree).
+        _LOG2_N = qd.static(4)  # N == 16 == 2**4
         for i_d in range(n_dofs):
             dot = gs.qd_float(0.0)
             j = tid
             while j < i_d:
                 dot = dot + L_sh[i_d, j] * v_sh[j]
                 j = j + N
-            # Butterfly reduction via subgroup shuffle (16 threads = 4 rounds)
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 8))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 4))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 2))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 1))
+            dot = qd.simt.subgroup.reduce_add(dot, _LOG2_N)
             if tid == 0:
                 v_sh[i_d] = (v_sh[i_d] - dot) / L_sh[i_d, i_d]
             qd.simt.block.sync()
 
-        # Backward substitution: solve L^T @ x = y (parallel dot with 16 threads)
+        # Backward substitution: solve L^T @ x = y (parallel dot with 16 threads).
         for i_d_ in range(n_dofs):
             i_d = n_dofs - 1 - i_d_
             dot = gs.qd_float(0.0)
@@ -1856,11 +1854,7 @@ def func_cholesky_and_solve_fused_tiled(
             while j < n_dofs:
                 dot = dot + L_sh[j, i_d] * v_sh[j]
                 j = j + N
-            # Butterfly reduction via subgroup shuffle (16 threads = 4 rounds)
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 8))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 4))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 2))
-            dot = dot + qd.simt.subgroup.shuffle(dot, qd.u32(tid ^ 1))
+            dot = qd.simt.subgroup.reduce_add(dot, _LOG2_N)
             if tid == 0:
                 v_sh[i_d] = (v_sh[i_d] - dot) / L_sh[i_d, i_d]
             qd.simt.block.sync()
