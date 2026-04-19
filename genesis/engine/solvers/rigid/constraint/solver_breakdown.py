@@ -114,6 +114,7 @@ def _func_parallel_linesearch_p0(
     """
     _B = constraint_state.grad.shape[1]
     _T = qd.static(_P0_BLOCK)
+    _LOG2_T = qd.static(5)  # _P0_BLOCK == 32 == 2**5; subgroup size on the target NVIDIA GPUs
 
     qd.loop_config(name="parallel_linesearch_p0", block_dim=_T)
     for i_flat in range(_B * _T):
@@ -164,12 +165,12 @@ def _func_parallel_linesearch_p0(
                 local_qg_hess += 0.5 * s * constraint_state.mv[i_d, i_b]
                 i_d += _T
 
-            # Subgroup all-reduce: snorm is needed by all lanes (EPS check + Phase 2 scale).
-            # subgroupAdd returns the same value to every lane in the subgroup (block_dim=_T=32 == warp size on the
-            # target NVIDIA GPUs), so this replaces the previous shared-memory tree reduction.
-            local_snorm_sq = qd.simt.subgroup.reduce_add(local_snorm_sq)
-            local_qg_grad = qd.simt.subgroup.reduce_add(local_qg_grad)
-            local_qg_hess = qd.simt.subgroup.reduce_add(local_qg_hess)
+            # Replaces the previous shared-memory tree reduction.
+            # snorm is needed by all lanes (EPS check + Phase 2 scale) -> all-reduce (XOR butterfly).
+            # qg_* are only consumed by lane 0 -> reduce_add (shuffle-down tree, valid in lane 0 only).
+            local_snorm_sq = qd.simt.subgroup.reduce_all_add(local_snorm_sq, _LOG2_T)
+            local_qg_grad = qd.simt.subgroup.reduce_add(local_qg_grad, _LOG2_T)
+            local_qg_hess = qd.simt.subgroup.reduce_add(local_qg_hess, _LOG2_T)
 
             snorm = qd.sqrt(local_snorm_sq)
 
@@ -238,13 +239,13 @@ def _func_parallel_linesearch_p0(
 
                     i_c += _T
 
-                # Subgroup all-reduce for the 6 Phase-2 accumulators (replaces shared-memory tree reduction).
-                local_eq_cost = qd.simt.subgroup.reduce_add(local_eq_cost)
-                local_eq_grad = qd.simt.subgroup.reduce_add(local_eq_grad)
-                local_eq_hess = qd.simt.subgroup.reduce_add(local_eq_hess)
-                local_p0_cost = qd.simt.subgroup.reduce_add(local_p0_cost)
-                local_constraint_grad = qd.simt.subgroup.reduce_add(local_constraint_grad)
-                local_constraint_hess = qd.simt.subgroup.reduce_add(local_constraint_hess)
+                # All 6 Phase-2 accumulators are only consumed by lane 0 -> reduce_add is sufficient.
+                local_eq_cost = qd.simt.subgroup.reduce_add(local_eq_cost, _LOG2_T)
+                local_eq_grad = qd.simt.subgroup.reduce_add(local_eq_grad, _LOG2_T)
+                local_eq_hess = qd.simt.subgroup.reduce_add(local_eq_hess, _LOG2_T)
+                local_p0_cost = qd.simt.subgroup.reduce_add(local_p0_cost, _LOG2_T)
+                local_constraint_grad = qd.simt.subgroup.reduce_add(local_constraint_grad, _LOG2_T)
+                local_constraint_hess = qd.simt.subgroup.reduce_add(local_constraint_hess, _LOG2_T)
 
                 if tid == 0:
                     constraint_state.eq_sum[0, i_b] = local_eq_cost
