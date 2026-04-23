@@ -787,7 +787,16 @@ def run_benchmark(step_fn, *, n_envs, meta):
     diag_enabled = os.environ.get("BENCH_DIAG", "0") == "1"
     diag_interval = int(os.environ.get("BENCH_DIAG_INTERVAL", "500"))
     diag_log_path = os.environ.get("BENCH_DIAG_LOG", "")
+    disable_gc = os.environ.get("BENCH_DISABLE_GC", "0") == "1"
     diag_entries = []
+
+    import gc as _gc
+    gc_was_enabled = _gc.isenabled()
+    gc_collections_before = list(_gc.get_stats())
+
+    if disable_gc:
+        _gc.collect()
+        _gc.disable()
 
     num_steps = 0
     warmup_steps = 0
@@ -821,17 +830,32 @@ def run_benchmark(step_fn, *, n_envs, meta):
     runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
     realtime_factor = runtime_fps * meta.step_dt
 
+    gc_collections_after = list(_gc.get_stats())
+    if disable_gc and gc_was_enabled:
+        _gc.enable()
+
     if diag_enabled:
         import json
+        gc_delta = []
+        for before, after in zip(gc_collections_before, gc_collections_after):
+            gc_delta.append({"gen": before["generation"],
+                             "collections": after["collections"] - before["collections"],
+                             "collected": after["collected"] - before["collected"],
+                             "uncollectable": after["uncollectable"] - before["uncollectable"]})
         diag_summary = {
             "warmup_steps": warmup_steps,
             "record_steps": num_steps,
             "record_wall_s": time_elapsed,
             "runtime_fps": runtime_fps,
+            "gc_disabled": disable_gc,
+            "gc_delta": gc_delta,
             "entries": diag_entries,
         }
         print(f"[DIAG] warmup_steps={warmup_steps} record_steps={num_steps} "
-              f"record_wall={time_elapsed:.3f}s fps={runtime_fps}")
+              f"record_wall={time_elapsed:.3f}s fps={runtime_fps} gc_disabled={disable_gc}")
+        for gd in gc_delta:
+            print(f"[DIAG] GC gen{gd['gen']}: {gd['collections']} collections, "
+                  f"{gd['collected']} collected, {gd['uncollectable']} uncollectable")
         if diag_log_path:
             with open(diag_log_path, "a") as f:
                 f.write(json.dumps(diag_summary) + "\n")
