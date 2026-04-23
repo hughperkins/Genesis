@@ -837,8 +837,8 @@ def run_benchmark(step_fn, *, n_envs, meta):
     if diag_enabled:
         import json
         gc_delta = []
-        for before, after in zip(gc_collections_before, gc_collections_after):
-            gc_delta.append({"gen": before["generation"],
+        for gen, (before, after) in enumerate(zip(gc_collections_before, gc_collections_after)):
+            gc_delta.append({"gen": gen,
                              "collections": after["collections"] - before["collections"],
                              "collected": after["collected"] - before["collected"],
                              "uncollectable": after["uncollectable"] - before["uncollectable"]})
