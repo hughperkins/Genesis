@@ -388,17 +388,20 @@ def get_constraint_state(constraint_solver, solver):
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
         efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
-        # Tier-1 constraint state: allocated as qd.Tensor wrappers
-        # (Phase-1 migration; see perso_hugh/doc/genesis_tensor_migration.md).
-        active=qd.tensor(gs.qd_bool, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
+        # Tier-1 constraint state: allocated as qd.Tensor wrappers.
+        # LAYOUT-TEST BRANCH: canonical shape permuted to (B, n_con) and
+        # ``layout=(1, 0)`` reverts the physical layout to the original
+        # (n_con, B) byte order, so this allocation is byte-identical to
+        # the parent commit. Access sites use [i_b, i_c] indexing.
+        active=qd.tensor(gs.qd_bool, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
         prev_active=V(dtype=gs.qd_bool, shape=(len_constraints_, _B)),
-        diag=qd.tensor(gs.qd_float, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
+        diag=qd.tensor(gs.qd_float, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
         aref=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        Jaref=qd.tensor(gs.qd_float, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
-        efc_frictionloss=qd.tensor(gs.qd_float, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
+        Jaref=qd.tensor(gs.qd_float, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
+        efc_frictionloss=qd.tensor(gs.qd_float, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
         efc_force=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
-        efc_D=qd.tensor(gs.qd_float, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
-        jv=qd.tensor(gs.qd_float, shape=(len_constraints_, _B), backend=_TENSOR_BACKEND),
+        efc_D=qd.tensor(gs.qd_float, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
+        jv=qd.tensor(gs.qd_float, shape=(_B, len_constraints_), backend=_TENSOR_BACKEND, layout=(1, 0)),
         jac=V(dtype=gs.qd_float, shape=jac_shape),
         jac_relevant_dofs=V(dtype=gs.qd_int, shape=jac_relevant_dofs_shape),
         jac_n_relevant_dofs=V(dtype=gs.qd_int, shape=jac_n_relevant_dofs_shape),

@@ -44,11 +44,11 @@ def _ls_eval_cost_grad(
 
     # Friction constraints: accumulate activation-dependent quad coefficients
     for i_c in range(ne, nef):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
-        f_val = constraint_state.efc_frictionloss[i_c, i_b]
-        r_val = constraint_state.diag[i_c, i_b]
+        Jaref_c = constraint_state.Jaref[i_b, i_c]
+        jv_c = constraint_state.jv[i_b, i_c]
+        D = constraint_state.efc_D[i_b, i_c]
+        f_val = constraint_state.efc_frictionloss[i_b, i_c]
+        r_val = constraint_state.diag[i_b, i_c]
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
         qf_1 = D * (jv_c * Jaref_c)
         qf_2 = D * (0.5 * jv_c * jv_c)
@@ -66,9 +66,9 @@ def _ls_eval_cost_grad(
 
     # Contact constraints: active when x < 0
     for i_c in range(nef, n_con):
-        Jaref_c = constraint_state.Jaref[i_c, i_b]
-        jv_c = constraint_state.jv[i_c, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
+        Jaref_c = constraint_state.Jaref[i_b, i_c]
+        jv_c = constraint_state.jv[i_b, i_c]
+        D = constraint_state.efc_D[i_b, i_c]
         x = Jaref_c + alpha * jv_c
         active = x < 0
         qf_0 = D * (0.5 * Jaref_c * Jaref_c)
@@ -154,7 +154,7 @@ def _func_parallel_linesearch_p0(
                 else:
                     for i_d in range(n_dofs):
                         jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
-                constraint_state.jv[i_c, i_b] = jv_val
+                constraint_state.jv[i_b, i_c] = jv_val
                 i_c += _T
 
             qd.simt.block.sync()  # Ensure mv and jv are written before Phase 1 reads them
@@ -218,9 +218,9 @@ def _func_parallel_linesearch_p0(
 
                 i_c = tid
                 while i_c < n_con:
-                    Jaref_c = constraint_state.Jaref[i_c, i_b]
-                    jv_c = constraint_state.jv[i_c, i_b]
-                    D = constraint_state.efc_D[i_c, i_b]
+                    Jaref_c = constraint_state.Jaref[i_b, i_c]
+                    jv_c = constraint_state.jv[i_b, i_c]
+                    D = constraint_state.efc_D[i_b, i_c]
                     qf_0 = D * (0.5 * Jaref_c * Jaref_c)
                     qf_1 = D * (jv_c * Jaref_c)
                     qf_2 = D * (0.5 * jv_c * jv_c)
@@ -235,8 +235,8 @@ def _func_parallel_linesearch_p0(
                         local_constraint_hess += qf_2
                     elif i_c < nef:
                         # Friction: check linear regime at alpha=0
-                        f = constraint_state.efc_frictionloss[i_c, i_b]
-                        r = constraint_state.diag[i_c, i_b]
+                        f = constraint_state.efc_frictionloss[i_b, i_c]
+                        r = constraint_state.diag[i_b, i_c]
                         rf = r * f
                         linear_neg = Jaref_c <= -rf
                         linear_pos = Jaref_c >= rf
@@ -390,7 +390,7 @@ def _func_parallel_linesearch_eval(
                 # Apply to constraints (strided over threads)
                 i_c = tid
                 while i_c < n_con_apply:
-                    constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha_apply
+                    constraint_state.Jaref[i_b, i_c] += constraint_state.jv[i_b, i_c] * alpha_apply
                     i_c += _K
 
 
@@ -418,7 +418,7 @@ def _func_update_constraint_forces(
     static_rigid_sim_config: qd.template(),
 ):
     """Compute active flags and efc_force, parallelized over (constraint, env)."""
-    len_constraints = constraint_state.active.shape[0]
+    len_constraints = constraint_state.active.shape[1]
     _B = constraint_state.grad.shape[1]
 
     qd.loop_config(name="update_constraint_forces")
@@ -428,24 +428,24 @@ def _func_update_constraint_forces(
             nef = ne + constraint_state.n_constraints_frictionloss[i_b]
 
             if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+                constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_b, i_c]
 
-            constraint_state.active[i_c, i_b] = True
+            constraint_state.active[i_b, i_c] = True
             floss_force = gs.qd_float(0.0)
 
             if ne <= i_c and i_c < nef:
-                f = constraint_state.efc_frictionloss[i_c, i_b]
-                r = constraint_state.diag[i_c, i_b]
+                f = constraint_state.efc_frictionloss[i_b, i_c]
+                r = constraint_state.diag[i_b, i_c]
                 rf = r * f
-                linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                constraint_state.active[i_c, i_b] = not (linear_neg or linear_pos)
+                linear_neg = constraint_state.Jaref[i_b, i_c] <= -rf
+                linear_pos = constraint_state.Jaref[i_b, i_c] >= rf
+                constraint_state.active[i_b, i_c] = not (linear_neg or linear_pos)
                 floss_force = linear_neg * f + linear_pos * -f
             elif nef <= i_c:
-                constraint_state.active[i_c, i_b] = constraint_state.Jaref[i_c, i_b] < 0
+                constraint_state.active[i_b, i_c] = constraint_state.Jaref[i_b, i_c] < 0
 
             constraint_state.efc_force[i_c, i_b] = floss_force + (
-                -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+                -constraint_state.Jaref[i_b, i_c] * constraint_state.efc_D[i_b, i_c] * constraint_state.active[i_b, i_c]
             )
 
 
@@ -503,18 +503,18 @@ def _func_update_constraint_cost(
             # Constraint cost: quadratic + friction linear
             for i_c in range(n_con):
                 cost_i += 0.5 * (
-                    constraint_state.Jaref[i_c, i_b] ** 2
-                    * constraint_state.efc_D[i_c, i_b]
-                    * constraint_state.active[i_c, i_b]
+                    constraint_state.Jaref[i_b, i_c] ** 2
+                    * constraint_state.efc_D[i_b, i_c]
+                    * constraint_state.active[i_b, i_c]
                 )
                 if ne <= i_c and i_c < nef:
-                    f = constraint_state.efc_frictionloss[i_c, i_b]
-                    r = constraint_state.diag[i_c, i_b]
+                    f = constraint_state.efc_frictionloss[i_b, i_c]
+                    r = constraint_state.diag[i_b, i_c]
                     rf = r * f
-                    linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
-                    linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                    cost_i += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b]) + linear_pos * f * (
-                        -0.5 * rf + constraint_state.Jaref[i_c, i_b]
+                    linear_neg = constraint_state.Jaref[i_b, i_c] <= -rf
+                    linear_pos = constraint_state.Jaref[i_b, i_c] >= rf
+                    cost_i += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_b, i_c]) + linear_pos * f * (
+                        -0.5 * rf + constraint_state.Jaref[i_b, i_c]
                     )
 
             constraint_state.gauss[i_b] = gauss_i
@@ -598,8 +598,8 @@ def _func_patch_hessian_delta(
                 if Ji != 0.0:
                     Jj = constraint_state.jac[i_c, i_d2, i_b]
                     if Jj != 0.0:
-                        D = constraint_state.efc_D[i_c, i_b]
-                        if constraint_state.active[i_c, i_b]:
+                        D = constraint_state.efc_D[i_b, i_c]
+                        if constraint_state.active[i_b, i_c]:
                             delta = delta + D * Ji * Jj
                         else:
                             delta = delta - D * Ji * Jj

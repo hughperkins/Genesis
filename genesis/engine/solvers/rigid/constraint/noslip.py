@@ -225,7 +225,7 @@ def kernel_noslip(
             improvement = gs.qd_float(0.0)
             if i_iter == 0:
                 for i_c in range(constraint_state.n_constraints[i_b]):
-                    improvement += 0.5 * constraint_state.efc_force[i_c, i_b] ** 2 * constraint_state.diag[i_c, i_b]
+                    improvement += 0.5 * constraint_state.efc_force[i_c, i_b] ** 2 * constraint_state.diag[i_b, i_c]
 
             for i_c in range(ne, ne + nf):
                 res = func_residual_constraint_force(
@@ -237,10 +237,10 @@ def kernel_noslip(
                 )
                 old_force[0] = constraint_state.efc_force[i_c, i_b]
                 constraint_state.efc_force[i_c, i_b] -= res[0] / constraint_state.efc_AR[i_c, i_c, i_b]
-                if constraint_state.efc_force[i_c, i_b] < -constraint_state.efc_frictionloss[i_c, i_b]:
-                    constraint_state.efc_force[i_c, i_b] = -constraint_state.efc_frictionloss[i_c, i_b]
-                elif constraint_state.efc_force[i_c, i_b] > constraint_state.efc_frictionloss[i_c, i_b]:
-                    constraint_state.efc_force[i_c, i_b] = constraint_state.efc_frictionloss[i_c, i_b]
+                if constraint_state.efc_force[i_c, i_b] < -constraint_state.efc_frictionloss[i_b, i_c]:
+                    constraint_state.efc_force[i_c, i_b] = -constraint_state.efc_frictionloss[i_b, i_c]
+                elif constraint_state.efc_force[i_c, i_b] > constraint_state.efc_frictionloss[i_b, i_c]:
+                    constraint_state.efc_force[i_c, i_b] = constraint_state.efc_frictionloss[i_b, i_c]
                 delta = constraint_state.efc_force[i_c, i_b] - old_force[0]
                 improvement -= 0.5 * delta**2 / constraint_state.efc_AR[i_c, i_c, i_b] + delta * res[0]
 
