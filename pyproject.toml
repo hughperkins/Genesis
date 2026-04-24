@@ -130,6 +130,7 @@ render = [
 usd = [
     # Used for parsing `.usd` mesh files
     "usd-core==25.11",
+    "filelock",
 ]
 
 [project.scripts]
