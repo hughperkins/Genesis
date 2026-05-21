@@ -3769,12 +3769,40 @@ def func_solve_init(
         # so those writes/reads coalesce. The dofs_state.acc_smooth read remains canonical (small per-env
         # working set, dominated by the qacc write).
         if qd.static(static_rigid_sim_config.constraint_layout_transposed):
-            qd.loop_config(name="from_warmstart", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-            for i_b, i_d in qd.ndrange(_B, n_dofs):
-                if constraint_state.n_constraints[i_b] > 0 and constraint_state.is_warmstart[i_b]:
-                    constraint_state.qacc[i_d, i_b] = constraint_state.qacc_ws[i_d, i_b]
-                else:
-                    constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
+            # Exp 1.2 Stage A: fused warp-coop ``from_warmstart`` + ``initialize_Ma``. One warp per env,
+            # lanes stride i_d. Stage 1 writes qacc[i_d, i_b]; ``subgroup.sync()`` makes the writes visible
+            # to all lanes in the warp; Stage 2 computes Ma[i_d1, i_b] = mass_mat[i_d1, i_d2, i_b] *
+            # qacc[i_d2, i_b]. Saves one kernel launch and keeps qacc warm in L1/registers across the boundary
+            # (we still write it to global so downstream kernels see it). Mass-mat layout=(2,1,0) means
+            # mass_mat[i_d1, i_d2, i_b] is physically [i_b][i_d1][i_d2] -> cross-lane stride n_dofs in i_d1
+            # (same as the standalone init_ma cooperative form), and qacc[i_d2, i_b] is a per-warp broadcast.
+            _K = qd.static(32)
+            qd.loop_config(name="fused_warmstart_init_ma", block_dim=_K)
+            for i_flat in range(_B * _K):
+                tid = i_flat % _K
+                i_b = i_flat // _K
+
+                use_ws = constraint_state.n_constraints[i_b] > 0 and constraint_state.is_warmstart[i_b]
+
+                i_d = tid
+                while i_d < n_dofs:
+                    if use_ws:
+                        constraint_state.qacc[i_d, i_b] = constraint_state.qacc_ws[i_d, i_b]
+                    else:
+                        constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
+                    i_d = i_d + _K
+
+                qd.simt.subgroup.sync()
+
+                i_d1 = tid
+                while i_d1 < n_dofs:
+                    I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+                    i_e = dofs_info.entity_idx[I_d1]
+                    Ma_ = gs.qd_float(0.0)
+                    for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                        Ma_ = Ma_ + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.qacc[i_d2, i_b]
+                    constraint_state.Ma[i_d1, i_b] = Ma_
+                    i_d1 = i_d1 + _K
         else:
             qd.loop_config(name="from_warmstart", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
             for i_d, i_b in qd.ndrange(n_dofs, _B):
@@ -3783,14 +3811,14 @@ def func_solve_init(
                 else:
                     constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
 
-        initialize_Ma(
-            Ma=constraint_state.Ma,
-            qacc=constraint_state.qacc,
-            dofs_info=dofs_info,
-            entities_info=entities_info,
-            rigid_global_info=rigid_global_info,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
+            initialize_Ma(
+                Ma=constraint_state.Ma,
+                qacc=constraint_state.qacc,
+                dofs_info=dofs_info,
+                entities_info=entities_info,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
 
     # Initialize solver accordingly
     initialize_Jaref(
