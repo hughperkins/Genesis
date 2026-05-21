@@ -4043,22 +4043,53 @@ def func_update_qacc(
     n_dofs = dofs_state.acc.shape[0]
     _B = dofs_state.acc.shape[1]
 
-    # NB: ndrange-swap attempted (Exp 2) but empirically regresses the kernel further (+6.2 vs +4.5 ms
-    # vs main). Despite the access count (7 flipped + 4 canonical), the 4 dofs_state writes appear to
-    # benefit from contiguous write-combining that outweighs the partial wins on flipped reads/writes,
-    # so the canonical ndrange is kept under both layouts.
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
-        dofs_state.acc[i_d, i_b] = constraint_state.qacc[i_d, i_b]
-        dofs_state.qf_constraint[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
-        dofs_state.force[i_d, i_b] = dofs_state.qf_smooth[i_d, i_b] + constraint_state.qfrc_constraint[i_d, i_b]
-        constraint_state.qacc_ws[i_d, i_b] = constraint_state.qacc[i_d, i_b]
-        if qd.math.isnan(constraint_state.qacc[i_d, i_b]):
-            errno[i_b] = errno[i_b] | array_class.ErrorCode.INVALID_FORCE_NAN
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        # Exp 1.4: warp-per-env cooperative form. 1 warp owns 1 env, lanes stride i_d.
+        # Under the dof-vec flip qacc, qacc_ws, acc, qf_constraint, force, qf_smooth are env-leading
+        # (n_dofs, _B) -> physical [_B][i_d]; a stride-_K lane pattern hits the same cache line for
+        # adjacent lanes (stride 1 within a tile of _K), giving coalesced writes for the four dofs_state
+        # writes that Exp 2's ndrange-swap regressed. The non-atomic ``errno[i_b] |=`` is collapsed into
+        # a single lane-0 OR via ``any_true_tiled``, sidestepping the race that broke Exp 2 / Exp 4 and
+        # the JIT FMA-reorder pattern that broke Exp 4a. The trailing ``is_warmstart[i_b] = True`` loop
+        # is folded into the same lane-0 store, saving one kernel launch.
+        _K = qd.static(32)
+        qd.loop_config(name="update_qacc_coop", block_dim=_K)
+        for i_flat in range(_B * _K):
+            tid = i_flat % _K
+            i_b = i_flat // _K
 
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        constraint_state.is_warmstart[i_b] = True
+            local_nan = qd.i32(0)
+            i_d = tid
+            while i_d < n_dofs:
+                qacc_v = constraint_state.qacc[i_d, i_b]
+                qfc_v = constraint_state.qfrc_constraint[i_d, i_b]
+                dofs_state.acc[i_d, i_b] = qacc_v
+                dofs_state.qf_constraint[i_d, i_b] = qfc_v
+                dofs_state.force[i_d, i_b] = dofs_state.qf_smooth[i_d, i_b] + qfc_v
+                constraint_state.qacc_ws[i_d, i_b] = qacc_v
+                if qd.math.isnan(qacc_v):
+                    local_nan = qd.i32(1)
+                i_d = i_d + _K
+
+            any_nan = qd.simt.subgroup.any_true_tiled(local_nan, 5)
+            if tid == 0:
+                if any_nan != 0:
+                    errno[i_b] = errno[i_b] | array_class.ErrorCode.INVALID_FORCE_NAN
+                constraint_state.is_warmstart[i_b] = True
+    else:
+        # Canonical paths preserved bit-identically.
+        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_d, i_b in qd.ndrange(n_dofs, _B):
+            dofs_state.acc[i_d, i_b] = constraint_state.qacc[i_d, i_b]
+            dofs_state.qf_constraint[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
+            dofs_state.force[i_d, i_b] = dofs_state.qf_smooth[i_d, i_b] + constraint_state.qfrc_constraint[i_d, i_b]
+            constraint_state.qacc_ws[i_d, i_b] = constraint_state.qacc[i_d, i_b]
+            if qd.math.isnan(constraint_state.qacc[i_d, i_b]):
+                errno[i_b] = errno[i_b] | array_class.ErrorCode.INVALID_FORCE_NAN
+
+        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_b in range(_B):
+            constraint_state.is_warmstart[i_b] = True
 
 
 from genesis.utils.deprecated_module_wrapper import create_virtual_deprecated_module
