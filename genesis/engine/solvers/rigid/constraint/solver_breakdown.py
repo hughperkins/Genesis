@@ -950,12 +950,32 @@ def _func_cholesky_and_solve_fused(
 
 
 @qd.func
+def _func_check_early_exit_pre(
+    constraint_state: array_class.ConstraintState,
+    graph_counter: qd.types.ndarray(qd.i32, ndim=0),
+):
+    # F2: hoisted out of (former) _func_check_early_exit so the flag reset
+    # happens BEFORE the atomic_max that is now fused into
+    # _func_update_search_direction.
+    qd.loop_config(name="check_early_exit_reset_flag")
+    for _ in range(1):
+        graph_counter[()] = graph_counter[()] - 1
+        constraint_state.early_exit_flag[()] = 0
+
+
+@qd.func
 def _func_update_search_direction(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Step 6: Check convergence and update search direction"""
+    """Step 6: Check convergence and update search direction.
+
+    F2: also performs the fused per-batch `check_early_exit_scan_values`
+    atomic_max — only when `improved[i_b]` is still True after the descent
+    call (matches original scan_values semantics, which ran after
+    update_search_direction).
+    """
     _B = constraint_state.grad.shape[1]
     qd.loop_config(
         name="update_search_direction", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32
@@ -968,25 +988,18 @@ def _func_update_search_direction(
                 constraint_state=constraint_state,
                 static_rigid_sim_config=static_rigid_sim_config,
             )
+            if constraint_state.improved[i_b]:
+                qd.atomic_max(constraint_state.early_exit_flag[()], 1)
 
 
 @qd.func
-def _func_check_early_exit(
+def _func_check_early_exit_post(
     constraint_state: array_class.ConstraintState,
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
-    """Decrement iteration counter and exit early if no batch element improved."""
-    qd.loop_config(name="check_early_exit_reset_flag")
-    for _ in range(1):
-        graph_counter[()] = graph_counter[()] - 1
-        constraint_state.early_exit_flag[()] = 0
-
-    _B = constraint_state.grad.shape[1]
-    qd.loop_config(name="check_early_exit_scan_values")
-    for i_b in range(_B):
-        if constraint_state.improved[i_b]:
-            qd.atomic_max(constraint_state.early_exit_flag[()], 1)
-
+    # F2: only set_counter remains here; reset_flag was hoisted to
+    # _func_check_early_exit_pre and scan_values was fused into
+    # _func_update_search_direction.
     qd.loop_config(name="check_early_exit_set_counter")
     for _ in range(1):
         if constraint_state.early_exit_flag[()] == 0:
@@ -1041,8 +1054,9 @@ def _kernel_solve_graph(
             _func_update_gradient(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
+        _func_check_early_exit_pre(constraint_state, graph_counter)
         _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config)
-        _func_check_early_exit(constraint_state, graph_counter)
+        _func_check_early_exit_post(constraint_state, graph_counter)
 
 
 @solver.func_solve_body.register(
