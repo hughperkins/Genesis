@@ -1831,7 +1831,9 @@ def func_hessian_direct_tiled(
 
 # Per-kernel grid-stride block sizes. Threads per env for the (env, c)-loop kernels.
 # Tuned on dex_hand 4096 envs (n_c ~ 40, n_d=62) -- sweet spots can shift with scene scale.
-_BUILD_CSR_BLOCK = 128
+# build_csr does heavy per-thread work (62 dof scans per c) so fewer/heavier threads is better.
+# scatter and qfrc both have lighter per-c work; more parallelism helps amortize atomic latency.
+_BUILD_CSR_BLOCK = 32
 _SCATTER_BLOCK = 128
 _QFRC_BLOCK = 128
 

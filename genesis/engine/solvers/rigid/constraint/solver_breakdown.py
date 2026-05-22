@@ -834,17 +834,16 @@ def _func_newton_only_nt_hessian(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others)."""
-    if qd.static(static_rigid_sim_config.hessian_sparse_build):
-        solver.func_hessian_direct_sparse_scatter(
-            constraint_state=constraint_state,
-            rigid_global_info=rigid_global_info,
-            check_full_hessian=True,
-        )
-    else:
-        solver.func_hessian_direct_tiled(
-            constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
-        )
+    """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others).
+
+    Always uses the dense path. The sparse atomic-scatter is competitive on
+    first-iter (where most envs are improved) but regresses here because
+    use_full_hessian filters out most envs and the two-kernel sparse pattern
+    pays launch overhead per substep regardless.
+    """
+    solver.func_hessian_direct_tiled(
+        constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
+    )
 
 
 @qd.func
