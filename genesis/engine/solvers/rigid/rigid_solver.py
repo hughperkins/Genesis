@@ -401,6 +401,30 @@ class RigidSolver(KinematicSolver):
             gpu_cores = 16384
         return self.n_envs <= gpu_cores
 
+    def _should_enable_block_arrowhead_cholesky(self) -> tuple[bool, int, int]:
+        """Decide whether to enable block-arrowhead Cholesky for kinematically-decoupled scenes.
+
+        Returns (enabled, split_a, split_b). The Hessian is treated as a doubly-bordered
+        block-arrowhead with three blocks ``[0, split_a)``, ``[split_a, split_b)``, ``[split_b, n_dofs)``.
+
+        Currently controlled by env var ``GS_BLOCK_ARROWHEAD_CHOLESKY=1`` and defaults to the
+        dex_hand layout (28, 56). Other scenes need explicit splits via
+        ``GS_BLOCK_ARROWHEAD_SPLIT_A`` / ``GS_BLOCK_ARROWHEAD_SPLIT_B``.
+        """
+        import os
+        if os.environ.get("GS_BLOCK_ARROWHEAD_CHOLESKY", "0") != "1":
+            return False, -1, -1
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False, -1, -1
+        try:
+            split_a = int(os.environ.get("GS_BLOCK_ARROWHEAD_SPLIT_A", "28"))
+            split_b = int(os.environ.get("GS_BLOCK_ARROWHEAD_SPLIT_B", "56"))
+        except ValueError:
+            return False, -1, -1
+        if not (0 < split_a < split_b < self.n_dofs):
+            return False, -1, -1
+        return True, split_a, split_b
+
     def _should_transpose_constraint_layout(self) -> bool:
         """Decide whether to allocate the layout-flippable constraint-state with layout=(1, 0).
 
@@ -478,6 +502,14 @@ class RigidSolver(KinematicSolver):
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
                 )
+
+                arrow_enabled, split_a, split_b = self._should_enable_block_arrowhead_cholesky()
+                if arrow_enabled and enable_tiled_cholesky_hessian:
+                    static_rigid_sim_config.update(
+                        enable_block_arrowhead_cholesky=True,
+                        block_arrowhead_split_a=split_a,
+                        block_arrowhead_split_b=split_b,
+                    )
 
             # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
             if self.sim.options.requires_grad:

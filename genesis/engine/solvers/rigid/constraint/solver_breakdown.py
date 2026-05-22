@@ -751,6 +751,11 @@ def _func_build_changed_and_decide_hessian_mode(
 
     Adaptive policy: use full rebuild if more than half the constraints changed, otherwise patch. Init (iter 0) always
     does full rebuild via func_solve_init.
+
+    When ``static_rigid_sim_config.enable_block_arrowhead_cholesky`` is True, also computes
+    ``use_block_arrowhead[i_b]``: 1 if no active constraint J row spans both DOF blocks
+    ``[0, split_a)`` (left) and ``[split_a, split_b)`` (right), 0 otherwise. The arrowhead path
+    only fires when the flag is 1; envs with cross-LR coupling fall back to the dense path.
     """
     qd.loop_config(name="increment_iter_counter")
     for _ in range(1):
@@ -773,6 +778,76 @@ def _func_build_changed_and_decide_hessian_mode(
                     constraint_state.use_full_hessian[i_b] = 1
                 else:
                     constraint_state.use_full_hessian[i_b] = 0
+
+    if qd.static(static_rigid_sim_config.enable_block_arrowhead_cholesky):
+        _func_decide_block_arrowhead(constraint_state, static_rigid_sim_config)
+
+
+@qd.func
+def _func_decide_block_arrowhead(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Set ``use_block_arrowhead[i_b]`` per env (1 = arrowhead valid, 0 = dense fallback).
+
+    Scans active constraint J rows for any column non-zero pattern that spans both
+    ``[0, split_a)`` and ``[split_a, split_b)``. Each thread handles a striped subset
+    of constraints; if any thread finds a cross-LR constraint it sets a shared flag
+    (race-free: all writers write 1). Naive O(nefc * n_dofs) cost per env per call.
+    """
+    _B = constraint_state.grad.shape[1]
+    split_a = qd.static(static_rigid_sim_config.block_arrowhead_split_a)
+    split_b = qd.static(static_rigid_sim_config.block_arrowhead_split_b)
+
+    BLOCK_DIM = qd.static(32)
+    qd.loop_config(name="decide_block_arrowhead", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
+
+        # Per-block shared flag: any cross-LR constraint detected? (1 = yes)
+        sh_cross = qd.simt.block.SharedArray((1,), qd.i32)
+        if tid == 0:
+            sh_cross[0] = 0
+        qd.simt.block.sync()
+
+        n_c = constraint_state.n_constraints[i_b]
+        local_cross = 0
+        i_c = tid
+        while i_c < n_c:
+            if local_cross == 0 and constraint_state.active[i_c, i_b]:
+                has_L = False
+                has_R = False
+                i_d = 0
+                while i_d < split_a:
+                    if constraint_state.jac[i_c, i_d, i_b] != 0.0:
+                        has_L = True
+                        i_d = split_a
+                    else:
+                        i_d = i_d + 1
+                if has_L:
+                    i_d = split_a
+                    while i_d < split_b:
+                        if constraint_state.jac[i_c, i_d, i_b] != 0.0:
+                            has_R = True
+                            i_d = split_b
+                        else:
+                            i_d = i_d + 1
+                    if has_R:
+                        local_cross = 1
+            i_c = i_c + BLOCK_DIM
+
+        # Race-free OR-reduce: every writer writes 1, no one writes 0.
+        if local_cross == 1:
+            sh_cross[0] = 1
+        qd.simt.block.sync()
+
+        if tid == 0:
+            constraint_state.use_block_arrowhead[i_b] = 1 - sh_cross[0]
 
 
 @qd.func

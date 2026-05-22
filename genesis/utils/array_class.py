@@ -314,6 +314,9 @@ class ConstraintState:
     timers: qd.Tensor
     # Per-env flag: 0 = use incremental Hessian+Cholesky, 1 = use full tiled rebuild
     use_full_hessian: qd.Tensor
+    # Per-env flag: 1 = arrowhead Cholesky valid (no L<->R direct coupling), 0 = dense fallback.
+    # Only meaningful when static_rigid_sim_config.enable_block_arrowhead_cholesky is True.
+    use_block_arrowhead: qd.Tensor
     # Solver loop iteration counter (0-indexed, increments each iteration in the graph loop)
     solver_iter_counter: qd.Tensor
     # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
@@ -437,6 +440,13 @@ def get_constraint_state(constraint_solver, solver):
         # Timers
         timers=V(dtype=qd.i64 if gs.backend != gs.metal else qd.i32, shape=(10, _B)),
         use_full_hessian=V(dtype=qd.i32, shape=(_B,)),
+        use_block_arrowhead=V(
+            dtype=qd.i32,
+            shape=maybe_shape(
+                (_B,),
+                bool(getattr(constraint_solver, "_enable_block_arrowhead_cholesky", False)),
+            ),
+        ),
         solver_iter_counter=V(dtype=qd.i32, shape=()),
         graph_counter=qd.ndarray(qd.i32, shape=()),
         early_exit_flag=V(dtype=qd.i32, shape=()),
@@ -2098,6 +2108,14 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # Block-arrowhead Cholesky for kinematically-decoupled scenes (dex_hand etc.).
+    # When True, factors H as a doubly-bordered block-arrowhead matrix using DOF blocks
+    # [0, block_arrowhead_split_a) (left) | [block_arrowhead_split_a, block_arrowhead_split_b) (right) |
+    # [block_arrowhead_split_b, n_dofs) (cap). Falls back to dense path on envs where any active
+    # constraint J row spans both left and right blocks (use_block_arrowhead[i_b] == 0).
+    enable_block_arrowhead_cholesky: bool = False
+    block_arrowhead_split_a: int = -1
+    block_arrowhead_split_b: int = -1
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.

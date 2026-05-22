@@ -61,6 +61,13 @@ class ConstraintSolver:
         self.ls_iterations = rigid_solver._options.ls_iterations
         self.ls_tolerance = rigid_solver._options.ls_tolerance
         self.sparse_solve = rigid_solver._options.sparse_solve
+        # Block-arrowhead Cholesky toggle (read by get_constraint_state to size use_block_arrowhead).
+        # Re-derived at static-config build time; cached here for the constraint-state allocator.
+        self._enable_block_arrowhead_cholesky = bool(
+            rigid_solver._should_enable_block_arrowhead_cholesky()[0]
+            if hasattr(rigid_solver, "_should_enable_block_arrowhead_cholesky")
+            else False
+        )
 
         # Note that it must be over-estimated because friction parameters and joint limits may be updated dynamically.
         # * 4 constraints per contact
