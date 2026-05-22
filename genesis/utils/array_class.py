@@ -317,6 +317,10 @@ class ConstraintState:
     # Per-env flag: 1 = arrowhead Cholesky valid (no L<->R direct coupling), 0 = dense fallback.
     # Only meaningful when static_rigid_sim_config.enable_block_arrowhead_cholesky is True.
     use_block_arrowhead: qd.Tensor
+    # Per-env count of currently-active constraints whose J row spans both L and R DOF blocks.
+    # Maintained incrementally: full-scan at substep init, deltas during in-graph iters.
+    # use_block_arrowhead[i_b] = 1 iff n_cross_lr_active[i_b] == 0.
+    n_cross_lr_active: qd.Tensor
     # Solver loop iteration counter (0-indexed, increments each iteration in the graph loop)
     solver_iter_counter: qd.Tensor
     # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
@@ -441,6 +445,13 @@ def get_constraint_state(constraint_solver, solver):
         timers=V(dtype=qd.i64 if gs.backend != gs.metal else qd.i32, shape=(10, _B)),
         use_full_hessian=V(dtype=qd.i32, shape=(_B,)),
         use_block_arrowhead=V(
+            dtype=qd.i32,
+            shape=maybe_shape(
+                (_B,),
+                bool(getattr(constraint_solver, "_enable_block_arrowhead_cholesky", False)),
+            ),
+        ),
+        n_cross_lr_active=V(
             dtype=qd.i32,
             shape=maybe_shape(
                 (_B,),
