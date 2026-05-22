@@ -2098,6 +2098,14 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # When True, the init-iter Hessian rebuild routes through a sparse CSR-based kernel
+    # (`func_hessian_csr_build`) instead of the dense `func_hessian_direct_tiled`. The sparse path scans
+    # each constraint's Jacobian row at thread time to find nonzero DoFs, then atomic-scatters
+    # J^T D J contributions into nt_H. On dex_hand (n_dofs=60, n_c~55, J nonzeros/row ~6), ~99 % of the
+    # dense kernel's FFMAs are 0 x 0 and get skipped here. See doc/cholesky_cross_substep_warmstart_2026may22.md
+    # (P3 H2). Gated on GPU + Newton + tiled-cholesky + not sparse_solve (the existing sparse_solve path
+    # already has its own CSR-based sparse build).
+    enable_csr_hessian_build: bool = False
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.

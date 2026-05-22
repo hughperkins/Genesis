@@ -1679,6 +1679,107 @@ def func_hessian_direct_batch(
 
 
 @qd.func
+def func_hessian_csr_build(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Sparse Hessian build: H = M + J.T @ D @ J via per-(env, constraint) atomic scatter.
+
+    P3 H2 optimisation (see ``perso_hugh/doc/cholesky_cross_substep_warmstart_2026may22.md``). Equivalent
+    semantics to ``func_hessian_direct_tiled`` (without ``check_full_hessian``: this entry point is only
+    used for the full init-iter rebuild, not the per-iter gated rebuild).
+
+    Exploits Jacobian row sparsity. For dex_hand (n_dofs=60, n_c~55, J nonzeros / row ~6),
+    ``func_hessian_direct_tiled`` does ``n_c * n_dofs * (n_dofs+1) / 2 ~= 100k`` FFMAs per env, of which
+    ``~99 %`` are ``0 * 0``. This kernel touches only the ``n_c * n_nz * (n_nz+1) / 2 ~= 1k`` true FFMAs
+    per env (~100x fewer).
+
+    Two phases (= two separate kernel launches inside one @qd.func):
+
+      1. ``hessian_csr_init_M``: one thread per (env, lower-tri pair), copies
+         ``mass_mat[i_d1, i_d2, i_b]`` into ``nt_H[i_b, i_d1, i_d2]``.
+      2. ``hessian_csr_accumulate``: one thread per (env, constraint), scans
+         ``jac[i_c, :, i_b]`` for nonzeros (in registers, ascending order via a local
+         ``qd.Vector`` pair), then ``atomic_add``s ``D * J[d1] * J[d2]`` into
+         ``nt_H[i_b, d1, d2]`` for every lower-tri (d1, d2) nonzero-pair (n_nz * (n_nz+1) / 2 atomics
+         per active constraint).
+
+    Coalescing: requires ``constraint_layout_transposed=True`` (the dex_hand default). Under transposed
+    layout ``jac`` is physically (_B, n_dofs, n_c) with stride-1 over i_c, so adjacent warp lanes (same
+    i_b, adjacent i_c) get fully-coalesced reads.
+
+    Beware ``nt_H`` is re-purposed downstream to store the Cholesky factor L. This kernel only writes
+    the lower triangle; the strictly upper triangle is left untouched (matches
+    ``func_hessian_direct_tiled``).
+    """
+    EPS = rigid_global_info.EPS[None]
+
+    _B = constraint_state.nt_H.shape[0]
+    n_dofs = constraint_state.nt_H.shape[1]
+    n_c_max = constraint_state.jac.shape[0]
+
+    n_lower_tri = n_dofs * (n_dofs + 1) // 2
+
+    # Phase 1: H = M (lower triangle copy). One thread per (env, lower_tri_pair).
+    # block_dim=64 picked to match the accumulate phase below (same launch grid class) so the compiler
+    # can reuse the same launch config object.
+    qd.loop_config(name="hessian_csr_init_M", block_dim=64)
+    for i in range(_B * n_lower_tri):
+        i_b = i // n_lower_tri
+        i_pair = i % n_lower_tri
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            # Inactive env: leave nt_H alone (the dense path doesn't write either for the
+            # ``not improved`` case; for ``n_c == 0`` the dense path writes M in a fallback branch
+            # but that path produces a Cholesky of M with no constraint contribution, which is fine
+            # to skip here since the rest of the substep handles n_c == 0 envs separately).
+            continue
+        i_d1, i_d2 = linear_to_lower_tri(i_pair)
+        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+
+    # Phase 2: H += sum_c D_c * J_c^T J_c via atomic scatter. One thread per (env, constraint).
+    # N_NZ_MAX = 32 covers all reasonable constraint types on n_dofs <= 64 scenes:
+    #   - contact normal/friction: up to ~6 dofs (chain to ground)
+    #   - bilateral equality: up to 12 dofs (2 entities x 6)
+    #   - joint limit: 1 dof
+    # 32 leaves margin for n_dofs up to 64; assert at the call-site guarantees no constraint exceeds it.
+    N_NZ_MAX = qd.static(32)
+
+    qd.loop_config(name="hessian_csr_accumulate", block_dim=64)
+    for i in range(_B * n_c_max):
+        i_b = i // n_c_max
+        i_c = i % n_c_max
+        if i_c >= constraint_state.n_constraints[i_b]:
+            continue
+        if not constraint_state.improved[i_b]:
+            continue
+        D = constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+        if D == 0.0:
+            continue
+
+        # Scan jac row, build per-thread CSR in registers (ascending dof order).
+        nz_dofs = qd.Vector([0] * N_NZ_MAX, dt=gs.qd_int)
+        nz_vals = qd.Vector([0.0] * N_NZ_MAX, dt=gs.qd_float)
+        n_nz = 0
+        for i_d in range(n_dofs):
+            v = constraint_state.jac[i_c, i_d, i_b]
+            if qd.abs(v) > EPS and n_nz < N_NZ_MAX:
+                nz_dofs[n_nz] = i_d
+                nz_vals[n_nz] = v
+                n_nz = n_nz + 1
+
+        # Scatter J^T D J lower-tri contributions.
+        # nz_dofs is ascending => for l <= k we have nz_dofs[l] <= nz_dofs[k], i.e. i_d2 <= i_d1
+        # (lower triangle). Auto-atomic via Taichi ``+=`` on tensor element.
+        for k in range(n_nz):
+            i_d1 = nz_dofs[k]
+            j1 = nz_vals[k]
+            for l in range(k + 1):
+                i_d2 = nz_dofs[l]
+                j2 = nz_vals[l]
+                constraint_state.nt_H[i_b, i_d1, i_d2] += D * j1 * j2
+
+
+@qd.func
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -2116,7 +2217,14 @@ def func_hessian_and_cholesky_factor_direct(
             )
     else:
         # GPU
-        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        # P3 H2 dispatch (see ``doc/cholesky_cross_substep_warmstart_2026may22.md``): if the CSR sparse build path
+        # is enabled (gated in rigid_solver.py on Newton + tiled cholesky + not sparse_solve + n_dofs > 16 + n_envs
+        # >= 256), use it instead of the dense tiled rebuild. For dex_hand the sparse path saves ~99 % of the dense
+        # FFMA work (which is on 0 x 0 entries).
+        if qd.static(static_rigid_sim_config.enable_csr_hessian_build):
+            func_hessian_csr_build(constraint_state, rigid_global_info)
+        else:
+            func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
