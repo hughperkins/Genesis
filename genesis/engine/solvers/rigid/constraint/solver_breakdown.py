@@ -800,14 +800,16 @@ def _func_block_arrowhead_is_cross_lr(
             i_d = split_a
         else:
             i_d = i_d + 1
-    if not has_L:
-        return False
-    i_d = split_a
-    while i_d < split_b:
-        if constraint_state.jac[i_c, i_d, i_b] != 0.0:
-            return True
-        i_d = i_d + 1
-    return False
+    has_R = False
+    if has_L:
+        i_d = split_a
+        while i_d < split_b:
+            if constraint_state.jac[i_c, i_d, i_b] != 0.0:
+                has_R = True
+                i_d = split_b
+            else:
+                i_d = i_d + 1
+    return has_L and has_R
 
 
 @qd.func
