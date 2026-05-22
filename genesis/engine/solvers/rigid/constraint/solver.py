@@ -1772,7 +1772,12 @@ def func_hessian_direct_tiled(
                             i_c_ = i_c_ + BLOCK_DIM
                         qd.simt.block.sync()
 
-                    # Compute `H += J.T @ D @ J` for a single Hessian block
+                    # Compute `H += J.T @ D @ J` for a single Hessian block.
+                    # E1 (sparse-jacobian-hessian): skip the second shmem load + FMA when the row entry is exactly zero.
+                    # On dex_hand the dense `jac_row` tile is ~92% zeros, so the skip eliminates most of the inner work.
+                    # Within a warp all threads execute the same `j_c_` loop and only branch on their own per-element
+                    # `jac_row[j_c_, i_d1_]`; the conditional reduces (read+FMA) to a register read most of the time and
+                    # leaves the rare nonzero path untouched.
                     if is_diag_tile:
                         n_lower_tri_tile = n_dofs_tile_row * (n_dofs_tile_row + 1) // 2
                         pid = tid
@@ -1784,7 +1789,9 @@ def func_hessian_direct_tiled(
                             if i_c_start == 0:
                                 coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
-                                coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_] * efc_D[j_c_]
+                                Ji = jac_row[j_c_, i_d1_]
+                                if Ji != 0.0:
+                                    coef = coef + Ji * jac_row[j_c_, i_d2_] * efc_D[j_c_]
                             if i_c_start == 0:
                                 constraint_state.nt_H[i_b, i_d1, i_d2] = coef
                             else:
@@ -1802,7 +1809,9 @@ def func_hessian_direct_tiled(
                             if i_c_start == 0:
                                 coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
-                                coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_] * efc_D[j_c_]
+                                Ji = jac_row[j_c_, i_d1_]
+                                if Ji != 0.0:
+                                    coef = coef + Ji * jac_col[j_c_, i_d2_] * efc_D[j_c_]
                             if i_c_start == 0:
                                 constraint_state.nt_H[i_b, i_d1, i_d2] = coef
                             else:
