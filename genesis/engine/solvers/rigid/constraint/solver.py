@@ -1825,6 +1825,98 @@ def func_hessian_direct_tiled(
 
 
 @qd.func
+def func_hessian_direct_sparse_scatter(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    check_full_hessian: qd.template() = False,
+):
+    """Sparse atomic-scatter alternative to ``func_hessian_direct_tiled``.
+
+    Computes H = M + J^T D J for all envs using an mjwarp ``_JTDAJ_sparse``-style
+    shape: one thread per ``(env, constraint)`` discovers the non-zero pattern of
+    each J row on the fly, caches the ``(d_idx, J_val)`` list in shared memory,
+    then triangularly atomic-scatters the lower-triangle contributions into
+    ``nt_H``.
+
+    Two top-level loops -> two CUDA launches:
+        1. ``nt_H_init_M`` lays down the lower-triangle of M into ``nt_H`` for envs
+           that would have run the dense kernel.
+        2. ``nt_H_scatter`` does the J^T D J accumulation on top. One block per
+           env, BLOCK_DIM threads, each thread takes one constraint per chunk and
+           writes its own slice of a shared-memory ``(BLOCK_DIM, MAX_NNZ_PER_ROW)``
+           scratch.
+
+    Same early-exit semantics as ``func_hessian_direct_tiled`` (line 1721-1727):
+        - ``n_constraints[i_b] == 0`` or ``not improved[i_b]`` -> dense kernel skips
+          the J^T D J loop but still wipes lower-tri of nt_H to M. We do the same
+          via the init loop; the scatter loop early-exits.
+        - ``check_full_hessian and use_full_hessian[i_b] == 0`` -> dense kernel
+          skips the entire env (so nt_H is left untouched for the patch path to
+          modify in place). We also skip M-init for those envs.
+
+    Toggled by ``static_rigid_sim_config.hessian_sparse_build``. See
+    ``perso_hugh/doc/func_solve_init_attribution_2026may22.md`` "E5 implementation".
+    """
+    EPS = rigid_global_info.EPS[None]
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+
+    qd.loop_config(name="nt_H_init_M")
+    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
+        if i_d2 > i_d1:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+        if not constraint_state.improved[i_b]:
+            continue
+        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+
+    BLOCK_DIM = qd.static(128)
+    MAX_NNZ_PER_ROW = qd.static(32)
+
+    qd.loop_config(name="nt_H_scatter", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        n_c = constraint_state.n_constraints[i_b]
+        if n_c == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+
+        nz_idx = qd.simt.block.SharedArray((BLOCK_DIM, MAX_NNZ_PER_ROW), gs.qd_int)
+        nz_val = qd.simt.block.SharedArray((BLOCK_DIM, MAX_NNZ_PER_ROW), gs.qd_float)
+
+        i_c_base = 0
+        while i_c_base < n_c:
+            i_c = i_c_base + tid
+            if i_c < n_c and constraint_state.active[i_c, i_b]:
+                nnz = 0
+                for i_d in range(n_dofs):
+                    v = constraint_state.jac[i_c, i_d, i_b]
+                    if qd.abs(v) > EPS:
+                        # NB: relies on MAX_NNZ_PER_ROW being large enough; production scenes
+                        # are checked at warmup in tests (see test_e5_hessian_sparse_build).
+                        nz_idx[tid, nnz] = i_d
+                        nz_val[tid, nnz] = v
+                        nnz = nnz + 1
+
+                Dc = constraint_state.efc_D[i_c, i_b]
+                for ii in range(nnz):
+                    d_i = nz_idx[tid, ii]
+                    v_i = nz_val[tid, ii]
+                    for jj in range(ii + 1):
+                        d_j = nz_idx[tid, jj]
+                        v_j = nz_val[tid, jj]
+                        row = qd.max(d_i, d_j)
+                        col = qd.min(d_i, d_j)
+                        qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
+            i_c_base = i_c_base + BLOCK_DIM
+
+
+@qd.func
 def func_cholesky_factor_direct_batch(
     i_b,
     constraint_state: array_class.ConstraintState,
@@ -2111,7 +2203,10 @@ def func_hessian_and_cholesky_factor_direct(
             )
     else:
         # GPU
-        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        if qd.static(static_rigid_sim_config.hessian_sparse_build):
+            func_hessian_direct_sparse_scatter(constraint_state, rigid_global_info)
+        else:
+            func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)

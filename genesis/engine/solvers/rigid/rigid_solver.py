@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 from typing import TYPE_CHECKING, Literal
 
@@ -401,6 +402,16 @@ class RigidSolver(KinematicSolver):
             gpu_cores = 16384
         return self.n_envs <= gpu_cores
 
+    def _should_use_hessian_sparse_build(self) -> bool:
+        """Opt-in toggle for the mjwarp-style sparse atomic-scatter H = M + J^T D J build.
+
+        Off by default; set environment variable ``GS_HESSIAN_SPARSE_BUILD=1`` to enable.
+        Only meaningful on the GPU backend; the CPU and ``sparse_solve=True`` paths ignore
+        this flag. See ``perso_hugh/doc/func_solve_init_attribution_2026may22.md``
+        "E5 implementation" section.
+        """
+        return os.environ.get("GS_HESSIAN_SPARSE_BUILD", "0") == "1"
+
     def _should_transpose_constraint_layout(self) -> bool:
         """Decide whether to allocate the layout-flippable constraint-state with layout=(1, 0).
 
@@ -449,6 +460,7 @@ class RigidSolver(KinematicSolver):
             broadphase_traversal=self._resolve_broadphase_traversal(),
             parallel_init=self._should_use_parallel_init(),
             constraint_layout_transposed=self._should_transpose_constraint_layout(),
+            hessian_sparse_build=self._should_use_hessian_sparse_build(),
         )
 
         # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)

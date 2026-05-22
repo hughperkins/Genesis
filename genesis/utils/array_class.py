@@ -2098,6 +2098,12 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # When True, the GPU H = M + J^T D J build uses an mjwarp-style atomic-scatter pattern with one
+    # thread per (env, constraint) that discovers the non-zero pattern of each J row on the fly.
+    # When False (default), uses the existing dense tiled implementation. Only consulted on the GPU
+    # backend; CPU and sparse_solve paths are unaffected. See
+    # ~/git/perso_hugh/doc/func_solve_init_attribution_2026may22.md "E5 implementation" section.
+    hessian_sparse_build: bool = False
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.
