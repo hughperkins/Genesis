@@ -294,6 +294,12 @@ class ConstraintState:
     # kernel to skip re-factorization when the constraint active set is unchanged (incr_n_changed[i_b] == 0).
     # Same shape as nt_H. ~67 MB at 4096 envs / 64 dofs.
     nt_L_cache: qd.Tensor
+    # Per-env flag: 1 if nt_L_cache[i_b] holds the L matching the current nt_H[i_b], 0 if stale or unwritten.
+    # Set to 0 by full-Hessian-rebuild iters (which deliberately skip the cache write to save bandwidth, since
+    # forced rebuilds usually cluster at step start where the active set is in flux and skip is unreachable
+    # anyway); set to 1 by patch iters that factor and write the cache. The skip path additionally requires
+    # this flag == 1.
+    nt_L_cache_valid: qd.Tensor
     nt_vec: qd.Tensor
     # Compacted list of constraints whose active state changed, used by incremental Cholesky update
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
@@ -402,6 +408,7 @@ def get_constraint_state(constraint_solver, solver):
         nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         nt_L_cache=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
+        nt_L_cache_valid=V(dtype=qd.i32, shape=(_B,)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),

@@ -1954,12 +1954,20 @@ def func_cholesky_and_solve_fused_tiled(
     L L^T x = g (forward + backward substitution) in-place and writes the result to Mgrad.
 
     Skip-unchanged optimization: when the constraint active set has not changed for this env
-    (`use_full_hessian[i_b] == 0` and `incr_n_changed[i_b] == 0`), the previous iter's L is loaded from
-    `nt_L_cache` into shared memory and the factor loop is skipped entirely. Otherwise the factor loop
-    runs as before and writes each completed L tile to both shared memory (for the substitution that
-    follows) and `nt_L_cache` (for the next iter's skip path). The dispatcher in
-    `_func_build_changed_and_decide_hessian_mode` already ensures `use_full_hessian == 1` on iter <= 1,
-    so the skip path is unreachable before nt_L_cache has been populated by iter-1's factor.
+    (`use_full_hessian[i_b] == 0` and `incr_n_changed[i_b] == 0`) AND nt_L_cache holds a fresh L
+    (`nt_L_cache_valid[i_b] == 1`), the previous iter's L is loaded from `nt_L_cache` into shared
+    memory and the factor loop is skipped entirely.
+
+    Adaptive write-gating (E2): cache writes are gated on `use_full_hessian == 0`. Forced full-rebuild
+    iters do NOT write the cache (and clear nt_L_cache_valid to 0). These iters fire mostly at
+    Newton-iter <= 1 of each substep (per `_func_build_changed_and_decide_hessian_mode`) where the
+    active set has just changed significantly, so the freshly factored L is unlikely to be reused on
+    the very next iter (which is itself another forced rebuild). Patch iters DO write the cache and
+    set the valid flag, because they're the predecessor iters that actually feed a skip.
+
+    Expected impact: roughly halves cache-write traffic on dex_hand vs E1 (forced-rebuild fraction is
+    ~67 % of factor iters; patch fraction ~33 %). Skip eligibility is unchanged because skips can only
+    follow a patch iter anyway (use_full_hessian == 0 was already a precondition).
     """
     EPS = rigid_global_info.EPS[None]
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
@@ -1981,9 +1989,17 @@ def func_cholesky_and_solve_fused_tiled(
         L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
         v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
 
+        # nt_L_cache_valid gates the skip path: a stale cache from a prior step's last patch iter MUST NOT
+        # be reused once a full-rebuild iter intervenes (the cache hasn't been refreshed to match the new H).
         skip_factor = (
-            constraint_state.use_full_hessian[i_b] == 0 and constraint_state.incr_n_changed[i_b] == 0
+            constraint_state.use_full_hessian[i_b] == 0
+            and constraint_state.incr_n_changed[i_b] == 0
+            and constraint_state.nt_L_cache_valid[i_b] == 1
         )
+        # Cache write gate: only patch iters (use_full_hessian == 0) write the cache. Full-rebuild iters
+        # are excluded — they pay the factor cost regardless and their L typically gets overwritten by the
+        # next iter's rebuild anyway (no skip benefit lost; cache-write bandwidth ~halved on dex_hand).
+        should_write_cache = constraint_state.use_full_hessian[i_b] == 0
 
         if skip_factor:
             # Reuse previous iter's L: load tiles from nt_L_cache directly into L_sh, skip factor loop.
@@ -2044,13 +2060,25 @@ def func_cholesky_and_solve_fused_tiled(
                     # Triangular solve: L[i,k] = L_ik @ inv(L[k,k]^T)
                     L_kk.solve_triangular_(L_ik)
 
-                    # Write L[i,k] to shared memory (for in-kernel substitution) and to nt_L_cache (for next-iter skip).
+                    # Write L[i,k] to shared memory (for in-kernel substitution) and, if this is a
+                    # patch iter (write-gating below), to nt_L_cache for the next-iter skip path.
                     L_ik._store(L_sh, i0, i1, k0, k1)
-                    L_ik._store3d(constraint_state.nt_L_cache, i_b, i0, i1, k0, k1)
+                    if should_write_cache:
+                        L_ik._store3d(constraint_state.nt_L_cache, i_b, i0, i1, k0, k1)
 
-                # Write L[k,k] to shared memory (for in-kernel substitution) and to nt_L_cache (for next-iter skip).
+                # Write L[k,k] to shared memory (for in-kernel substitution) and, conditionally, to nt_L_cache.
                 L_kk._store(L_sh, k0, k1, k0, k1)
-                L_kk._store3d(constraint_state.nt_L_cache, i_b, k0, k1, k0, k1)
+                if should_write_cache:
+                    L_kk._store3d(constraint_state.nt_L_cache, i_b, k0, k1, k0, k1)
+
+            # Update the cache validity flag once per env outside the per-block loop. Thread 0 owns the write
+            # (it's a scalar update and other threads have nothing to add). The factor branch is the only place
+            # nt_L_cache can become valid/invalid: skip iters trivially preserve the cache state.
+            if tid == 0:
+                if should_write_cache:
+                    constraint_state.nt_L_cache_valid[i_b] = 1
+                else:
+                    constraint_state.nt_L_cache_valid[i_b] = 0
 
         # --- Scalar triangular solve using L from shared memory ---
         # No longer using 16x16 tiles; the 16 threads parallelize each row's
