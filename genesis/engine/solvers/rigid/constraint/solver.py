@@ -3817,25 +3817,22 @@ def func_solve_init(
         constraint_state.use_full_hessian[i_b] = 1
     constraint_state.solver_iter_counter[()] = 0
 
-    # Fused-init path: opt-in via prefer_decomposed_solver == 1 AND GPU + Newton + tiled.
-    # Build H (no factor), compute grad without solve, then run the fused factor+solve kernel.
-    # L stays in shared memory inside func_cholesky_and_solve_fused_tiled; nt_H is left as H. This
-    # avoids the separate cholesky_factor_direct_tiled (write L to global) +
-    # cholesky_solve_tiled (read L) launches used by the unfused path.
+    # Fused-init path: GPU + Newton + tiled Cholesky.
+    # Build H, compute grad without solve, then run the fused factor+solve kernel.
+    # L stays in shared memory inside func_cholesky_and_solve_fused_tiled. nt_H is left as H
+    # (no writeback). This avoids the separate cholesky_factor_direct_tiled (writes L) +
+    # cholesky_solve_tiled (reads L) launches used by the unfused path.
     #
-    # Restricted to `prefer_decomposed_solver == 1` because:
-    #  - The host-loop monolith path's `func_hessian_and_cholesky_factor_incremental_batch` does
-    #    rank-1 updates assuming `nt_H == L after init`. If `prefer_decomposed_solver` is auto (-1)
-    #    or 0, perf_dispatch may run the monolith and it would see nt_H == H instead of L.
-    #  - Empirically, even with a writeback_L flag in the fused kernel, the benchmarks regressed
-    #    (box_pyramid_5 -2.93%, g1_fall -1.54%) on auto-dispatch — likely due to perf_dispatch
-    #    interactions and writeback overhead. Strict opt-in avoids any impact on default users.
+    # Both consumers are aligned to handle nt_H == H after init:
+    #  - Graph path (_kernel_solve_graph) already forces a full rebuild on iter_count <= 1
+    #    via _func_newton_only_nt_hessian, then patches H every iter; never reads L from nt_H.
+    #  - Monolith path (func_solve_iter) is patched in this branch to also force a full
+    #    direct rebuild on iter_idx == 0 instead of reading L from nt_H.
     if qd.static(
         static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
         and static_rigid_sim_config.backend != gs.cpu
         and not static_rigid_sim_config.sparse_solve
         and static_rigid_sim_config.enable_tiled_cholesky_hessian
-        and static_rigid_sim_config.prefer_decomposed_solver == 1
     ):
         func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
@@ -3895,6 +3892,7 @@ def func_solve_init(
 @qd.func
 def func_solve_iter(
     i_b,
+    iter_idx,
     entities_info: array_class.EntitiesInfo,
     dofs_state: array_class.DofsState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -3951,6 +3949,37 @@ def func_solve_iter(
                     rigid_global_info=rigid_global_info,
                     static_rigid_sim_config=static_rigid_sim_config,
                 )
+            elif qd.static(
+                static_rigid_sim_config.backend != gs.cpu
+                and static_rigid_sim_config.enable_tiled_cholesky_hessian
+            ):
+                # When fused init runs (GPU + Newton + tiled + dense), it leaves nt_H == H
+                # (no L writeback). Force a full rebuild on the first monolith iter to produce
+                # nt_H == L, so iter >= 1 can read L for incremental rank-1 update. Mirrors
+                # the graph path's iter_count <= 1 -> use_full_hessian = 1 logic.
+                if iter_idx == 0:
+                    func_hessian_and_cholesky_factor_direct_batch(
+                        i_b,
+                        entities_info=entities_info,
+                        constraint_state=constraint_state,
+                        rigid_global_info=rigid_global_info,
+                        static_rigid_sim_config=static_rigid_sim_config,
+                    )
+                else:
+                    is_degenerated = func_hessian_and_cholesky_factor_incremental_batch(
+                        i_b,
+                        constraint_state=constraint_state,
+                        rigid_global_info=rigid_global_info,
+                        static_rigid_sim_config=static_rigid_sim_config,
+                    )
+                    if is_degenerated:
+                        func_hessian_and_cholesky_factor_direct_batch(
+                            i_b,
+                            entities_info=entities_info,
+                            constraint_state=constraint_state,
+                            rigid_global_info=rigid_global_info,
+                            static_rigid_sim_config=static_rigid_sim_config,
+                        )
             else:
                 is_degenerated = func_hessian_and_cholesky_factor_incremental_batch(
                     i_b,
@@ -4024,9 +4053,10 @@ def func_solve_body_monolith(
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
     for i_b in range(_B):
         if constraint_state.n_constraints[i_b] > 0:
-            for _ in range(rigid_global_info.iterations[None]):
+            for iter_idx in range(rigid_global_info.iterations[None]):
                 func_solve_iter(
                     i_b,
+                    iter_idx,
                     entities_info=entities_info,
                     dofs_state=dofs_state,
                     rigid_global_info=rigid_global_info,
