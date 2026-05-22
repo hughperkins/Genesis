@@ -1904,42 +1904,28 @@ def func_hessian_direct_sparse_scatter(
     """
     EPS = rigid_global_info.EPS[None]
     _B = constraint_state.grad.shape[1]
-    n_dofs = qd.static(constraint_state.nt_H.shape[1])
-    n_lower_tri = qd.static(n_dofs * (n_dofs + 1) // 2)
-    BLOCK_DIM = qd.static(_BUILD_CSR_BLOCK)
+    n_dofs = constraint_state.nt_H.shape[1]
 
-    # Single kernel, one block per env: init lower-tri H = M in block-shared memory,
-    # block-sync, scatter J^T D J via shared-mem atomics, block-sync, copy to global.
-    # Shared atomics are ~10-100x faster than global atomics, eliminating the dominant
-    # cost of the previous two-kernel atomic-into-global form.
-    qd.loop_config(name="nt_H_scatter", block_dim=BLOCK_DIM)
-    for i_flat in range(_B * BLOCK_DIM):
-        tid = i_flat % BLOCK_DIM
-        i_b = i_flat // BLOCK_DIM
-
-        h_shared = qd.simt.block.SharedArray((n_lower_tri,), gs.qd_float)
-
-        n_c = constraint_state.n_constraints[i_b]
-        skip = (n_c == 0) or (not constraint_state.improved[i_b])
+    qd.loop_config(name="nt_H_init_M")
+    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
+        if i_d2 > i_d1:
+            continue
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
-                skip = True
-
-        if skip:
+                continue
+        if not constraint_state.improved[i_b]:
             continue
+        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
-        # Phase 1: initialize h_shared (linear lower-tri layout) from mass_mat.
-        # Linear elem k -> (i_d1, i_d2) with i_d1 = floor((sqrt(8k+1)-1)/2), i_d2 = k - i_d1*(i_d1+1)/2.
-        elem = tid
-        while elem < n_lower_tri:
-            i_d1, i_d2 = linear_to_lower_tri(elem)
-            h_shared[elem] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
-            elem = elem + BLOCK_DIM
-
-        qd.simt.block.sync()
-
-        # Phase 2: atomic-scatter J^T D J contributions into h_shared.
-        i_c = tid
+    qd.loop_config(name="nt_H_scatter")
+    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
+        n_c = constraint_state.n_constraints[i_b]
+        if n_c == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+        i_c = i_c_g
         while i_c < n_c:
             if constraint_state.active[i_c, i_b]:
                 nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
@@ -1952,18 +1938,8 @@ def func_hessian_direct_sparse_scatter(
                         v_j = constraint_state.jac[i_c, d_j, i_b]
                         row = qd.max(d_i, d_j)
                         col = qd.min(d_i, d_j)
-                        elem = row * (row + 1) // 2 + col
-                        qd.atomic_add(h_shared[elem], v_i * v_j * Dc)
-            i_c = i_c + BLOCK_DIM
-
-        qd.simt.block.sync()
-
-        # Phase 3: write h_shared back to global nt_H lower-tri.
-        elem = tid
-        while elem < n_lower_tri:
-            i_d1, i_d2 = linear_to_lower_tri(elem)
-            constraint_state.nt_H[i_b, i_d1, i_d2] = h_shared[elem]
-            elem = elem + BLOCK_DIM
+                        qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
+            i_c = i_c + _BUILD_CSR_BLOCK
 
 
 @qd.func
