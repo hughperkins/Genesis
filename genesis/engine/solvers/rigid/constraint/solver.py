@@ -3809,12 +3809,27 @@ def _initialize_Jaref_parallel(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Initialize Jaref = J @ qacc, parallelised over (constraint, env)."""
+    """Initialize Jaref = J @ qacc, parallelised over (constraint, env).
+
+    Under ``hessian_sparse_build=True``, uses a grid-stride launch
+    (_B * _QFRC_BLOCK threads) since the sparse body reads scattered
+    jac_relevant_dofs anyway -- coalescing was already lost so we trade it
+    for far fewer thread launches (~30x reduction in the dex_hand-class case
+    where len_constraints ~ 4154 but actual n_c ~ 40).
+    """
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
     len_constraints = constraint_state.Jaref.shape[0]
 
-    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+    if qd.static(static_rigid_sim_config.hessian_sparse_build):
+        qd.loop_config(name="init_jaref", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_b, i_c_g in qd.ndrange(_B, _QFRC_BLOCK):
+            n_c = constraint_state.n_constraints[i_b]
+            i_c = i_c_g
+            while i_c < n_c:
+                _initialize_Jaref_body(i_c, i_b, n_dofs, qacc, constraint_state, static_rigid_sim_config)
+                i_c = i_c + _QFRC_BLOCK
+    elif qd.static(static_rigid_sim_config.constraint_layout_transposed):
         qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         # i_c innermost: matches stride-1 axis of flipped jac, jac loads coalesce.
         for i_b, i_c in qd.ndrange(_B, len_constraints):
