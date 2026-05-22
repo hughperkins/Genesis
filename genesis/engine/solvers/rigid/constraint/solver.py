@@ -1829,7 +1829,11 @@ def func_hessian_direct_tiled(
                 i_pair = i_pair + BLOCK_DIM
 
 
-_BUILD_CSR_BLOCK = 256
+# Per-kernel grid-stride block sizes. Threads per env for the (env, c)-loop kernels.
+# Tuned on dex_hand 4096 envs (n_c ~ 40, n_d=62) -- sweet spots can shift with scene scale.
+_BUILD_CSR_BLOCK = 64
+_SCATTER_BLOCK = 128
+_QFRC_BLOCK = 64
 
 
 @qd.func
@@ -1918,7 +1922,7 @@ def func_hessian_direct_sparse_scatter(
         constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
     qd.loop_config(name="nt_H_scatter")
-    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
+    for i_b, i_c_g in qd.ndrange(_B, _SCATTER_BLOCK):
         n_c = constraint_state.n_constraints[i_b]
         if n_c == 0 or not constraint_state.improved[i_b]:
             continue
@@ -1939,7 +1943,7 @@ def func_hessian_direct_sparse_scatter(
                         row = qd.max(d_i, d_j)
                         col = qd.min(d_i, d_j)
                         qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
-            i_c = i_c + _BUILD_CSR_BLOCK
+            i_c = i_c + _SCATTER_BLOCK
 
 
 @qd.func
@@ -3509,7 +3513,7 @@ def _func_update_qfrc_constraint_sparse_scatter(
         constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
 
     qd.loop_config(name="update_constraint_qfrc")
-    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
+    for i_b, i_c_g in qd.ndrange(_B, _QFRC_BLOCK):
         n_c = constraint_state.n_constraints[i_b]
         i_c = i_c_g
         while i_c < n_c:
@@ -3519,7 +3523,7 @@ def _func_update_qfrc_constraint_sparse_scatter(
                 i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
                 j = constraint_state.jac[i_c, i_d, i_b]
                 qd.atomic_add(constraint_state.qfrc_constraint[i_d, i_b], j * force)
-            i_c = i_c + _BUILD_CSR_BLOCK
+            i_c = i_c + _QFRC_BLOCK
 
 
 @qd.func
