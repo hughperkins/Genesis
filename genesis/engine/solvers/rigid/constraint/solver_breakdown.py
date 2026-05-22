@@ -791,39 +791,49 @@ def _func_patch_hessian_delta(
     """
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
-    # Launch one thread per (env, changed_constraint_slot). The slot count is bounded by the static max number of
-    # constraints, gated at runtime by incr_n_changed[i_b].
-    MAX_CHANGED = qd.static(constraint_state.incr_changed_idx.shape[0])
+    # Cooperative block of BLOCK_DIM threads per env. Each thread handles its own subset of changed constraints
+    # (strided by BLOCK_DIM), so launch grid is _B * BLOCK_DIM (matches the old kernel's grid size, much smaller
+    # than the naive (_B, len_constraints_) ndrange whose MAX_CHANGED would be ~800 for dex_hand). Per-thread:
+    # walk this constraint's Jacobian row densely (skipping zeros) and atomic_add the sign * Ji * Jj lower-tri
+    # contributions to nt_H.
+    BLOCK_DIM = qd.static(32)
 
-    qd.loop_config(name="patch_hessian_delta", block_dim=32)
-    for i_b, change_idx in qd.ndrange(_B, MAX_CHANGED):
+    qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
         if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
             continue
         if constraint_state.use_full_hessian[i_b] != 0:
             continue
-        if change_idx >= constraint_state.incr_n_changed[i_b]:
+
+        n_changed = constraint_state.incr_n_changed[i_b]
+        if n_changed == 0:
             continue
 
-        i_c = constraint_state.incr_changed_idx[change_idx, i_b]
-        D = constraint_state.efc_D[i_c, i_b]
-        # Sign: +D for constraints that became active (added to H), -D for those that became inactive (subtracted).
-        # The decide-step writes incr_changed_idx for both transitions; "active" here reflects the post-linesearch
-        # state, so active==True means we are adding this constraint's contribution.
-        sign = D
-        if not constraint_state.active[i_c, i_b]:
-            sign = -D
+        change_idx = tid
+        while change_idx < n_changed:
+            i_c = constraint_state.incr_changed_idx[change_idx, i_b]
+            D = constraint_state.efc_D[i_c, i_b]
+            # Sign: +D for constraints that became active (added to H), -D for those that became inactive.
+            sign = D
+            if not constraint_state.active[i_c, i_b]:
+                sign = -D
 
-        # Dense walk of J's row for this constraint, skipping zero columns. For each non-zero (i_d1, Ji), walk
-        # i_d2 in [0, i_d1] (lower triangle) and scatter sign * Ji * Jj into nt_H[i_b, i_d1, i_d2] via atomic_add.
-        for i_d1 in range(n_dofs):
-            Ji = constraint_state.jac[i_c, i_d1, i_b]
-            if Ji == 0.0:
-                continue
-            for i_d2 in range(i_d1 + 1):
-                Jj = constraint_state.jac[i_c, i_d2, i_b]
-                if Jj == 0.0:
+            # Dense walk of J's row for this constraint, skipping zero columns. For each non-zero (i_d1, Ji),
+            # walk i_d2 in [0, i_d1] (lower triangle) and scatter sign * Ji * Jj via atomic_add.
+            for i_d1 in range(n_dofs):
+                Ji = constraint_state.jac[i_c, i_d1, i_b]
+                if Ji == 0.0:
                     continue
-                qd.atomic_add(constraint_state.nt_H[i_b, i_d1, i_d2], sign * Ji * Jj)
+                for i_d2 in range(i_d1 + 1):
+                    Jj = constraint_state.jac[i_c, i_d2, i_b]
+                    if Jj == 0.0:
+                        continue
+                    qd.atomic_add(constraint_state.nt_H[i_b, i_d1, i_d2], sign * Ji * Jj)
+            change_idx = change_idx + BLOCK_DIM
 
 
 @qd.func
