@@ -1694,15 +1694,20 @@ def func_hessian_csr_build(
     ``~99 %`` are ``0 * 0``. This kernel touches only the ``n_c * n_nz * (n_nz+1) / 2 ~= 1k`` true FFMAs
     per env (~100x fewer).
 
-    Two phases (= two separate kernel launches inside one @qd.func):
+    Single cooperative kernel (one block per env, BLOCK_DIM threads per block; matches the dense kernel's
+    launch shape) with two phases separated by a block-wide sync:
 
-      1. ``hessian_csr_init_M``: one thread per (env, lower-tri pair), copies
+      1. Cooperative M-init: threads stride over the n_lower_tri pairs and copy
          ``mass_mat[i_d1, i_d2, i_b]`` into ``nt_H[i_b, i_d1, i_d2]``.
-      2. ``hessian_csr_accumulate``: one thread per (env, constraint), scans
-         ``jac[i_c, :, i_b]`` for nonzeros (in registers, ascending order via a local
-         ``qd.Vector`` pair), then ``atomic_add``s ``D * J[d1] * J[d2]`` into
-         ``nt_H[i_b, d1, d2]`` for every lower-tri (d1, d2) nonzero-pair (n_nz * (n_nz+1) / 2 atomics
-         per active constraint).
+      2. Cooperative scatter: threads stride over the n_constraints active constraints; for each, scan
+         ``jac[i_c, :, i_b]`` for nonzeros (in registers, ascending order via a local ``qd.Vector`` pair),
+         then ``atomic_add`` ``D * J[d1] * J[d2]`` into ``nt_H[i_b, d1, d2]`` for every lower-tri
+         (d1, d2) nonzero-pair (n_nz * (n_nz+1) / 2 atomics per active constraint).
+
+    A naive (_B, n_c_max) ndrange variant launches 4096 * 800 ~= 3.3M threads on dex_hand of which only
+    ~225K (4096 envs * ~55 active constraints) do real work; the cooperative shape avoids that 93 %
+    launch-overhead waste (same regression mode documented in
+    ``perso_hugh/doc/sparse_patch_delta_2026may22.md`` exp 1).
 
     Coalescing: requires ``constraint_layout_transposed=True`` (the dex_hand default). Under transposed
     layout ``jac`` is physically (_B, n_dofs, n_c) with stride-1 over i_c, so adjacent warp lanes (same
@@ -1716,67 +1721,76 @@ def func_hessian_csr_build(
 
     _B = constraint_state.nt_H.shape[0]
     n_dofs = constraint_state.nt_H.shape[1]
-    n_c_max = constraint_state.jac.shape[0]
 
     n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
-    # Phase 1: H = M (lower triangle copy). One thread per (env, lower_tri_pair).
-    # block_dim=64 picked to match the accumulate phase below (same launch grid class) so the compiler
-    # can reuse the same launch config object.
-    qd.loop_config(name="hessian_csr_init_M", block_dim=64)
-    for i in range(_B * n_lower_tri):
-        i_b = i // n_lower_tri
-        i_pair = i % n_lower_tri
-        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
-            # Inactive env: leave nt_H alone (the dense path doesn't write either for the
-            # ``not improved`` case; for ``n_c == 0`` the dense path writes M in a fallback branch
-            # but that path produces a Cholesky of M with no constraint contribution, which is fine
-            # to skip here since the rest of the substep handles n_c == 0 envs separately).
-            continue
-        i_d1, i_d2 = linear_to_lower_tri(i_pair)
-        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+    # Cooperative one-block-per-env kernel: matches the dense `func_hessian_direct_tiled` launch shape
+    # (1 block / env, BLOCK_DIM threads / block) so we get the same env-level parallelism but with much
+    # less per-thread work. Single kernel launch handles both phases (M-init then atomic scatter), with
+    # a block sync between them.
+    #
+    # Why not a (_B, n_c_max) ndrange: with n_c_max ~= 800 for dex_hand and n_c active ~55, that would
+    # short-circuit ~93 % of launches at the n_constraints gate (same regression mode as
+    # `sparse_patch_delta` exp 1).
+    BLOCK_DIM = qd.static(128)
 
-    # Phase 2: H += sum_c D_c * J_c^T J_c via atomic scatter. One thread per (env, constraint).
-    # N_NZ_MAX = 32 covers all reasonable constraint types on n_dofs <= 64 scenes:
-    #   - contact normal/friction: up to ~6 dofs (chain to ground)
-    #   - bilateral equality: up to 12 dofs (2 entities x 6)
-    #   - joint limit: 1 dof
-    # 32 leaves margin for n_dofs up to 64; assert at the call-site guarantees no constraint exceeds it.
+    # N_NZ_MAX = 32 covers all reasonable constraint types on n_dofs <= 64 scenes (contacts: ~6,
+    # bilateral equalities: up to ~12, joint limits: 1). Per-thread register cost: 32 int + 32 float
+    # = 64 registers. With BLOCK_DIM=128 and ~16 blocks/SM on Blackwell, this is well within budget.
     N_NZ_MAX = qd.static(32)
 
-    qd.loop_config(name="hessian_csr_accumulate", block_dim=64)
-    for i in range(_B * n_c_max):
-        i_b = i // n_c_max
-        i_c = i % n_c_max
-        if i_c >= constraint_state.n_constraints[i_b]:
+    qd.loop_config(name="hessian_csr_build", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
             continue
-        if not constraint_state.improved[i_b]:
-            continue
-        D = constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
-        if D == 0.0:
+        n_c = constraint_state.n_constraints[i_b]
+        if n_c == 0 or not constraint_state.improved[i_b]:
             continue
 
-        # Scan jac row, build per-thread CSR in registers (ascending dof order).
-        nz_dofs = qd.Vector([0] * N_NZ_MAX, dt=gs.qd_int)
-        nz_vals = qd.Vector([0.0] * N_NZ_MAX, dt=gs.qd_float)
-        n_nz = 0
-        for i_d in range(n_dofs):
-            v = constraint_state.jac[i_c, i_d, i_b]
-            if qd.abs(v) > EPS and n_nz < N_NZ_MAX:
-                nz_dofs[n_nz] = i_d
-                nz_vals[n_nz] = v
-                n_nz = n_nz + 1
+        # Phase 1: H = M (lower triangle). Cooperative: each thread handles ceil(n_lower_tri / BLOCK_DIM)
+        # entries, fully coalesced reads from mass_mat (contiguous over i_d2 for fixed i_d1, i_b).
+        i_pair = tid
+        while i_pair < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(i_pair)
+            constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+            i_pair = i_pair + BLOCK_DIM
 
-        # Scatter J^T D J lower-tri contributions.
-        # nz_dofs is ascending => for l <= k we have nz_dofs[l] <= nz_dofs[k], i.e. i_d2 <= i_d1
-        # (lower triangle). Auto-atomic via Taichi ``+=`` on tensor element.
-        for k in range(n_nz):
-            i_d1 = nz_dofs[k]
-            j1 = nz_vals[k]
-            for l in range(k + 1):
-                i_d2 = nz_dofs[l]
-                j2 = nz_vals[l]
-                constraint_state.nt_H[i_b, i_d1, i_d2] += D * j1 * j2
+        # Block-wide sync: phase 2 atomic_adds must observe all phase 1 writes for this env's nt_H.
+        qd.simt.block.sync()
+
+        # Phase 2: H += sum_c D_c * J_c^T J_c via atomic scatter. Cooperative: each thread handles a
+        # stride-BLOCK_DIM slice of the active constraints (i_c in {tid, tid + BLOCK_DIM, ...}).
+        # Atomic_add contention per env: ~n_c * n_nz^2 / 2 atomic_adds spread over n_lower_tri H slots,
+        # average ~1-2 atomic_adds / slot on dex_hand. No cross-env contention (each env's nt_H slice
+        # is disjoint). Per-warp atomic throughput on Blackwell handles this easily.
+        i_c = tid
+        while i_c < n_c:
+            D = constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+            if D != 0.0:
+                # Scan jac row, build per-thread CSR in registers (ascending dof order).
+                nz_dofs = qd.Vector([0] * N_NZ_MAX, dt=gs.qd_int)
+                nz_vals = qd.Vector([0.0] * N_NZ_MAX, dt=gs.qd_float)
+                n_nz = 0
+                for i_d in range(n_dofs):
+                    v = constraint_state.jac[i_c, i_d, i_b]
+                    if qd.abs(v) > EPS and n_nz < N_NZ_MAX:
+                        nz_dofs[n_nz] = i_d
+                        nz_vals[n_nz] = v
+                        n_nz = n_nz + 1
+
+                # Scatter J^T D J lower-tri contributions. nz_dofs is ascending so for l <= k we have
+                # nz_dofs[l] <= nz_dofs[k] (i.e. i_d2 <= i_d1, lower triangle). Auto-atomic via Taichi
+                # ``+=`` on tensor element.
+                for k in range(n_nz):
+                    i_d1 = nz_dofs[k]
+                    j1 = nz_vals[k]
+                    for l in range(k + 1):
+                        i_d2 = nz_dofs[l]
+                        j2 = nz_vals[l]
+                        constraint_state.nt_H[i_b, i_d1, i_d2] += D * j1 * j2
+            i_c = i_c + BLOCK_DIM
 
 
 @qd.func
