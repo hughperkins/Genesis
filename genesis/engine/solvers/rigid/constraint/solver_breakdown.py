@@ -715,11 +715,19 @@ def _func_newton_only_nt_hessian(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Step 4: Newton Hessian update (Newton only)"""
-    solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
-    # Note: K1 (copy nt_H -> nt_H_unfactored) is intentionally NOT called here. The per-iter K1 was
-    # ~16 ms / step on dex_hand (15x more than expected). Leaving it out for C1-debug; will re-add
-    # inside the delta-update kernel (C2) when there's actual incremental benefit.
+    """Step 4: Newton Hessian update (Newton only).
+
+    When ``gpu_incr_cholesky=True``, replaces the full per-iter H rebuild with a delta-scatter
+    over constraints whose ``active`` flipped since the previous iter, then re-Choleskys H. See
+    ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
+    """
+    if qd.static(static_rigid_sim_config.gpu_incr_cholesky):
+        # Incremental path: build changed list, delta-update nt_H_unfactored, copy back, factor.
+        solver.func_build_changed_constraint_list_parallel(constraint_state=constraint_state)
+        solver.func_hessian_delta_scatter(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+        solver.func_hessian_copy_unfactored_to_nt_H(constraint_state=constraint_state)
+    else:
+        solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,
