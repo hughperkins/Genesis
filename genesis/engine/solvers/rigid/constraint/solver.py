@@ -3726,7 +3726,19 @@ def func_update_gradient_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    do_solve: qd.template() = True,
 ):
+    """
+    Compute grad = M @ acc - q_force_ext - q_force_const, then optionally solve Mgrad = H^{-1} @ grad.
+
+    The ``do_solve`` parameter (compile-time via ``qd.static``) selects whether to run the post-grad solve:
+
+      - ``do_solve=True`` (default): legacy behavior. Runs ``func_cholesky_solve_tiled`` for the Newton solver, which
+        reads L from ``nt_H`` (written by a prior ``func_cholesky_factor_direct_tiled`` call) and writes Mgrad.
+      - ``do_solve=False``: only computes grad. Used by ``func_solve_init`` when consolidating the init iter through
+        ``func_cholesky_and_solve_fused_tiled`` instead of the (init-factor + init-solve) pair (round 2 C' optimisation,
+        see ``doc/cholesky_init_pack2_2026may22.md``). The fused kernel does factor + solve in one launch.
+    """
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
 
@@ -3746,7 +3758,7 @@ def func_update_gradient_tiled(
                 constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b] - constraint_state.qfrc_constraint[i_d, i_b]
             )
 
-    if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
+    if qd.static(do_solve and static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
         qd.loop_config(
             name="update_gradient_tiled", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32
         )
@@ -3762,7 +3774,7 @@ def func_update_gradient_tiled(
                 is_backward=False,
             )
 
-    if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+    if qd.static(do_solve and static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
         func_cholesky_solve_tiled(constraint_state, static_rigid_sim_config)
 
 
@@ -4099,21 +4111,62 @@ def func_solve_init(
         constraint_state.use_full_hessian[i_b] = 1
     constraint_state.solver_iter_counter[()] = 0
 
-    if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-        func_hessian_and_cholesky_factor_direct(
+    # Round 2 C' optimisation (see ``doc/cholesky_init_pack2_2026may22.md``): for GPU+tiled+Newton, the init iter is
+    # rerouted through the per-iter fused Cholesky kernel (factor + solve in one launch, ~54us total). The legacy
+    # path runs ``func_cholesky_factor_direct_tiled`` (~171us) then ``func_cholesky_solve_tiled`` (~151us) in two
+    # separate launches = ~322us — eliminating ~268us per substep at dex_hand n_dofs=60 (~+5.7% FPS upper bound).
+    #
+    # The fused kernel reads ``active_envs_compacted`` (populated by ``_func_scatter_active_envs_compacted``), which
+    # is only required for the pack-2 path (``tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS``). The do_while loop's
+    # ``_kernel_solve_graph`` already populates the same list once per substep, but that runs AFTER this init iter,
+    # so we have to populate it here too. Cost: ~5-10us per substep for two extra kernel launches (reset + scatter).
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and static_rigid_sim_config.backend != gs.cpu
+        and not static_rigid_sim_config.sparse_solve
+    ):
+        # H build only (no factor)
+        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        # grad compute only (no solve)
+        func_update_gradient_tiled(
+            dofs_state=dofs_state,
+            entities_info=entities_info,
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+            do_solve=False,
+        )
+        # Compaction for the pack-2 fused kernel path (no-op cost-wise for single-env fused since the kernel does
+        # not read active_envs_compacted; we still scatter to keep the runtime contract identical across paths).
+        if qd.static(static_rigid_sim_config.tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS):
+            _func_reset_n_active_envs(constraint_state=constraint_state)
+            _func_scatter_active_envs_compacted(
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        # Fused factor + solve (writes L into nt_H AND Mgrad into constraint_state.Mgrad)
+        func_cholesky_and_solve_fused_tiled(
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+    else:
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+            func_hessian_and_cholesky_factor_direct(
+                entities_info=entities_info,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+        func_update_gradient(
+            dofs_state=dofs_state,
             entities_info=entities_info,
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-    func_update_gradient(
-        dofs_state=dofs_state,
-        entities_info=entities_info,
-        constraint_state=constraint_state,
-        rigid_global_info=rigid_global_info,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
 
     if qd.static(static_rigid_sim_config.constraint_layout_transposed):
         qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
