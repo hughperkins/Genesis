@@ -3971,10 +3971,12 @@ def func_solve_iter(
 
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
             func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
-            if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
+            if qd.static(static_rigid_sim_config.sparse_solve):
                 # Bypass incremental Cholesky when sparse_solve=True. The incremental rank-1 update
                 # assumes globally descending DOF order in jac_relevant_dofs, which doesn't hold
                 # for cross-entity constraints. Always use direct Hessian rebuild which has the max/min fix.
+                # NB: do NOT include hessian_sparse_build here -- that flag is for the decomposed GPU path's
+                # E5 atomic-scatter kernel, NOT for routing the monolith solver through CPU-batch direct.
                 func_hessian_and_cholesky_factor_direct_batch(
                     i_b,
                     entities_info=entities_info,
