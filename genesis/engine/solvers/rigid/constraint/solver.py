@@ -1862,14 +1862,20 @@ def func_cholesky_factor_direct_tiled(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute the Cholesky factorization L of the Hessian matrix H = L @ L.T for a given environment `i_b`.
+    """Compute the Cholesky factorization L of the Hessian matrix H = L @ L.T for all active environments.
 
-    This implementation is specialized for GPU backend and highly optimized for it using a left-looking blocked algorithm
-    with Tile16x16 primitives (potrf, trsm, syr_sub, ger_sub), all operating entirely in registers via subgroup shuffles.
-    No shared memory or block synchronization needed. This function has no inherent DOF limit, but the fused variant
-    (func_cholesky_and_solve_fused_tiled) requires shared memory for L, so the caller gates both behind the same
-    shared-memory-based DOF threshold: n_dofs <= 64 (f64) or 96 (f32) with 48kB default shared memory, higher with
-    opt-in shared memory (e.g. 160/224 on RTX PRO 6000).
+    Pack-2 layout: each 32-lane CUDA warp processes two 16x16 tiles (one per env) in parallel. Lanes 0-15 = env_a,
+    lanes 16-31 = env_b. This closes the sub-warp execution penalty (FFMAs at 32-lane warp throughput instead of 16)
+    and reuses the POTRF-unrolled `Tile16x16Pack2.cholesky_` (`qd.static`, running per-lane norm, dual `dot0`/`dot1`
+    accumulator) plus inline-cascade `_ger_sub` (the SYRK update, which is the highest-frequency tile op at ~10x per
+    factor on dex_hand n_dofs=60).
+
+    The init factor does NOT use compaction: it runs once per substep, on every initially-improved env, so adjacent
+    raw (env_a=2k, env_b=2k+1) pairs are statistically both active in the common case (dex_hand: ~95-100%). The
+    early-skip predicate `not env_a_active and not env_b_active` filters whole warps where both are out.
+
+    Left-looking blocked Cholesky reads previously computed L tiles from `nt_H` global memory, so no shared memory is
+    needed and `block_dim=32` carries the same shmem footprint as the original `block_dim=16` single-env layout.
 
     Beware the Hessian matrix is re-purposed to store its Cholesky factorization to spare memory resources.
 
@@ -1884,13 +1890,30 @@ def func_cholesky_factor_direct_tiled(
     n_dofs = constraint_state.nt_H.shape[1]
     N_BLOCKS = (n_dofs + 16 - 1) // 16
 
-    qd.loop_config(name="cholesky_factor_direct_tiled", block_dim=16)
-    for i in range(_B * 16):
+    # Pack-2 launch shape: 32 lanes per warp, one warp per env pair.
+    _B_pairs = (_B + 1) // 2
+
+    qd.loop_config(name="cholesky_factor_direct_tiled", block_dim=32)
+    for i in range(_B_pairs * 32):
+        # Warp-uniform pair index: skip the whole warp only if BOTH envs in the pair are inactive.
+        # Per-half-warp skip would diverge the warp and break the cross-tile shuffles.
+        env_pair = i // 32
+        env_a = env_pair * 2
+        env_b = env_pair * 2 + 1
+        env_a_active = env_a < _B and constraint_state.n_constraints[env_a] > 0 and constraint_state.improved[env_a]
+        env_b_active = env_b < _B and constraint_state.n_constraints[env_b] > 0 and constraint_state.improved[env_b]
+        if not env_a_active and not env_b_active:
+            continue
+
+        # Per-half-warp env: `i // 16` gives env_a for lanes 0-15 and env_b for lanes 16-31.
+        # `i_b_safe` clamps for OOB env_b reads; the per-half-warp `my_active` predicate gates stores.
         i_b = i // 16
-        if i_b >= _B:
-            continue
-        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
-            continue
+        i_b_safe = qd.min(i_b, _B - 1)
+        my_active = (
+            i_b < _B
+            and constraint_state.n_constraints[i_b_safe] > 0
+            and constraint_state.improved[i_b_safe]
+        )
 
         # Loop over column blocks sequentially: each column block depends on all prior columns (inherent to
         # left-looking Cholesky). Within each column, the diagonal is factored first, then off-diagonal rows
@@ -1900,17 +1923,14 @@ def func_cholesky_factor_direct_tiled(
             k1 = qd.min(k0 + 16, n_dofs)
 
             # Load diagonal tile H[k,k] (rows beyond n_dofs stay as identity from the .eye() init)
-            L_kk = Tile16x16Cholesky.eye(dtype=gs.qd_float)
-            # FIXME: migrate back to using slice index, i.e. L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:k1]
-            # and similar.
-            # We'll do this once we move _tile16.py changes back into Quadrants.
-            L_kk._load3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
+            L_kk = Tile16x16Pack2.eye(dtype=gs.qd_float)
+            L_kk._load3d(constraint_state.nt_H, i_b_safe, k0, k1, k0, k1)
 
             # Subtract prior-column contributions: L_kk -= sum_j L[k,j] @ L[k,j]^T
             for jb in range(kb):
                 j0 = jb * 16
                 for t in range(16):
-                    v = L_kk._resolve_vec3d(constraint_state.nt_H, i_b, k0, k1, j0 + t)
+                    v = L_kk._resolve_vec3d(constraint_state.nt_H, i_b_safe, k0, k1, j0 + t)
                     L_kk._ger_sub(v, v)
 
             # Factor diagonal tile in-place
@@ -1922,25 +1942,30 @@ def func_cholesky_factor_direct_tiled(
                 i1 = qd.min(i0 + 16, n_dofs)
 
                 # Load off-diagonal tile H[i,k] (rows beyond n_dofs stay as zero from the .zeros() init)
-                L_ik = Tile16x16Cholesky.zeros(dtype=gs.qd_float)
-                L_ik._load3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
+                L_ik = Tile16x16Pack2.zeros(dtype=gs.qd_float)
+                L_ik._load3d(constraint_state.nt_H, i_b_safe, i0, i1, k0, k1)
 
                 # Subtract prior-column contributions: L_ik -= sum_j L[i,j] @ L[k,j]^T
                 for jb in range(kb):
                     j0 = jb * 16
                     for t in range(16):
-                        v_own = L_ik._resolve_vec3d(constraint_state.nt_H, i_b, i0, i1, j0 + t)
-                        v_diag = L_ik._resolve_vec3d(constraint_state.nt_H, i_b, k0, k1, j0 + t)
+                        v_own = L_ik._resolve_vec3d(constraint_state.nt_H, i_b_safe, i0, i1, j0 + t)
+                        v_diag = L_ik._resolve_vec3d(constraint_state.nt_H, i_b_safe, k0, k1, j0 + t)
                         L_ik._ger_sub(v_own, v_diag)
 
                 # Triangular solve: L[i,k] = L_ik @ inv(L[k,k]^T)
                 L_kk.solve_triangular_(L_ik)
 
-                # Write L[i,k] back to global memory
-                L_ik._store3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
+                # Per-half-warp predicated store: skips writes for inactive halves (converged envs in mixed
+                # pairs, or env_b in the odd tail pair). `_store3d` has no subgroup shuffles, so wrapping in
+                # `if my_active` only skips the actual writes; the rest of the warp stays lockstep for the
+                # next iteration's tile shuffles.
+                if my_active:
+                    L_ik._store3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
 
-            # Write L[k,k] back to global memory
-            L_kk._store3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
+            # Write L[k,k] back to global memory (per-half-warp predicated)
+            if my_active:
+                L_kk._store3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
 
 
 # Shared-memory budget threshold below which the pack-2 fused kernel (2 envs/warp) is used.
