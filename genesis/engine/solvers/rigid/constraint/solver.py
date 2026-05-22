@@ -3477,6 +3477,46 @@ def _func_update_cost_coop(
 
 
 @qd.func
+def _func_update_qfrc_constraint_sparse_scatter(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Sparse atomic-scatter alternative to ``_func_update_qfrc_constraint_coop``.
+
+    Computes qfrc_constraint = J^T @ efc_force using one thread per ``(env, c)`` that
+    reads its row's nnz dof list from the CSR storage and atomic-scatters
+    ``jac[i_c, i_d] * efc_force[i_c]`` into ``qfrc_constraint[i_d, i_b]``.
+
+    Two top-level loops -> two CUDA launches:
+        1. ``clear_qfrc_constraint`` zeroes qfrc_constraint
+        2. ``update_constraint_qfrc`` does the scatter
+
+    Atomic contention per (env, dof) is low (~few constraints touch any given dof
+    in dex_hand-class problems). The CSR storage ``jac_relevant_dofs`` /
+    ``jac_n_relevant_dofs`` is populated by ``func_build_jac_csr_from_dense`` at
+    the start of ``func_solve_init``.
+    """
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.qfrc_constraint.shape[0]
+    n_c_max = constraint_state.jac.shape[0]
+
+    qd.loop_config(name="clear_qfrc_constraint")
+    for i_b, i_d in qd.ndrange(_B, n_dofs):
+        constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
+
+    qd.loop_config(name="update_constraint_qfrc")
+    for i_b, i_c in qd.ndrange(_B, n_c_max):
+        if i_c >= constraint_state.n_constraints[i_b]:
+            continue
+        force = constraint_state.efc_force[i_c, i_b]
+        nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+        for i_d_ in range(nnz):
+            i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+            j = constraint_state.jac[i_c, i_d, i_b]
+            qd.atomic_add(constraint_state.qfrc_constraint[i_d, i_b], j * force)
+
+
+@qd.func
 def func_update_constraint(
     qacc: qd.Tensor,
     Ma: qd.Tensor,
@@ -3495,7 +3535,10 @@ def func_update_constraint(
     """
     if qd.static(static_rigid_sim_config.constraint_layout_transposed):
         _func_update_efc_force(constraint_state, static_rigid_sim_config)
-        _func_update_qfrc_constraint_coop(constraint_state, static_rigid_sim_config)
+        if qd.static(static_rigid_sim_config.hessian_sparse_build):
+            _func_update_qfrc_constraint_sparse_scatter(constraint_state, static_rigid_sim_config)
+        else:
+            _func_update_qfrc_constraint_coop(constraint_state, static_rigid_sim_config)
         _func_update_cost_coop(
             qacc=qacc,
             Ma=Ma,
