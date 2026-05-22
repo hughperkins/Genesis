@@ -483,7 +483,7 @@ class RigidSolver(KinematicSolver):
                 enable_csr_hessian_build = (
                     enable_tiled_cholesky_hessian
                     and solver_is_newton
-                    and not self.constraint_solver.sparse_solve
+                    and not self._options.sparse_solve
                     and self.n_dofs > 16
                     and self.n_envs >= 256
                 )
