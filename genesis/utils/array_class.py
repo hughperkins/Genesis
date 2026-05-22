@@ -290,6 +290,10 @@ class ConstraintState:
     # In practice, this variable is re-purposed to store the Cholesky factor L st H = L @ L.T to spare memory resources.
     # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: qd.Tensor
+    # Cache of last computed Cholesky factor L (lower triangular). Used by the fused factor+solve
+    # kernel to skip re-factorization when the constraint active set is unchanged (incr_n_changed[i_b] == 0).
+    # Same shape as nt_H. ~67 MB at 4096 envs / 64 dofs.
+    nt_L_cache: qd.Tensor
     nt_vec: qd.Tensor
     # Compacted list of constraints whose active state changed, used by incremental Cholesky update
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
@@ -397,6 +401,7 @@ def get_constraint_state(constraint_solver, solver):
         cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
+        nt_L_cache=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
