@@ -290,6 +290,12 @@ class ConstraintState:
     # In practice, this variable is re-purposed to store the Cholesky factor L st H = L @ L.T to spare memory resources.
     # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: qd.Tensor
+    # fp16 cache of the Cholesky factor L written by func_cholesky_and_solve_fused_tiled on factor iters and reloaded
+    # on skip-unchanged iters (incr_n_changed == 0). Stored as f16 (not gs.qd_float) to halve the per-tile global
+    # write bandwidth and shrink the buffer to ~33 MB at 4096 envs / 64 dofs so it stays L2-resident across the
+    # solver-loop's ~200-400 MB of inter-kernel traffic. Lower precision is tolerable because reads are only used
+    # for forward/backward substitution (no further factorization), which is well-conditioned for Newton tolerances.
+    nt_L_cache: qd.Tensor
     nt_vec: qd.Tensor
     # Compacted list of constraints whose active state changed, used by incremental Cholesky update
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
@@ -397,6 +403,8 @@ def get_constraint_state(constraint_solver, solver):
         cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
+        # fp16 cache: ~33 MB at dex_hand sizing vs ~67 MB at f32, fits in 96 MB Blackwell L2.
+        nt_L_cache=V(dtype=qd.f16, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),

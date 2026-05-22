@@ -378,6 +378,80 @@ def _make_tile16x16_class(dtype):
                         arr[batch, row, col_start + j] = self._r(j)
 
         @qd.func
+        def _store3d_cast(self, arr: qd.template(), arr_dtype: qd.template(),
+                          batch, row_start, row_stop, col_start, col_stop):
+            """Like _store3d but casts each value to ``arr_dtype`` before storing.
+
+            Caller passes ``arr_dtype`` explicitly (e.g. ``qd.f16``) because Quadrants doesn't surface ``arr.dtype`` as
+            a compile-time-usable handle. Used to back fp16 caches of an fp32 Cholesky factor: the tile stays fp32 in
+            registers, only the global-memory write loses precision.
+            """
+            arr_row_stop = arr.shape[1]
+            if arr_row_stop < row_stop:
+                row_stop = arr_row_stop
+            row = row_start + qd.simt.subgroup.invocation_id()
+            if row < row_stop:
+                arr_col_stop = arr.shape[2]
+                if arr_col_stop < col_stop:
+                    col_stop = arr_col_stop
+                for j in qd.static(range(16)):
+                    if col_start + j < col_stop:
+                        arr[batch, row, col_start + j] = qd.cast(self._r(j), arr_dtype)
+
+        @qd.func
+        def _load3d_cast(self, arr: qd.template(), arr_dtype: qd.template(),
+                         batch, row_start, row_stop, col_start, col_stop):
+            """Like _load3d but explicitly casts the loaded value to the tile's compute dtype.
+
+            ``arr_dtype`` is unused at the AST level (Quadrants emits the cast from arr.dtype to ``dtype``
+            automatically as part of the register assignment); it's accepted for API symmetry with _store3d_cast and
+            to make caller intent explicit at the call site.
+            """
+            arr_row_stop = arr.shape[1]
+            if arr_row_stop < row_stop:
+                row_stop = arr_row_stop
+            row = row_start + qd.simt.subgroup.invocation_id()
+            if row < row_stop:
+                arr_col_stop = arr.shape[2]
+                if arr_col_stop < col_stop:
+                    col_stop = arr_col_stop
+                for j in qd.static(range(16)):
+                    if col_start + j < col_stop:
+                        val = qd.cast(arr[batch, row, col_start + j], dtype)
+                        if j == 0:
+                            self.r0 = val
+                        if j == 1:
+                            self.r1 = val
+                        if j == 2:
+                            self.r2 = val
+                        if j == 3:
+                            self.r3 = val
+                        if j == 4:
+                            self.r4 = val
+                        if j == 5:
+                            self.r5 = val
+                        if j == 6:
+                            self.r6 = val
+                        if j == 7:
+                            self.r7 = val
+                        if j == 8:
+                            self.r8 = val
+                        if j == 9:
+                            self.r9 = val
+                        if j == 10:
+                            self.r10 = val
+                        if j == 11:
+                            self.r11 = val
+                        if j == 12:
+                            self.r12 = val
+                        if j == 13:
+                            self.r13 = val
+                        if j == 14:
+                            self.r14 = val
+                        if j == 15:
+                            self.r15 = val
+
+        @qd.func
         def eye_(self):
             """Set this tile to the 16x16 identity matrix.  Each thread sets its diagonal element to 1.0 and all
             others to 0.0."""
