@@ -1878,6 +1878,7 @@ def func_build_jac_csr_from_dense(
 def func_hessian_direct_sparse_scatter(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
     check_full_hessian: qd.template() = False,
 ):
     """Sparse atomic-scatter alternative to ``func_hessian_direct_tiled``.
@@ -1910,41 +1911,67 @@ def func_hessian_direct_sparse_scatter(
     EPS = rigid_global_info.EPS[None]
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
+    N_STATIC = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    BLOCK_DIM = qd.static(_SCATTER_BLOCK)
+    SQ = qd.static(N_STATIC * N_STATIC)
 
-    qd.loop_config(name="nt_H_init_M")
-    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
-        if i_d2 > i_d1:
-            continue
-        if qd.static(check_full_hessian):
-            if constraint_state.use_full_hessian[i_b] == 0:
-                continue
-        if not constraint_state.improved[i_b]:
-            continue
-        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+    # E5 v16: fused init+scatter+writeback in shared memory. One block per env.
+    # h_shared[i, j] is the full N x N lower triangle (upper-tri cells wasted but
+    # eliminates the sqrt cost of linear<->lower_tri conversion that killed v9).
+    # Phase 1: init lower-tri h_shared = M from global.
+    # Phase 2: atomic-scatter J^T D J into h_shared (shared atomics are 5-10x
+    # faster than global atomics on contended cells, which is the bulk of the
+    # previous nt_H_scatter cost).
+    # Phase 3: writeback lower-tri h_shared -> global nt_H.
+    qd.loop_config(name="nt_H_scatter", block_dim=BLOCK_DIM)
+    for i_flat in range(_B * BLOCK_DIM):
+        tid = i_flat % BLOCK_DIM
+        i_b = i_flat // BLOCK_DIM
 
-    qd.loop_config(name="nt_H_scatter")
-    for i_b, i_c_g in qd.ndrange(_B, _SCATTER_BLOCK):
+        h_shared = qd.simt.block.SharedArray((N_STATIC, N_STATIC), gs.qd_float)
+
         n_c = constraint_state.n_constraints[i_b]
-        if n_c == 0 or not constraint_state.improved[i_b]:
-            continue
+        skip = (n_c == 0) or (not constraint_state.improved[i_b])
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
-                continue
-        i_c = i_c_g
-        while i_c < n_c:
-            if constraint_state.active[i_c, i_b]:
-                nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
-                Dc = constraint_state.efc_D[i_c, i_b]
-                for ii in range(nnz):
-                    d_i = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
-                    v_i = constraint_state.jac[i_c, d_i, i_b]
-                    for jj in range(ii + 1):
-                        d_j = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
-                        v_j = constraint_state.jac[i_c, d_j, i_b]
-                        row = qd.max(d_i, d_j)
-                        col = qd.min(d_i, d_j)
-                        qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
-            i_c = i_c + _SCATTER_BLOCK
+                skip = True
+
+        if not skip:
+            k = tid
+            while k < SQ:
+                i_d1 = k // N_STATIC
+                i_d2 = k % N_STATIC
+                if i_d2 <= i_d1 and i_d1 < n_dofs:
+                    h_shared[i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+                k = k + BLOCK_DIM
+
+            qd.simt.block.sync()
+
+            i_c = tid
+            while i_c < n_c:
+                if constraint_state.active[i_c, i_b]:
+                    nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+                    Dc = constraint_state.efc_D[i_c, i_b]
+                    for ii in range(nnz):
+                        d_i = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
+                        v_i = constraint_state.jac[i_c, d_i, i_b]
+                        for jj in range(ii + 1):
+                            d_j = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
+                            v_j = constraint_state.jac[i_c, d_j, i_b]
+                            row = qd.max(d_i, d_j)
+                            col = qd.min(d_i, d_j)
+                            qd.atomic_add(h_shared[row, col], v_i * v_j * Dc)
+                i_c = i_c + BLOCK_DIM
+
+            qd.simt.block.sync()
+
+            k = tid
+            while k < SQ:
+                i_d1 = k // N_STATIC
+                i_d2 = k % N_STATIC
+                if i_d2 <= i_d1 and i_d1 < n_dofs:
+                    constraint_state.nt_H[i_b, i_d1, i_d2] = h_shared[i_d1, i_d2]
+                k = k + BLOCK_DIM
 
 
 @qd.func
@@ -2235,7 +2262,7 @@ def func_hessian_and_cholesky_factor_direct(
     else:
         # GPU
         if qd.static(static_rigid_sim_config.hessian_sparse_build):
-            func_hessian_direct_sparse_scatter(constraint_state, rigid_global_info)
+            func_hessian_direct_sparse_scatter(constraint_state, rigid_global_info, static_rigid_sim_config)
         else:
             func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
