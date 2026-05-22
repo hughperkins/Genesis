@@ -3817,21 +3817,70 @@ def func_solve_init(
         constraint_state.use_full_hessian[i_b] = 1
     constraint_state.solver_iter_counter[()] = 0
 
-    if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-        func_hessian_and_cholesky_factor_direct(
+    # Fused-init path: opt-in via prefer_decomposed_solver == 1 AND GPU + Newton + tiled.
+    # Build H (no factor), compute grad without solve, then run the fused factor+solve kernel.
+    # L stays in shared memory inside func_cholesky_and_solve_fused_tiled; nt_H is left as H. This
+    # avoids the separate cholesky_factor_direct_tiled (write L to global) +
+    # cholesky_solve_tiled (read L) launches used by the unfused path.
+    #
+    # Restricted to `prefer_decomposed_solver == 1` because:
+    #  - The host-loop monolith path's `func_hessian_and_cholesky_factor_incremental_batch` does
+    #    rank-1 updates assuming `nt_H == L after init`. If `prefer_decomposed_solver` is auto (-1)
+    #    or 0, perf_dispatch may run the monolith and it would see nt_H == H instead of L.
+    #  - Empirically, even with a writeback_L flag in the fused kernel, the benchmarks regressed
+    #    (box_pyramid_5 -2.93%, g1_fall -1.54%) on auto-dispatch — likely due to perf_dispatch
+    #    interactions and writeback overhead. Strict opt-in avoids any impact on default users.
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.backend != gs.cpu
+        and not static_rigid_sim_config.sparse_solve
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and static_rigid_sim_config.prefer_decomposed_solver == 1
+    ):
+        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+
+        if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+            qd.loop_config(
+                name="update_gradient_init", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL
+            )
+            for i_b, i_d in qd.ndrange(_B, n_dofs):
+                constraint_state.grad[i_d, i_b] = (
+                    constraint_state.Ma[i_d, i_b]
+                    - dofs_state.force[i_d, i_b]
+                    - constraint_state.qfrc_constraint[i_d, i_b]
+                )
+        else:
+            qd.loop_config(
+                name="update_gradient_init", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL
+            )
+            for i_d, i_b in qd.ndrange(n_dofs, _B):
+                constraint_state.grad[i_d, i_b] = (
+                    constraint_state.Ma[i_d, i_b]
+                    - dofs_state.force[i_d, i_b]
+                    - constraint_state.qfrc_constraint[i_d, i_b]
+                )
+
+        func_cholesky_and_solve_fused_tiled(
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+    else:
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+            func_hessian_and_cholesky_factor_direct(
+                entities_info=entities_info,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+        func_update_gradient(
+            dofs_state=dofs_state,
             entities_info=entities_info,
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-    func_update_gradient(
-        dofs_state=dofs_state,
-        entities_info=entities_info,
-        constraint_state=constraint_state,
-        rigid_global_info=rigid_global_info,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
 
     if qd.static(static_rigid_sim_config.constraint_layout_transposed):
         qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
