@@ -2562,18 +2562,35 @@ def func_cholesky_solve_tiled(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute the solution of H @ grad = Mgrad st H = L @ L.T for all environments at once.
+    """Init-time triangular solve dispatcher: H @ Mgrad = grad, where H = L @ L^T already.
 
-    This implementation is specialized for GPU backend and highly optimized for it using shared memory and cooperative
-    threading. The current implementation only supports n_dofs <= 64 for 64bits precision and n_dofs <= 92 for 32bits
-    precision. See `func_cholesky_factor_direct_tiled` documentation for details.
+    Dispatches at compile time (`qd.static`) between the pack-2 implementation (2 envs per
+    32-lane warp, used when MAX_DOFS <= _CHOLESKY_FUSED_PACK2_MAX_DOFS) and the original
+    single-env implementation (1 env per 64-thread block, fallback for larger MAX_DOFS).
 
-    Note that this implementation leverages warp-level reduction whenever supported, a generic fallback otherwise. At
-    the time of writing, all warp-level intrinsics in `qd.simt.warp` sub-module are CUDA-specific, of which only
-    `shfl_down_f32` is being used here. Although some of these warp-level instrinsics are supposed to be supported by
-    all major GPUs if not all (incl. Apple Silicon chips under naming 'SIMD-group'), Quadrants does not provide a unified
-    API for it yet. As a result, warp-level intrinsics are currently disabled if not running on CUDA backend. On top of
-    that, most if not all, Warp-level intrinsics are only supporting 32bits precision.
+    The pack-2 path mirrors the substitution structure of
+    ``_func_cholesky_and_solve_fused_tiled_pack2``: L is loaded from ``nt_H`` into shared
+    memory (per env in the pair), and v is register-resident with v_reg_0..3 striped across
+    the 16 lanes of each half-warp. Unlike the fused kernel, this kernel is called once per
+    substep (init-time) and processes ALL envs without any compaction or per-env skip — the
+    init-solve runs before any Newton iteration has had a chance to converge an env.
+    """
+    if qd.static(static_rigid_sim_config.tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS):
+        _func_cholesky_solve_tiled_pack2(constraint_state, static_rigid_sim_config)
+    else:
+        _func_cholesky_solve_tiled_single(constraint_state, static_rigid_sim_config)
+
+
+@qd.func
+def _func_cholesky_solve_tiled_single(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Original single-env init-solve (BLOCK_DIM=64, one env per block).
+
+    Used as the fallback path when ``tiled_n_dofs > _CHOLESKY_FUSED_PACK2_MAX_DOFS``, where
+    pack-2's doubled per-block shared memory footprint would exceed the GPU opt-in shmem
+    budget. Behaviour is bitwise identical to the pre-pack-2 init-solve.
     """
     # Performance is optimal for BLOCK_DIM = 64
     BLOCK_DIM = qd.static(64)
@@ -2670,6 +2687,179 @@ def func_cholesky_solve_tiled(
         while k_d < n_dofs:
             constraint_state.Mgrad[k_d, i_b] = v[k_d]
             k_d = k_d + BLOCK_DIM
+
+
+@qd.func
+def _func_cholesky_solve_tiled_pack2(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Pack-2 init-time triangular solve: 2 envs per 32-lane warp, v in registers.
+
+    Lifts the substitution structure of ``_func_cholesky_and_solve_fused_tiled_pack2`` for
+    the init-time case where the factor phase has already been completed by a preceding
+    ``func_cholesky_factor_direct_tiled`` call and L sits in ``constraint_state.nt_H[i_b, :, :]``
+    (lower triangle only).
+
+    Layout:
+
+    - ``BLOCK_DIM=32``, ``env_in_warp = tid >> 4``, ``local = tid & 15``.
+    - ``L_sh`` shape ``(2, MAX_DOFS, MAX_DOFS+1)``: lanes 0–15 read/write ``[0,...]``,
+      lanes 16–31 read/write ``[1,...]``.
+    - v is register-resident in ``v_reg_0..v_reg_{NSLOTS-1}``, where lane ``local`` owns
+      slots ``{local + s*16 for s in range(NSLOTS)}`` and ``NSLOTS = ceil(MAX_DOFS/16)``
+      (max 4 at ``MAX_DOFS=64``).
+    - No compaction. Init-solve runs once per substep on ALL envs with constraints (no env
+      has converged yet, so an "improved" filter is moot).
+
+    Tail handling: for odd ``_B`` the last pair's env_b is OOB; we mirror env_b → env_a so
+    the warp stays in lockstep through the subgroup shuffles and mask env_b stores via
+    ``my_active``. The reads to ``nt_H[i_b_safe, ...]`` and ``grad[..., i_b_safe]`` are
+    safe (point to env_a) and only their writeback is suppressed.
+    """
+    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    NSLOTS = qd.static((MAX_DOFS + 15) // 16)
+
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    _B_pairs_alloc = (_B + 1) // 2
+
+    qd.loop_config(name="cholesky_solve_tiled_pack2", block_dim=32)
+    for i in range(_B_pairs_alloc * 32):
+        tid = i % 32
+        local = tid & 15
+        env_in_warp = tid >> 4
+        pair_idx = i // 32
+
+        slot_a = pair_idx * 2
+        slot_b = pair_idx * 2 + 1
+        slot_b_safe = qd.min(slot_b, _B - 1)
+        env_a = slot_a
+        env_b = slot_b_safe
+        i_b = env_a
+        if env_in_warp == 1:
+            i_b = env_b
+        i_b_safe = i_b
+        my_active = env_in_warp == 0 or slot_b < _B
+
+        # +1 padding on the last axis avoids shared memory bank conflicts on column-wise
+        # access. Leading dim 2 reserves one full L per env in the pair. Total shmem ~2 *
+        # MAX_DOFS * (MAX_DOFS+1) * sizeof(float). For MAX_DOFS=64 fp32 this is ~33 KB,
+        # fitting the default 48 KB per-block shmem budget. For MAX_DOFS>64 the dispatcher
+        # routes to ``_single`` so this allocation never overflows.
+        L_sh = qd.simt.block.SharedArray((2, MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
+
+        # Load lower triangle of L from nt_H into shared mem (per env in the pair). Each
+        # half-warp lane strides over (i_d1, i_d2) with stride 16, covering all n_dofs^2
+        # entries; entries with i_d2 > i_d1 are skipped (strictly upper triangle — never
+        # read by either substitution direction).
+        i_flat = local
+        n_dofs_2 = n_dofs * n_dofs
+        while i_flat < n_dofs_2:
+            i_d1 = i_flat // n_dofs
+            i_d2 = i_flat % n_dofs
+            if i_d2 <= i_d1:
+                L_sh[env_in_warp, i_d1, i_d2] = constraint_state.nt_H[i_b_safe, i_d1, i_d2]
+            i_flat = i_flat + 16
+        # Half-warp sync: L_sh writes by lanes within the half-warp must be visible to
+        # subsequent reads. ``subgroup.sync`` synchronizes the 16-lane half-warp; the
+        # downstream subgroup.reduce_all_add_tiled is warp-synchronous on its own.
+        qd.simt.subgroup.sync()
+
+        # Load gradient into per-lane register cache. v_reg_{s} holds v[local + s*16] (or
+        # 0 for slots beyond n_dofs). Inactive half-warps still load env_a's values via
+        # i_b_safe == env_a; those values are discarded at writeback via ``my_active``.
+        v_reg_0 = gs.qd_float(0.0)
+        v_reg_1 = gs.qd_float(0.0)
+        v_reg_2 = gs.qd_float(0.0)
+        v_reg_3 = gs.qd_float(0.0)
+        if local < n_dofs:
+            v_reg_0 = constraint_state.grad[local, i_b_safe]
+        if qd.static(NSLOTS > 1):
+            if local + 16 < n_dofs:
+                v_reg_1 = constraint_state.grad[local + 16, i_b_safe]
+        if qd.static(NSLOTS > 2):
+            if local + 32 < n_dofs:
+                v_reg_2 = constraint_state.grad[local + 32, i_b_safe]
+        if qd.static(NSLOTS > 3):
+            if local + 48 < n_dofs:
+                v_reg_3 = constraint_state.grad[local + 48, i_b_safe]
+
+        # Forward substitution: solve L @ y = grad. Lanes stripe over columns with stride
+        # 16; the subgroup-tiled reduce sums partials within each 16-lane half-warp. The
+        # lane that owns slot (i_d & 15, i_d >> 4) rewrites its register with the new
+        # v[i_d]; other lanes leave their registers untouched.
+        for i_d in range(n_dofs):
+            dot = gs.qd_float(0.0)
+            if local < i_d:
+                dot = dot + L_sh[env_in_warp, i_d, local] * v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 16] * v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 32] * v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 48] * v_reg_3
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            slot_idx = i_d >> 4
+            owner = i_d & 15
+            inv_diag = gs.qd_float(1.0) / L_sh[env_in_warp, i_d, i_d]
+            if local == owner:
+                if slot_idx == 0:
+                    v_reg_0 = (v_reg_0 - dot) * inv_diag
+                elif qd.static(NSLOTS > 1) and slot_idx == 1:
+                    v_reg_1 = (v_reg_1 - dot) * inv_diag
+                elif qd.static(NSLOTS > 2) and slot_idx == 2:
+                    v_reg_2 = (v_reg_2 - dot) * inv_diag
+                elif qd.static(NSLOTS > 3) and slot_idx == 3:
+                    v_reg_3 = (v_reg_3 - dot) * inv_diag
+
+        # Backward substitution: solve L^T @ x = y. Same v_reg cache, overwritten in-place
+        # with the backward-subst output. Same striping + subgroup-reduce pattern.
+        for i_d_ in range(n_dofs):
+            i_d = n_dofs - 1 - i_d_
+            dot = gs.qd_float(0.0)
+            if local > i_d and local < n_dofs:
+                dot = dot + L_sh[env_in_warp, local, i_d] * v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 > i_d and local + 16 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 16, i_d] * v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 > i_d and local + 32 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 32, i_d] * v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 > i_d and local + 48 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 48, i_d] * v_reg_3
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            slot_idx = i_d >> 4
+            owner = i_d & 15
+            inv_diag = gs.qd_float(1.0) / L_sh[env_in_warp, i_d, i_d]
+            if local == owner:
+                if slot_idx == 0:
+                    v_reg_0 = (v_reg_0 - dot) * inv_diag
+                elif qd.static(NSLOTS > 1) and slot_idx == 1:
+                    v_reg_1 = (v_reg_1 - dot) * inv_diag
+                elif qd.static(NSLOTS > 2) and slot_idx == 2:
+                    v_reg_2 = (v_reg_2 - dot) * inv_diag
+                elif qd.static(NSLOTS > 3) and slot_idx == 3:
+                    v_reg_3 = (v_reg_3 - dot) * inv_diag
+
+        # Writeback Mgrad. Each lane writes its owned slots; the env_b half-warp of an odd
+        # tail pair is masked via ``my_active`` to prevent OOB writes when ``_B`` is odd.
+        if my_active:
+            if local < n_dofs:
+                constraint_state.Mgrad[local, i_b_safe] = v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 < n_dofs:
+                    constraint_state.Mgrad[local + 16, i_b_safe] = v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 < n_dofs:
+                    constraint_state.Mgrad[local + 32, i_b_safe] = v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 < n_dofs:
+                    constraint_state.Mgrad[local + 48, i_b_safe] = v_reg_3
 
 
 # =====================================================================================================================
