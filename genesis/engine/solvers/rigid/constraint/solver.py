@@ -1725,11 +1725,9 @@ def func_cholesky_factor_direct_tiled(
 def func_build_changed_constraint_list_parallel(
     constraint_state: array_class.ConstraintState,
 ):
-    """Parallel wrapper around ``func_build_changed_constraint_list``.
-
-    Used by the GPU incremental Cholesky path. Builds ``incr_changed_idx`` /
-    ``incr_n_changed`` for every env in parallel; the per-env body is sequential over
-    constraints (cheap: ~40 active constraints on dex_hand).
+    """Parallel wrapper around ``func_build_changed_constraint_list`` (kept for compatibility
+    with the legacy CPU batch path; the GPU incremental Cholesky path now uses the fused
+    ``func_hessian_delta_scan_scatter`` below instead).
     """
     _B = constraint_state.grad.shape[1]
     qd.loop_config(name="build_changed_constraint_list_parallel")
@@ -1738,49 +1736,55 @@ def func_build_changed_constraint_list_parallel(
 
 
 @qd.func
-def func_hessian_delta_scatter(
+def func_hessian_delta_scan_scatter(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
 ):
-    """K2: parallel atomic delta-update on ``nt_H_unfactored`` for changed constraints.
+    """K2 (fused): scan every constraint, detect ``active ^ prev_active``, atomic delta-update
+    ``nt_H_unfactored``, and atomically increment ``incr_n_changed[i_b]`` so the C3 factor-skip
+    gate can still check ``> 0``. Profile showed ``build_changed_constraint_list_parallel`` was
+    the larger of the two kernels in the per-iter path (~600 us / step on dex_hand) -- fusing it
+    in saves a kernel launch and a constraint pre-scan.
 
-    For each constraint whose ``active`` state flipped since the previous Newton iter, adds (or
-    subtracts) ``D * J_c J_c^T`` into the lower triangle of ``nt_H_unfactored``. Updates only the
-    cells reached by the constraint's non-zero dofs (scanned from the dense ``jac`` row inline; no
-    CSR storage required so this works on the GPU path that does not allocate ``jac_relevant_dofs``).
-
-    Dispatch: one thread per (env, change_idx). Grid-strided over changes. mjwarp-style
-    ``update_gradient_h_incremental_sparse`` pattern, adapted to scan dense J rather than read
-    a pre-built CSR.
-
-    Toggled by ``gpu_incr_cholesky``. See ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
+    Dispatch: one block per (env, _DELTA_BLOCK) with grid-stride over constraints. dense J scan
+    inside the (i_d1, i_d2) inner loop; small but real cost compared to a real CSR jac (deferred
+    to future work).
     """
     EPS = rigid_global_info.EPS[None]
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.jac.shape[1]
     DELTA_BLOCK = qd.static(128)
 
-    qd.loop_config(name="hessian_delta_scatter", block_dim=DELTA_BLOCK)
-    for i_b, idx_g in qd.ndrange(_B, DELTA_BLOCK):
+    # Reset incr_n_changed for each improved env. Cheap (_B threads, trivial work).
+    qd.loop_config(name="hessian_delta_reset_count")
+    for i_b in range(_B):
+        if constraint_state.improved[i_b]:
+            constraint_state.incr_n_changed[i_b] = 0
+
+    qd.loop_config(name="hessian_delta_scan_scatter", block_dim=DELTA_BLOCK)
+    for i_b, i_c_g in qd.ndrange(_B, DELTA_BLOCK):
         if not constraint_state.improved[i_b]:
             continue
-        n_changed = constraint_state.incr_n_changed[i_b]
-        idx = idx_g
-        while idx < n_changed:
-            i_c = constraint_state.incr_changed_idx[idx, i_b]
-            sign = gs.qd_float(1.0) if constraint_state.active[i_c, i_b] else gs.qd_float(-1.0)
-            Dc = constraint_state.efc_D[i_c, i_b]
-            sign_Dc = sign * Dc
-            for i_d1 in range(n_dofs):
-                v1 = constraint_state.jac[i_c, i_d1, i_b]
-                if qd.abs(v1) <= EPS:
-                    continue
-                for i_d2 in range(i_d1 + 1):
-                    v2 = constraint_state.jac[i_c, i_d2, i_b]
-                    if qd.abs(v2) <= EPS:
+        n_c = constraint_state.n_constraints[i_b]
+        i_c = i_c_g
+        while i_c < n_c:
+            active_now = constraint_state.active[i_c, i_b]
+            active_prev = constraint_state.prev_active[i_c, i_b]
+            if active_now ^ active_prev:
+                qd.atomic_add(constraint_state.incr_n_changed[i_b], 1)
+                sign = gs.qd_float(1.0) if active_now else gs.qd_float(-1.0)
+                Dc = constraint_state.efc_D[i_c, i_b]
+                sign_Dc = sign * Dc
+                for i_d1 in range(n_dofs):
+                    v1 = constraint_state.jac[i_c, i_d1, i_b]
+                    if qd.abs(v1) <= EPS:
                         continue
-                    qd.atomic_add(constraint_state.nt_H_unfactored[i_b, i_d1, i_d2], sign_Dc * v1 * v2)
-            idx = idx + DELTA_BLOCK
+                    for i_d2 in range(i_d1 + 1):
+                        v2 = constraint_state.jac[i_c, i_d2, i_b]
+                        if qd.abs(v2) <= EPS:
+                            continue
+                        qd.atomic_add(constraint_state.nt_H_unfactored[i_b, i_d1, i_d2], sign_Dc * v1 * v2)
+            i_c = i_c + DELTA_BLOCK
 
 
 @qd.func

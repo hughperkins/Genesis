@@ -722,10 +722,10 @@ def _func_newton_only_nt_hessian(
     ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
     """
     if qd.static(static_rigid_sim_config.gpu_incr_cholesky):
-        # Incremental path: build changed list, delta-update nt_H_unfactored. K3 (copy_back) is
-        # fused into the factor's load step via skip_unchanged=True below, saving one global pass.
-        solver.func_build_changed_constraint_list_parallel(constraint_state=constraint_state)
-        solver.func_hessian_delta_scatter(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+        # Incremental path: fused scan + delta-scatter writes both nt_H_unfactored deltas and
+        # incr_n_changed counts in a single launch (one cheap reset launch before it). K3
+        # (copy_back) is fused into the factor's load step via skip_unchanged=True below.
+        solver.func_hessian_delta_scan_scatter(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     else:
         solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
