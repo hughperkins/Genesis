@@ -645,7 +645,7 @@ def _add_friction_constraint(
     n = d * contact_data_friction - contact_data_normal
 
     n_con = collision_con_start + i_col * 4 + i_friction
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
             i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
             constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -789,7 +789,7 @@ def _add_collision_constraints_per_contact(
                 n = d * contact_data_friction - contact_data_normal
 
                 n_con = collision_con_start + i_col * 4 + i_friction
-                if qd.static(static_rigid_sim_config.sparse_solve):
+                if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                         i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                         constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -940,7 +940,7 @@ def func_equality_connect(
         qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
         con_n_relevant_dofs = 0
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
             for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                 i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -1038,7 +1038,7 @@ def func_equality_joint(
     n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
     qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
 
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
             i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
             constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -1285,7 +1285,7 @@ def func_equality_weld(
         qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
         con_n_relevant_dofs = 0
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
             for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                 i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -1437,7 +1437,7 @@ def add_joint_limit_constraints(
                         constraint_state.aref[n_con, i_b] = aref
                         constraint_state.efc_D[n_con, i_b] = 1 / diag
 
-                        if qd.static(static_rigid_sim_config.sparse_solve):
+                        if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.constraint_layout_transposed):
                             for i_d2_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                                 i_d2 = constraint_state.jac_relevant_dofs[n_con, i_d2_, i_b]
                                 constraint_state.jac[n_con, i_d2, i_b] = gs.qd_float(0.0)
