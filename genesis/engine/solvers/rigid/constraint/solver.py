@@ -1833,7 +1833,7 @@ def func_hessian_direct_tiled(
 # Tuned on dex_hand 4096 envs (n_c ~ 40, n_d=62). 128 across the board is best on RTX 5090:
 # higher (256) splits more SMs but adds overhead; lower (64) under-utilizes parallel atomics.
 _BUILD_CSR_BLOCK = 128
-_SCATTER_BLOCK = 128
+_SCATTER_BLOCK = 256
 _QFRC_BLOCK = 128
 
 
