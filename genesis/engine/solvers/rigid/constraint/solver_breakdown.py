@@ -146,7 +146,7 @@ def _func_decomp_linesearch_p0(
             i_c = tid
             while i_c < n_con:
                 jv_val = gs.qd_float(0.0)
-                if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
+                if qd.static(static_rigid_sim_config.sparse_solve):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
                         i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
                         jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]

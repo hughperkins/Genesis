@@ -1829,6 +1829,9 @@ def func_hessian_direct_tiled(
                 i_pair = i_pair + BLOCK_DIM
 
 
+_BUILD_CSR_BLOCK = 64
+
+
 @qd.func
 def func_build_jac_csr_from_dense(
     constraint_state: array_class.ConstraintState,
@@ -1841,26 +1844,29 @@ def func_build_jac_csr_from_dense(
     One launch per substep, called right at the start of ``func_solve_init`` after
     constraint construction.
 
-    Topology: one thread per ``(env, c)``. Each thread sequentially scans
-    ``jac[i_c, :, i_b]`` for ``|j| > EPS``, writing the dof index into
-    ``jac_relevant_dofs`` and the running count into ``jac_n_relevant_dofs``.
+    Topology: grid-stride. Each ``(env, i_c_g)`` thread iterates ``i_c =
+    i_c_g, i_c_g + _BUILD_CSR_BLOCK, ...`` until ``n_constraints[i_b]``. This avoids
+    launching ``jac.shape[0]`` (~4000) threads per env when actual ``n_c`` is ~40 ish;
+    instead launches ``_BUILD_CSR_BLOCK`` threads per env regardless, each strided
+    over the constraints.
     """
     EPS = rigid_global_info.EPS[None]
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.jac.shape[1]
-    n_c_max = constraint_state.jac.shape[0]
 
     qd.loop_config(name="build_jac_csr")
-    for i_b, i_c in qd.ndrange(_B, n_c_max):
-        if i_c >= constraint_state.n_constraints[i_b]:
-            continue
-        nnz = gs.qd_int(0)
-        for i_d in range(n_dofs):
-            v = constraint_state.jac[i_c, i_d, i_b]
-            if qd.abs(v) > EPS:
-                constraint_state.jac_relevant_dofs[i_c, nnz, i_b] = i_d
-                nnz = nnz + 1
-        constraint_state.jac_n_relevant_dofs[i_c, i_b] = nnz
+    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
+        n_c = constraint_state.n_constraints[i_b]
+        i_c = i_c_g
+        while i_c < n_c:
+            nnz = gs.qd_int(0)
+            for i_d in range(n_dofs):
+                v = constraint_state.jac[i_c, i_d, i_b]
+                if qd.abs(v) > EPS:
+                    constraint_state.jac_relevant_dofs[i_c, nnz, i_b] = i_d
+                    nnz = nnz + 1
+            constraint_state.jac_n_relevant_dofs[i_c, i_b] = nnz
+            i_c = i_c + _BUILD_CSR_BLOCK
 
 
 @qd.func
@@ -1911,31 +1917,29 @@ def func_hessian_direct_sparse_scatter(
             continue
         constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
-    n_c_max = constraint_state.jac.shape[0]
     qd.loop_config(name="nt_H_scatter")
-    for i_b, i_c in qd.ndrange(_B, n_c_max):
+    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
         n_c = constraint_state.n_constraints[i_b]
         if n_c == 0 or not constraint_state.improved[i_b]:
             continue
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
                 continue
-        if i_c >= n_c:
-            continue
-        if not constraint_state.active[i_c, i_b]:
-            continue
-
-        nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
-        Dc = constraint_state.efc_D[i_c, i_b]
-        for ii in range(nnz):
-            d_i = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
-            v_i = constraint_state.jac[i_c, d_i, i_b]
-            for jj in range(ii + 1):
-                d_j = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
-                v_j = constraint_state.jac[i_c, d_j, i_b]
-                row = qd.max(d_i, d_j)
-                col = qd.min(d_i, d_j)
-                qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
+        i_c = i_c_g
+        while i_c < n_c:
+            if constraint_state.active[i_c, i_b]:
+                nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+                Dc = constraint_state.efc_D[i_c, i_b]
+                for ii in range(nnz):
+                    d_i = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
+                    v_i = constraint_state.jac[i_c, d_i, i_b]
+                    for jj in range(ii + 1):
+                        d_j = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
+                        v_j = constraint_state.jac[i_c, d_j, i_b]
+                        row = qd.max(d_i, d_j)
+                        col = qd.min(d_i, d_j)
+                        qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
+            i_c = i_c + _BUILD_CSR_BLOCK
 
 
 @qd.func
@@ -3505,15 +3509,17 @@ def _func_update_qfrc_constraint_sparse_scatter(
         constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
 
     qd.loop_config(name="update_constraint_qfrc")
-    for i_b, i_c in qd.ndrange(_B, n_c_max):
-        if i_c >= constraint_state.n_constraints[i_b]:
-            continue
-        force = constraint_state.efc_force[i_c, i_b]
-        nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
-        for i_d_ in range(nnz):
-            i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-            j = constraint_state.jac[i_c, i_d, i_b]
-            qd.atomic_add(constraint_state.qfrc_constraint[i_d, i_b], j * force)
+    for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
+        n_c = constraint_state.n_constraints[i_b]
+        i_c = i_c_g
+        while i_c < n_c:
+            force = constraint_state.efc_force[i_c, i_b]
+            nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+            for i_d_ in range(nnz):
+                i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                j = constraint_state.jac[i_c, i_d, i_b]
+                qd.atomic_add(constraint_state.qfrc_constraint[i_d, i_b], j * force)
+            i_c = i_c + _BUILD_CSR_BLOCK
 
 
 @qd.func
