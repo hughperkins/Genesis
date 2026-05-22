@@ -1831,9 +1831,9 @@ def func_hessian_direct_tiled(
 
 # Per-kernel grid-stride block sizes. Threads per env for the (env, c)-loop kernels.
 # Tuned on dex_hand 4096 envs (n_c ~ 40, n_d=62) -- sweet spots can shift with scene scale.
-_BUILD_CSR_BLOCK = 64
+_BUILD_CSR_BLOCK = 128
 _SCATTER_BLOCK = 128
-_QFRC_BLOCK = 64
+_QFRC_BLOCK = 128
 
 
 @qd.func
