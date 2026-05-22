@@ -733,6 +733,7 @@ def _func_newton_only_nt_hessian(
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
+            skip_unchanged=qd.static(static_rigid_sim_config.gpu_incr_cholesky),
         )
     else:
         _B = constraint_state.jac.shape[2]

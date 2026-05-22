@@ -1630,6 +1630,7 @@ def func_cholesky_factor_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    skip_unchanged: qd.template() = False,
 ):
     """Compute the Cholesky factorization L of the Hessian matrix H = L @ L.T for a given environment `i_b`.
 
@@ -1662,10 +1663,11 @@ def func_cholesky_factor_direct_tiled(
             continue
         if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
             continue
-        # C3 skip-unchanged: when gpu_incr_cholesky is on, envs with no active-set change since the
-        # previous iter reuse the prior L stored in nt_H. See
+        # C3 skip-unchanged: per-iter callers pass skip_unchanged=True to reuse the prior L when
+        # the active set is stable. The initial substep call leaves skip_unchanged=False so the
+        # factor always runs (incr_n_changed is stale at that point). See
         # ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
-        if qd.static(static_rigid_sim_config.gpu_incr_cholesky):
+        if qd.static(skip_unchanged):
             if constraint_state.incr_n_changed[i_b] == 0:
                 continue
 
