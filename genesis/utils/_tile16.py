@@ -642,13 +642,24 @@ def _make_tile16x16_class(dtype):
 
             L is a Tile16x16 holding the lower-triangular Cholesky factor (from cholesky_).  On return, self holds
             the solution X.
+
+            Hybrid unroll: dynamic outer (`for c`) preserves the runtime `c > j` predicate
+            and avoids the 16x outer-unroll bloat that regressed in fully-static trials
+            (deskai9 round-3 trsm experiments, 2026-05-22). Inner unrolled statically
+            with `_r(j)` and a 2-way dot accumulator (`dot0`/`dot1`) mirroring
+            `cholesky_`'s opt-3 split.
             """
             for c in range(16):
-                dot = qd.cast(0.0, dtype)
-                for j in range(16):
+                dot0 = qd.cast(0.0, dtype)
+                dot1 = qd.cast(0.0, dtype)
+                for j in qd.static(range(16)):
                     if c > j:
-                        Lkj = qd.simt.subgroup.shuffle(L._get_col(j), qd.u32(c))
-                        dot += self._get_col(j) * Lkj  # type: ignore[reportOperatorIssue]
+                        Lkj = qd.simt.subgroup.shuffle(L._r(j), qd.u32(c))
+                        if j % 2 == 0:
+                            dot0 += self._r(j) * Lkj  # type: ignore[reportOperatorIssue]
+                        else:
+                            dot1 += self._r(j) * Lkj  # type: ignore[reportOperatorIssue]
+                dot = dot0 + dot1
 
                 diag_c = qd.simt.subgroup.shuffle(L._get_col(c), qd.u32(c))
                 new_val = (self._get_col(c) - dot) / diag_c  # type: ignore[reportOperatorIssue]
