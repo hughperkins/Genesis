@@ -623,6 +623,13 @@ def _func_update_constraint_cost_coop(
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
+        # F1-E2: hoisted `solver_iter_counter += 1` (was a standalone 1-thread serial kernel
+        # `increment_iter_counter` in `_func_build_changed_and_decide_hessian_mode`). Runs
+        # unconditionally on exactly one thread per launch (i_flat == 0). The grid-sync at this
+        # kernel's boundary makes the post-increment value visible to the read in the next
+        # kernel `build_changed_decide`.
+        if i_flat == 0:
+            constraint_state.solver_iter_counter[()] = constraint_state.solver_iter_counter[()] + 1
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             n_dofs = constraint_state.qfrc_constraint.shape[0]
             ne = constraint_state.n_constraints_equality[i_b]
@@ -683,6 +690,11 @@ def _func_update_constraint_cost_serial(
 
     qd.loop_config(name="update_constraint_cost", block_dim=32)
     for i_b in range(_B):
+        # F1-E2: hoisted `solver_iter_counter += 1` (was a standalone 1-thread serial kernel
+        # `increment_iter_counter`). Runs unconditionally on exactly one thread per launch
+        # (i_b == 0). See `_func_update_constraint_cost_coop` for the matching change.
+        if i_b == 0:
+            constraint_state.solver_iter_counter[()] = constraint_state.solver_iter_counter[()] + 1
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             n_dofs = constraint_state.qfrc_constraint.shape[0]
             ne = constraint_state.n_constraints_equality[i_b]
@@ -752,11 +764,12 @@ def _func_build_changed_and_decide_hessian_mode(
     Adaptive policy: use full rebuild if more than half the constraints changed, otherwise patch. Init (iter 0) always
     does full rebuild via func_solve_init.
     """
-    qd.loop_config(name="increment_iter_counter")
-    for _ in range(1):
-        constraint_state.solver_iter_counter[()] = constraint_state.solver_iter_counter[()] + 1
-
     _B = constraint_state.grad.shape[1]
+    # F1-E2: `solver_iter_counter += 1` was hoisted into the preceding `update_constraint_cost`
+    # kernel (lane 0 of i_flat == 0 / i_b == 0), eliminating the 1-thread serial
+    # `increment_iter_counter` kernel that used to live here. The increment lands one kernel
+    # earlier in the iter body; the read below sees the post-increment value via the kernel
+    # boundary grid-sync.
     iter_count = constraint_state.solver_iter_counter[()]
     qd.loop_config(name="build_changed_decide", block_dim=32)
     for i_b in range(_B):
@@ -954,13 +967,23 @@ def _func_update_search_direction(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
-    """Step 6: Check convergence and update search direction"""
+    """Step 6: Check convergence and update search direction.
+
+    F1-E1: also performs the per-iter `early_exit_flag = 0` and `graph_counter -= 1`
+    writes that used to live in `check_early_exit_reset_flag` (a separate 1-thread
+    serial kernel). Both writes are scalar single-writer (lane 0 = i_b == 0) and the
+    grid-wide kernel boundary between this kernel and `check_early_exit_scan_values`
+    ensures the reset is visible before the atomic_max reads early_exit_flag."""
     _B = constraint_state.grad.shape[1]
     qd.loop_config(
         name="update_search_direction", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32
     )
     for i_b in range(_B):
+        if i_b == 0:
+            constraint_state.early_exit_flag[()] = 0
+            graph_counter[()] = graph_counter[()] - 1
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             solver.func_terminate_or_update_descent_batch(
                 i_b,
@@ -975,12 +998,11 @@ def _func_check_early_exit(
     constraint_state: array_class.ConstraintState,
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
-    """Decrement iteration counter and exit early if no batch element improved."""
-    qd.loop_config(name="check_early_exit_reset_flag")
-    for _ in range(1):
-        graph_counter[()] = graph_counter[()] - 1
-        constraint_state.early_exit_flag[()] = 0
+    """Exit early if no batch element improved.
 
+    F1-E1: the per-iter `early_exit_flag = 0` reset and the `graph_counter -= 1`
+    decrement were hoisted into `_func_update_search_direction` lane 0, saving one
+    1-thread serial kernel (was `check_early_exit_reset_flag`) per Newton iter."""
     _B = constraint_state.grad.shape[1]
     qd.loop_config(name="check_early_exit_scan_values")
     for i_b in range(_B):
@@ -1041,7 +1063,7 @@ def _kernel_solve_graph(
             _func_update_gradient(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
-        _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config)
+        _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config, graph_counter)
         _func_check_early_exit(constraint_state, graph_counter)
 
 
