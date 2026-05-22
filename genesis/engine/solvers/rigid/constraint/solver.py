@@ -3784,66 +3784,6 @@ def _initialize_Jaref_body(
 
 
 @qd.func
-def _initialize_Jaref_body_and_build_csr(
-    i_c,
-    i_b,
-    n_dofs,
-    EPS,
-    qacc: qd.template(),
-    constraint_state: array_class.ConstraintState,
-):
-    """Like ``_initialize_Jaref_body`` but ALSO populates the CSR sparsity index for J.
-
-    Scans the dense ``jac[i_c, :, i_b]`` once, writes ``jac_relevant_dofs`` /
-    ``jac_n_relevant_dofs`` for non-zeros, and accumulates Jaref = J@qacc - aref over
-    the SAME non-zero entries (multiplying by zero contributes nothing). One pass,
-    no extra reads vs the dense init_jaref. Used as the FIRST init_jaref call when
-    ``hessian_sparse_build=True`` so we don't need a separate build_jac_csr kernel.
-    """
-    Jaref = -constraint_state.aref[i_c, i_b]
-    nnz = gs.qd_int(0)
-    for i_d in range(n_dofs):
-        v = constraint_state.jac[i_c, i_d, i_b]
-        if qd.abs(v) > EPS:
-            constraint_state.jac_relevant_dofs[i_c, nnz, i_b] = i_d
-            Jaref = Jaref + v * qacc[i_d, i_b]
-            nnz = nnz + 1
-    constraint_state.jac_n_relevant_dofs[i_c, i_b] = nnz
-    constraint_state.Jaref[i_c, i_b] = Jaref
-
-
-@qd.func
-def initialize_Jaref_and_build_csr(
-    qacc: qd.template(),
-    constraint_state: array_class.ConstraintState,
-    rigid_global_info: array_class.RigidGlobalInfo,
-    static_rigid_sim_config: qd.template(),
-):
-    """Fused first-pass init_jaref + build_csr.
-
-    Single launch over (env, c). Replaces both ``initialize_Jaref`` and
-    ``func_build_jac_csr_from_dense`` for the FIRST call when
-    ``hessian_sparse_build=True``. Subsequent init_jaref calls read the populated
-    CSR via ``_initialize_Jaref_body``'s sparse branch.
-    """
-    EPS = rigid_global_info.EPS[None]
-    _B = constraint_state.jac.shape[2]
-    n_dofs = constraint_state.jac.shape[1]
-    len_constraints = constraint_state.Jaref.shape[0]
-
-    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
-        qd.loop_config(name="init_jaref_build_csr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_b, i_c in qd.ndrange(_B, len_constraints):
-            if i_c < constraint_state.n_constraints[i_b]:
-                _initialize_Jaref_body_and_build_csr(i_c, i_b, n_dofs, EPS, qacc, constraint_state)
-    else:
-        qd.loop_config(name="init_jaref_build_csr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_c, i_b in qd.ndrange(len_constraints, _B):
-            if i_c < constraint_state.n_constraints[i_b]:
-                _initialize_Jaref_body_and_build_csr(i_c, i_b, n_dofs, EPS, qacc, constraint_state)
-
-
-@qd.func
 def _initialize_Jaref_per_env(
     qacc: qd.template(),
     constraint_state: array_class.ConstraintState,
@@ -3933,6 +3873,12 @@ def func_solve_init(
     _B = dofs_state.acc_smooth.shape[1]
     n_dofs = dofs_state.acc_smooth.shape[0]
 
+    if qd.static(static_rigid_sim_config.hessian_sparse_build):
+        # Populate CSR sparsity index for J from the dense jac. Cheap single-pass kernel;
+        # subsequent kernels in func_solve_init and the per-iter graph then read jac_relevant_dofs
+        # / jac_n_relevant_dofs to skip zero entries.
+        func_build_jac_csr_from_dense(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+
     if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
         # Compute cost for warmstart state (i.e. acceleration at previous timestep)
         initialize_Ma(
@@ -3944,21 +3890,11 @@ def func_solve_init(
             static_rigid_sim_config=static_rigid_sim_config,
         )
 
-        if qd.static(static_rigid_sim_config.hessian_sparse_build):
-            # Fused: scan dense jac, populate CSR sparsity index, compute Jaref. Saves one
-            # kernel launch vs running build_jac_csr_from_dense + initialize_Jaref separately.
-            initialize_Jaref_and_build_csr(
-                qacc=constraint_state.qacc_ws,
-                constraint_state=constraint_state,
-                rigid_global_info=rigid_global_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
-        else:
-            initialize_Jaref(
-                qacc=constraint_state.qacc_ws,
-                constraint_state=constraint_state,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
+        initialize_Jaref(
+            qacc=constraint_state.qacc_ws,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
         func_update_constraint(
             qacc=constraint_state.qacc_ws,
             Ma=constraint_state.Ma_ws,
@@ -4029,16 +3965,7 @@ def func_solve_init(
             static_rigid_sim_config=static_rigid_sim_config,
         )
 
-        if qd.static(static_rigid_sim_config.hessian_sparse_build):
-            # Non-mujoco-compat path: this is the FIRST init_jaref call, so CSR is not yet
-            # populated. Build it standalone here to avoid double-populating in the shared
-            # init_jaref below.
-            func_build_jac_csr_from_dense(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
-
-    # Initialize solver accordingly. By this point CSR is already populated (either by
-    # initialize_Jaref_and_build_csr in mujoco-compat or by func_build_jac_csr_from_dense
-    # above for non-mujoco-compat) when hessian_sparse_build=True, so initialize_Jaref's
-    # sparse branch reads valid data.
+    # Initialize solver accordingly
     initialize_Jaref(
         qacc=constraint_state.qacc,
         constraint_state=constraint_state,
