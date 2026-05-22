@@ -1873,7 +1873,6 @@ def func_build_jac_csr_from_dense(
 def func_hessian_direct_sparse_scatter(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
-    static_rigid_sim_config: qd.template(),
     check_full_hessian: qd.template() = False,
 ):
     """Sparse atomic-scatter alternative to ``func_hessian_direct_tiled``.
@@ -1905,10 +1904,9 @@ def func_hessian_direct_sparse_scatter(
     """
     EPS = rigid_global_info.EPS[None]
     _B = constraint_state.grad.shape[1]
-    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
-    N_LOWER_TRI = qd.static(MAX_DOFS * (MAX_DOFS + 1) // 2)
+    n_dofs = qd.static(constraint_state.nt_H.shape[1])
+    n_lower_tri = qd.static(n_dofs * (n_dofs + 1) // 2)
     BLOCK_DIM = qd.static(_BUILD_CSR_BLOCK)
-    n_dofs = constraint_state.nt_H.shape[1]
 
     # Single kernel, one block per env: init lower-tri H = M in block-shared memory,
     # block-sync, scatter J^T D J via shared-mem atomics, block-sync, copy to global.
@@ -1919,7 +1917,7 @@ def func_hessian_direct_sparse_scatter(
         tid = i_flat % BLOCK_DIM
         i_b = i_flat // BLOCK_DIM
 
-        h_shared = qd.simt.block.SharedArray((N_LOWER_TRI,), gs.qd_float)
+        h_shared = qd.simt.block.SharedArray((n_lower_tri,), gs.qd_float)
 
         n_c = constraint_state.n_constraints[i_b]
         skip = (n_c == 0) or (not constraint_state.improved[i_b])
@@ -1931,10 +1929,9 @@ def func_hessian_direct_sparse_scatter(
             continue
 
         # Phase 1: initialize h_shared (linear lower-tri layout) from mass_mat.
-        # Use n_dofs (actual dim) for the bound, not MAX_DOFS-derived N_LOWER_TRI.
-        n_lower_tri_actual = n_dofs * (n_dofs + 1) // 2
+        # Linear elem k -> (i_d1, i_d2) with i_d1 = floor((sqrt(8k+1)-1)/2), i_d2 = k - i_d1*(i_d1+1)/2.
         elem = tid
-        while elem < n_lower_tri_actual:
+        while elem < n_lower_tri:
             i_d1, i_d2 = linear_to_lower_tri(elem)
             h_shared[elem] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
             elem = elem + BLOCK_DIM
@@ -1963,7 +1960,7 @@ def func_hessian_direct_sparse_scatter(
 
         # Phase 3: write h_shared back to global nt_H lower-tri.
         elem = tid
-        while elem < n_lower_tri_actual:
+        while elem < n_lower_tri:
             i_d1, i_d2 = linear_to_lower_tri(elem)
             constraint_state.nt_H[i_b, i_d1, i_d2] = h_shared[elem]
             elem = elem + BLOCK_DIM
@@ -2257,7 +2254,7 @@ def func_hessian_and_cholesky_factor_direct(
     else:
         # GPU
         if qd.static(static_rigid_sim_config.hessian_sparse_build):
-            func_hessian_direct_sparse_scatter(constraint_state, rigid_global_info, static_rigid_sim_config)
+            func_hessian_direct_sparse_scatter(constraint_state, rigid_global_info)
         else:
             func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
