@@ -1719,7 +1719,7 @@ def func_hessian_copy_to_unfactored(
     """
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
-    qd.loop_config(name="hessian_copy_to_unfactored")
+    qd.loop_config(name="hessian_copy_to_unfactored", block_dim=128)
     for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
         if i_d2 > i_d1:
             continue
