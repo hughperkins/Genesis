@@ -1833,7 +1833,7 @@ def func_hessian_direct_tiled(
 # Tuned on dex_hand 4096 envs (n_c ~ 40, n_d=62). 128 across the board is best on RTX 5090:
 # higher (256) splits more SMs but adds overhead; lower (64) under-utilizes parallel atomics.
 _BUILD_CSR_BLOCK = 128
-_SCATTER_BLOCK = 64
+_SCATTER_BLOCK = 128
 _QFRC_BLOCK = 128
 
 
@@ -1922,7 +1922,7 @@ def func_hessian_direct_sparse_scatter(
             continue
         constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
-    qd.loop_config(name="nt_H_scatter")
+    qd.loop_config(name="nt_H_scatter", block_dim=qd.static(_SCATTER_BLOCK))
     for i_b, i_c_g in qd.ndrange(_B, _SCATTER_BLOCK):
         n_c = constraint_state.n_constraints[i_b]
         if n_c == 0 or not constraint_state.improved[i_b]:
