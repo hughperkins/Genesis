@@ -1906,16 +1906,23 @@ def func_hessian_direct_sparse_scatter(
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
 
+    # Grid-stride per (env, lower-tri-elem-block). Each thread iterates its slice of the
+    # lower-tri (size n_dofs * (n_dofs + 1) // 2) using a linear index, decoding (i_d1, i_d2)
+    # via triangle math. Saves ~half the wasted threads (upper-tri early-exits) and ~30x
+    # fewer total thread launches vs the ndrange(_B, n_dofs, n_dofs) form.
+    n_lower_tri = n_dofs * (n_dofs + 1) // 2
     qd.loop_config(name="nt_H_init_M")
-    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
-        if i_d2 > i_d1:
-            continue
+    for i_b, elem_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
                 continue
         if not constraint_state.improved[i_b]:
             continue
-        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+        elem = elem_g
+        while elem < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(elem)
+            constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+            elem = elem + _BUILD_CSR_BLOCK
 
     qd.loop_config(name="nt_H_scatter")
     for i_b, i_c_g in qd.ndrange(_B, _BUILD_CSR_BLOCK):
