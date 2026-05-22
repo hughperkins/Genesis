@@ -1829,7 +1829,7 @@ def func_hessian_direct_tiled(
                 i_pair = i_pair + BLOCK_DIM
 
 
-_BUILD_CSR_BLOCK = 64
+_BUILD_CSR_BLOCK = 256
 
 
 @qd.func
