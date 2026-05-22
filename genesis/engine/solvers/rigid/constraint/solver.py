@@ -1705,10 +1705,12 @@ def func_hessian_direct_tiled(
     # the test_rigid_benchmarks.py in production.yml for each value.
     BLOCK_DIM = qd.static(128)
     MAX_DOFS_PER_BLOCK = qd.static(64)
-    # Note: setting MAX_CONSTRAINTS_PER_BLOCK to 64 provides a benefit for anymal_uniform_kinematic cpu
-    # bs=0 (+14%), but a regression on anymal_uniform cuda ndarray (-9%). Generally gives better
-    # performance on CPU, but worse on CUDA.
-    MAX_CONSTRAINTS_PER_BLOCK = qd.static(32)
+    # P3 H1 experiment (round 3, see doc/cholesky_cross_substep_warmstart_2026may22.md): trying =64 on dex_hand.
+    # On dex_hand n_c~55, =32 needs 2 constraint blocks per substep; =64 collapses to 1, eliminating the outer
+    # repeat pass (1 fewer M-init branch, 1 fewer sync). Shmem cost doubles (jac_row + jac_col goes from 32*64*4*2
+    # = 16kB to 32kB) but still fits well under 48kB default budget.
+    # Prior note: =64 regressed -9% on anymal_uniform cuda ndarray, may differ on dex_hand n_c~55.
+    MAX_CONSTRAINTS_PER_BLOCK = qd.static(64)
 
     n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
