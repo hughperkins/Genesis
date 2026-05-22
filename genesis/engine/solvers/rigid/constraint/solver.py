@@ -1679,11 +1679,13 @@ def func_hessian_direct_batch(
 
 
 @qd.func
-def func_hessian_csr_build(
+def _func_hessian_csr_build_unused(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
 ):
-    """Sparse Hessian build: H = M + J.T @ D @ J via per-(env, constraint) atomic scatter.
+    """[H2 negative result, retained for reference / future revival — NOT called from production paths.]
+
+    Sparse Hessian build: H = M + J.T @ D @ J via per-(env, constraint) atomic scatter.
 
     P3 H2 optimisation (see ``perso_hugh/doc/cholesky_cross_substep_warmstart_2026may22.md``). Equivalent
     semantics to ``func_hessian_direct_tiled`` (without ``check_full_hessian``: this entry point is only
@@ -1716,6 +1718,16 @@ def func_hessian_csr_build(
     Beware ``nt_H`` is re-purposed downstream to store the Cholesky factor L. This kernel only writes
     the lower triangle; the strictly upper triangle is left untouched (matches
     ``func_hessian_direct_tiled``).
+
+    **2026-05-22 negative-result note (see doc/cholesky_cross_substep_warmstart_2026may22.md).** On
+    dex_hand: kernel measured 309.9 us / call vs the dense kernel's 231.6 us (with MAX_CONSTRAINTS_PER_BLOCK=64,
+    H1) — a ~34 % regression on the targeted kernel. The dense FFMA loop is already near-optimal because
+    (a) it amortizes shmem-cached Jacobian loads across many FFMAs, (b) it uses register accumulation with
+    a single non-atomic write per (i_d1, i_d2) pair, and (c) it fuses the M-load into the FFMA accumulator
+    (no separate M-init pass). The sparse path's per-thread register CSR (32 int + 32 float vec) plus
+    serial 60-DoF scan plus 21 global atomic_adds per active constraint outweighs the FFMA savings.
+    Atomic_add to global memory is ~30 ns vs the dense kernel's ~1 ns per FMA. Function retained for
+    reference; not wired into any production path.
     """
     EPS = rigid_global_info.EPS[None]
 
@@ -2231,14 +2243,7 @@ def func_hessian_and_cholesky_factor_direct(
             )
     else:
         # GPU
-        # P3 H2 dispatch (see ``doc/cholesky_cross_substep_warmstart_2026may22.md``): if the CSR sparse build path
-        # is enabled (gated in rigid_solver.py on Newton + tiled cholesky + not sparse_solve + n_dofs > 16 + n_envs
-        # >= 256), use it instead of the dense tiled rebuild. For dex_hand the sparse path saves ~99 % of the dense
-        # FFMA work (which is on 0 x 0 entries).
-        if qd.static(static_rigid_sim_config.enable_csr_hessian_build):
-            func_hessian_csr_build(constraint_state, rigid_global_info)
-        else:
-            func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)

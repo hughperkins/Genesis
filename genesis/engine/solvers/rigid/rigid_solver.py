@@ -472,26 +472,9 @@ class RigidSolver(KinematicSolver):
                 tiled_n_dofs = min(max(math.ceil(self.n_dofs / 32), 1), max_n_warps) * 32
                 tiled_n_dofs_per_entity = min(max(math.ceil(max_n_dofs_per_entity / 32), 1), max_n_warps) * 32
 
-                # CSR-based init Hessian build (P3 H2, doc/cholesky_cross_substep_warmstart_2026may22.md).
-                # Gated on the same conditions as enable_tiled_cholesky_hessian PLUS the Newton solver
-                # (other solvers don't call the H rebuild), and explicitly disabled when sparse_solve is on
-                # (that path already uses jac_relevant_dofs CSR). Skip when n_dofs is tiny (<= 16): the
-                # dense kernel's per-thread workload is already small enough that atomic_add overhead would
-                # dominate. Skip when n_envs is small (<= 256): the constraint-scatter launch would be
-                # under-occupied vs the dense kernel's per-env warp.
-                solver_is_newton = self._options.constraint_solver == gs.constraint_solver.Newton
-                enable_csr_hessian_build = (
-                    enable_tiled_cholesky_hessian
-                    and solver_is_newton
-                    and not self._options.sparse_solve
-                    and self.n_dofs > 16
-                    and self.n_envs >= 256
-                )
-
                 static_rigid_sim_config.update(
                     enable_tiled_cholesky_mass_matrix=enable_tiled_cholesky_mass_matrix,
                     enable_tiled_cholesky_hessian=enable_tiled_cholesky_hessian,
-                    enable_csr_hessian_build=enable_csr_hessian_build,
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
                 )
