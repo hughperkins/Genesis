@@ -295,6 +295,12 @@ class ConstraintState:
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
     incr_changed_idx: qd.Tensor
     incr_n_changed: qd.Tensor
+    # Compacted list of envs that are improved (active) for the current Newton iteration. Built by
+    # `_func_scatter_active_envs_compacted` and consumed by the pack-2 fused Cholesky kernel so it can
+    # pair active envs together (avoiding the skip-unchanged disadvantage of pairing a random
+    # i_b with i_b+1).
+    active_envs_compacted: qd.Tensor
+    n_active_envs: qd.Tensor
     # Backward gradients
     dL_dqacc: qd.Tensor
     dL_dM: qd.Tensor
@@ -399,6 +405,8 @@ def get_constraint_state(constraint_solver, solver):
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
+        active_envs_compacted=V(dtype=gs.qd_int, shape=(_B,)),
+        n_active_envs=V(dtype=gs.qd_int, shape=()),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
         efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
         # Layout-flippable constraint-state tensors: allocated as qd.Tensor wrappers, optionally with

@@ -12,6 +12,7 @@ import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
 from genesis.utils._tile16 import Tile16x16Cholesky
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
+from genesis.utils.tile16_pack2 import Tile16x16Pack2
 
 from ..collider.contact_island import ContactIsland
 from . import backward as backward_constraint_solver
@@ -1942,8 +1943,75 @@ def func_cholesky_factor_direct_tiled(
             L_kk._store3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
 
 
+# Shared-memory budget threshold below which the pack-2 fused kernel (2 envs/warp) is used.
+# Pack-2 doubles shared memory per warp:
+#   L_sh: 2 * MAX_DOFS * (MAX_DOFS + 1) * sizeof(float)
+# At MAX_DOFS=64 (fp32), this is ~33 KB — under the 48 KB default per-block dynamic shmem cap.
+# Above this threshold we fall back to the single-env-per-warp kernel which uses half the shmem
+# and is the only path that can handle the `test_cholesky_tiling_large_shared_memory` scenario
+# (MAX_DOFS ~ 102 dofs).
+_CHOLESKY_FUSED_PACK2_MAX_DOFS = 64
+
+
+@qd.func
+def _func_reset_n_active_envs(constraint_state: array_class.ConstraintState):
+    """Reset the n_active_envs counter to 0 (1 thread, separate kernel launch from the scatter)."""
+    qd.loop_config(name="reset_n_active_envs", serialize=True)
+    for _ in range(1):
+        constraint_state.n_active_envs[None] = 0
+
+
+@qd.func
+def _func_scatter_active_envs_compacted(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Atomic-add scatter of active env indices into `constraint_state.active_envs_compacted`.
+
+    Each env that is active (n_constraints > 0 and improved) atomic-adds to `n_active_envs` and
+    writes its index into the returned slot. Slot order is non-deterministic but irrelevant for
+    pack-2 (it just needs pairs of slots to both be active envs). Must run after
+    `_func_reset_n_active_envs` and before the pack-2 fused kernel.
+    """
+    _B = constraint_state.grad.shape[1]
+    qd.loop_config(name="scatter_active_envs", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            idx = qd.atomic_add(constraint_state.n_active_envs[None], 1)
+            constraint_state.active_envs_compacted[idx] = i_b
+
+
 @qd.func
 def func_cholesky_and_solve_fused_tiled(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Dispatcher: pack-2 (2 envs/warp) for small MAX_DOFS, single-env (1/warp) otherwise.
+
+    Compile-time selection via ``qd.static``: scenes whose `tiled_n_dofs` fits the pack-2 shmem
+    budget take the pack-2 path with the POTRF-unroll and compaction optimisations. Larger
+    scenes fall back to the original single-env kernel which is unchanged from main.
+
+    The compacted active-env list is built once per substep before the Newton do_while loop
+    (see ``_kernel_solve_graph`` in ``solver_breakdown.py``); the pack-2 kernel just reads it.
+    """
+    if qd.static(static_rigid_sim_config.tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS):
+        _func_cholesky_and_solve_fused_tiled_pack2(
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+    else:
+        _func_cholesky_and_solve_fused_tiled_single(
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+
+@qd.func
+def _func_cholesky_and_solve_fused_tiled_single(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
@@ -1953,6 +2021,10 @@ def func_cholesky_and_solve_fused_tiled(
     Factorizes H = L L^T using register-resident 16x16 tiles, storing completed L tiles in shared memory. Then solves
     L L^T x = g (forward + backward substitution) in-place and writes the result to Mgrad, without ever writing L to
     global memory.
+
+    Single-env (1 env per 16-lane sub-warp) fallback path. Used when MAX_DOFS exceeds the pack-2
+    shmem budget (see ``_CHOLESKY_FUSED_PACK2_MAX_DOFS``). Identical to the original upstream
+    implementation; numerically bit-equivalent.
     """
     EPS = rigid_global_info.EPS[None]
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
@@ -2064,6 +2136,216 @@ def func_cholesky_and_solve_fused_tiled(
         while k < n_dofs:
             constraint_state.Mgrad[k, i_b] = v_sh[k]
             k = k + 16
+
+
+@qd.func
+def _func_cholesky_and_solve_fused_tiled_pack2(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Pack-2 fused Cholesky+solve: 2 envs per 32-lane warp.
+
+    Shared memory shape (2, MAX_DOFS, MAX_DOFS+1) for L (env_in_warp = tid >> 4 picks the half-warp's
+    slab). The solve vector v lives in per-lane registers (T24 register-resident v optimisation),
+    not shared memory, so the only shmem allocation is L.
+
+    Reads from ``constraint_state.active_envs_compacted[:n_active]`` (populated once per substep
+    by ``_func_scatter_active_envs_compacted``) so adjacent pairs of slots are always both
+    active envs. For odd n_active the tail pair has env_b == env_a (duplicate) and the env_b
+    half-warp's stores are masked out by ``my_active``.
+
+    The Tile16x16Pack2 tile primitives (``cholesky_``, ``_ger_sub``, ``_load3d``, ``_store3d``)
+    carry the POTRF-unroll and SYRK inline-cascade optimisations ported from ``_tile16.py``
+    (``Tile16x16Cholesky``). Each warp-instruction puts 32 lanes through the FFMA pipe instead
+    of 16, closing the sub-warp execution penalty.
+    """
+    EPS = rigid_global_info.EPS[None]
+    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    N_BLOCKS = (n_dofs + 16 - 1) // 16
+
+    # Pack-2 layout: each 32-lane CUDA warp processes 2 envs (lanes 0-15 = env_a, lanes 16-31 = env_b).
+    # Worst-case launch shape is _B_pairs_alloc = (_B + 1) // 2 warps; we skip warps past
+    # n_active_pairs early via `continue`.
+    _B_pairs_alloc = (_B + 1) // 2
+    n_active = constraint_state.n_active_envs[None]
+    n_active_pairs = (n_active + 1) // 2
+
+    qd.loop_config(name="cholesky_and_solve_fused_tiled_pack2", block_dim=32)
+    for i in range(_B_pairs_alloc * 32):
+        tid = i % 32
+        local = tid & 15
+        env_in_warp = tid >> 4
+
+        pair_idx = i // 32
+        if pair_idx >= n_active_pairs:
+            continue
+
+        slot_a = pair_idx * 2
+        slot_b = pair_idx * 2 + 1
+        slot_b_safe = qd.min(slot_b, n_active - 1)
+        env_a = constraint_state.active_envs_compacted[slot_a]
+        env_b = constraint_state.active_envs_compacted[slot_b_safe]
+        # When the tail pair has only one active env, env_b's half-warp reads env_a's data so the
+        # warp stays coherent through the in-tile shuffles; my_active masks the env_b stores.
+        i_b = env_a
+        if env_in_warp == 1:
+            i_b = env_b
+        i_b_safe = i_b
+        my_active = env_in_warp == 0 or slot_b < n_active
+
+        # +1 padding on the last axis avoids shared memory bank conflicts on column-wise access.
+        # Leading dim 2 reserves one full L per env in the pair; lanes 0-15 -> [0,...], lanes 16-31 -> [1,...].
+        L_sh = qd.simt.block.SharedArray((2, MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
+
+        # --- Blocked Cholesky factorization ---
+        for kb in range(N_BLOCKS):
+            k0 = kb * 16
+            k1 = qd.min(k0 + 16, n_dofs)
+
+            # Load diagonal tile H[k,k] (rows beyond n_dofs stay as identity from the .eye() init)
+            L_kk = Tile16x16Pack2.eye(dtype=gs.qd_float)
+            L_kk._load3d(constraint_state.nt_H, i_b_safe, k0, k1, k0, k1)
+
+            # Subtract prior-column contributions from shared memory (per-env via env_in_warp)
+            for jb in range(kb):
+                j0 = jb * 16
+                for t in range(16):
+                    v = L_kk._resolve_vec3d(L_sh, env_in_warp, k0, k1, j0 + t)
+                    L_kk._ger_sub(v, v)
+
+            # Factor diagonal tile in-place (POTRF — unrolled + running-norm + dual-accumulator)
+            L_kk.cholesky_(EPS)
+
+            # Solve off-diagonal tiles and store in shared memory (not global)
+            for ib in range(kb + 1, N_BLOCKS):
+                i0 = ib * 16
+                i1 = qd.min(i0 + 16, n_dofs)
+
+                L_ik = Tile16x16Pack2.zeros(dtype=gs.qd_float)
+                L_ik._load3d(constraint_state.nt_H, i_b_safe, i0, i1, k0, k1)
+
+                # Subtract prior-column contributions from shared memory
+                for jb in range(kb):
+                    j0 = jb * 16
+                    for t in range(16):
+                        v_own = L_ik._resolve_vec3d(L_sh, env_in_warp, i0, i1, j0 + t)
+                        v_diag = L_ik._resolve_vec3d(L_sh, env_in_warp, k0, k1, j0 + t)
+                        L_ik._ger_sub(v_own, v_diag)
+
+                # Triangular solve: L[i,k] = L_ik @ inv(L[k,k]^T)
+                L_kk.solve_triangular_(L_ik)
+
+                # Per-half-warp predicated store: skips inactive half-warps. `_store3d` has no
+                # subgroup shuffles, so masking only skips actual writes; the rest of the warp
+                # remains lockstep for the next iteration's shuffles.
+                if my_active:
+                    L_ik._store3d(L_sh, env_in_warp, i0, i1, k0, k1)
+
+            if my_active:
+                L_kk._store3d(L_sh, env_in_warp, k0, k1, k0, k1)
+
+        # Barrier: ensure all L_sh writes from the factor phase (scattered across the 16 lanes of
+        # each half-warp via Tile16x16Pack2._store3d) are visible to the substitution phase's
+        # L_sh reads on the SAME warp.
+        qd.simt.subgroup.sync()
+
+        # --- Scalar triangular solve with v in REGISTERS, L in shared memory ---
+        # T24 register-resident v optimisation: each lane owns slots {l, l+16, l+32, l+48} of v
+        # (NSLOTS at most 4 at MAX_DOFS=64). The reduce_all_add_tiled is warp-synchronous, so we
+        # remove 2 * n_dofs `subgroup.sync` calls per warp (1 per forward/backward subst row).
+        NSLOTS = qd.static((MAX_DOFS + 15) // 16)
+
+        v_reg_0 = gs.qd_float(0.0)
+        v_reg_1 = gs.qd_float(0.0)
+        v_reg_2 = gs.qd_float(0.0)
+        v_reg_3 = gs.qd_float(0.0)
+        if my_active:
+            if local < n_dofs:
+                v_reg_0 = constraint_state.grad[local, i_b_safe]
+            if qd.static(NSLOTS > 1):
+                if local + 16 < n_dofs:
+                    v_reg_1 = constraint_state.grad[local + 16, i_b_safe]
+            if qd.static(NSLOTS > 2):
+                if local + 32 < n_dofs:
+                    v_reg_2 = constraint_state.grad[local + 32, i_b_safe]
+            if qd.static(NSLOTS > 3):
+                if local + 48 < n_dofs:
+                    v_reg_3 = constraint_state.grad[local + 48, i_b_safe]
+
+        # Forward substitution: solve L @ y = grad.
+        for i_d in range(n_dofs):
+            dot = gs.qd_float(0.0)
+            if local < i_d:
+                dot = dot + L_sh[env_in_warp, i_d, local] * v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 16] * v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 32] * v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 < i_d:
+                    dot = dot + L_sh[env_in_warp, i_d, local + 48] * v_reg_3
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            slot_idx = i_d >> 4
+            owner = i_d & 15
+            inv_diag = gs.qd_float(1.0) / L_sh[env_in_warp, i_d, i_d]
+            if local == owner:
+                if slot_idx == 0:
+                    v_reg_0 = (v_reg_0 - dot) * inv_diag
+                elif qd.static(NSLOTS > 1) and slot_idx == 1:
+                    v_reg_1 = (v_reg_1 - dot) * inv_diag
+                elif qd.static(NSLOTS > 2) and slot_idx == 2:
+                    v_reg_2 = (v_reg_2 - dot) * inv_diag
+                elif qd.static(NSLOTS > 3) and slot_idx == 3:
+                    v_reg_3 = (v_reg_3 - dot) * inv_diag
+
+        # Backward substitution: solve L^T @ x = y. Same v_reg cache.
+        for i_d_ in range(n_dofs):
+            i_d = n_dofs - 1 - i_d_
+            dot = gs.qd_float(0.0)
+            if local > i_d and local < n_dofs:
+                dot = dot + L_sh[env_in_warp, local, i_d] * v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 > i_d and local + 16 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 16, i_d] * v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 > i_d and local + 32 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 32, i_d] * v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 > i_d and local + 48 < n_dofs:
+                    dot = dot + L_sh[env_in_warp, local + 48, i_d] * v_reg_3
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            slot_idx = i_d >> 4
+            owner = i_d & 15
+            inv_diag = gs.qd_float(1.0) / L_sh[env_in_warp, i_d, i_d]
+            if local == owner:
+                if slot_idx == 0:
+                    v_reg_0 = (v_reg_0 - dot) * inv_diag
+                elif qd.static(NSLOTS > 1) and slot_idx == 1:
+                    v_reg_1 = (v_reg_1 - dot) * inv_diag
+                elif qd.static(NSLOTS > 2) and slot_idx == 2:
+                    v_reg_2 = (v_reg_2 - dot) * inv_diag
+                elif qd.static(NSLOTS > 3) and slot_idx == 3:
+                    v_reg_3 = (v_reg_3 - dot) * inv_diag
+
+        # Write Mgrad to global memory from per-lane register cache (per-env).
+        if my_active:
+            if local < n_dofs:
+                constraint_state.Mgrad[local, i_b] = v_reg_0
+            if qd.static(NSLOTS > 1):
+                if local + 16 < n_dofs:
+                    constraint_state.Mgrad[local + 16, i_b] = v_reg_1
+            if qd.static(NSLOTS > 2):
+                if local + 32 < n_dofs:
+                    constraint_state.Mgrad[local + 32, i_b] = v_reg_2
+            if qd.static(NSLOTS > 3):
+                if local + 48 < n_dofs:
+                    constraint_state.Mgrad[local + 48, i_b] = v_reg_3
 
 
 @qd.func

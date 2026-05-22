@@ -1006,6 +1006,23 @@ def _kernel_solve_graph(
     static_rigid_sim_config: qd.template(),
     graph_counter: qd.types.ndarray(qd.i32, ndim=0),
 ):
+    # Compaction hoisted out of the Newton iter loop (T26-1 from cholesky_mjw_vs_gs_2026may21.md).
+    # Runs ONCE per substep (graph invocation) rather than once per Newton iter. For dex_hand
+    # (~1-3 Newton iters per substep) this saves 2-4 graph-node launches per substep at ~30 ns each
+    # in CUDA-graph replay. The compacted active-env list may go stale within a substep as envs
+    # converge mid-Newton, but the pack-2 fused kernel correctly processes converged envs as
+    # no-ops via the per-half-warp `my_active` predicate.
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and static_rigid_sim_config.tiled_n_dofs <= solver._CHOLESKY_FUSED_PACK2_MAX_DOFS
+    ):
+        solver._func_reset_n_active_envs(constraint_state=constraint_state)
+        solver._func_scatter_active_envs_compacted(
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
     while qd.graph_do_while(graph_counter):
         # Fused: mv + jv + snorm + quad_gauss + eq_sum + p0_cost
         _func_decomp_linesearch_p0(
