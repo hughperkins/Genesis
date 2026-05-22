@@ -61,6 +61,11 @@ class ConstraintSolver:
         self.ls_iterations = rigid_solver._options.ls_iterations
         self.ls_tolerance = rigid_solver._options.ls_tolerance
         self.sparse_solve = rigid_solver._options.sparse_solve
+        # E5: when True (set from rigid_solver._should_use_hessian_sparse_build), allocate the
+        # CSR-shaped jac_relevant_dofs/jac_n_relevant_dofs arrays on the GPU dense path so the
+        # sparse-scatter hessian build can read non-zero positions in O(nnz) instead of
+        # scanning all n_dofs per row. Doubles the J memory footprint when on.
+        self._hessian_sparse_build = bool(rigid_solver._should_use_hessian_sparse_build())
 
         # Note that it must be over-estimated because friction parameters and joint limits may be updated dynamically.
         # * 4 constraints per contact
@@ -559,7 +564,7 @@ def func_clear_constraint_at_env(
     constraint_state.qd_n_equalities[i_b] = rigid_global_info.n_equalities[None]
     for i_d, i_c in qd.ndrange(n_dofs, len_constraints):
         constraint_state.jac[i_c, i_d, i_b] = 0.0
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_c in range(len_constraints):
             constraint_state.jac_n_relevant_dofs[i_c, i_b] = 0
 
@@ -645,7 +650,7 @@ def _add_friction_constraint(
     n = d * contact_data_friction - contact_data_normal
 
     n_con = collision_con_start + i_col * 4 + i_friction
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
             i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
             constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -681,13 +686,13 @@ def _add_friction_constraint(
                 jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                if qd.static(static_rigid_sim_config.sparse_solve):
+                if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                     constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_d
                     con_n_relevant_dofs = con_n_relevant_dofs + 1
 
             link = links_info.parent_idx[link_maybe_batch]
 
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
         _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
     imp, aref = gu.imp_aref(contact_data_sol_params, -contact_data_penetration, jac_qvel, -contact_data_penetration)
@@ -789,7 +794,7 @@ def _add_collision_constraints_per_contact(
                 n = d * contact_data_friction - contact_data_normal
 
                 n_con = collision_con_start + i_col * 4 + i_friction
-                if qd.static(static_rigid_sim_config.sparse_solve):
+                if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                         i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                         constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -825,13 +830,13 @@ def _add_collision_constraints_per_contact(
                             jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                             constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                            if qd.static(static_rigid_sim_config.sparse_solve):
+                            if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                                 constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_d
                                 con_n_relevant_dofs = con_n_relevant_dofs + 1
 
                         link = links_info.parent_idx[link_maybe_batch]
 
-                if qd.static(static_rigid_sim_config.sparse_solve):
+                if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                     constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
                     _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
                 imp, aref = gu.imp_aref(
@@ -940,7 +945,7 @@ def func_equality_connect(
         qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
         con_n_relevant_dofs = 0
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
             for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                 i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -976,13 +981,13 @@ def func_equality_connect(
                     jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                     constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                    if qd.static(static_rigid_sim_config.sparse_solve):
+                    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                         constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_d
                         con_n_relevant_dofs = con_n_relevant_dofs + 1
 
                 link = links_info.parent_idx[link_maybe_batch]
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
             constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
             # Sort needed: DOFs from two entities are only descending within each
             # entity. Incremental Cholesky requires globally descending order.
@@ -1038,7 +1043,7 @@ def func_equality_joint(
     n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
     qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
 
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
             i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
             constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -1082,7 +1087,7 @@ def func_equality_joint(
     # Populate jac_relevant_dofs for this joint-equality constraint.
     # Without this, sparse iterations see 0 relevant DOFs and produce
     # zero forces, leading to NaN in the solver.
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         con_n_relevant_dofs = 0
         constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_dof1
         con_n_relevant_dofs += 1
@@ -1285,7 +1290,7 @@ def func_equality_weld(
         qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
         con_n_relevant_dofs = 0
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
             for i_d_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                 i_d = constraint_state.jac_relevant_dofs[n_con, i_d_, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
@@ -1317,12 +1322,12 @@ def func_equality_weld(
                     jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                     constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                    if qd.static(static_rigid_sim_config.sparse_solve):
+                    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                         constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_d
                         con_n_relevant_dofs = con_n_relevant_dofs + 1
                 link = links_info.parent_idx[link_maybe_batch]
 
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
             constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
             _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
 
@@ -1377,7 +1382,7 @@ def func_equality_weld(
                 jac_qvel[i_con - n_con] + constraint_state.jac[i_con, i_d, i_b] * dofs_state.vel[i_d, i_b]
             )
 
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_con in range(n_con, n_con + 3):
             constraint_state.jac_n_relevant_dofs[i_con, i_b] = con_n_relevant_dofs
             _sort_relevant_dofs_descending(constraint_state, i_con, con_n_relevant_dofs, i_b)
@@ -1437,7 +1442,7 @@ def add_joint_limit_constraints(
                         constraint_state.aref[n_con, i_b] = aref
                         constraint_state.efc_D[n_con, i_b] = 1 / diag
 
-                        if qd.static(static_rigid_sim_config.sparse_solve):
+                        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                             for i_d2_ in range(constraint_state.jac_n_relevant_dofs[n_con, i_b]):
                                 i_d2 = constraint_state.jac_relevant_dofs[n_con, i_d2_, i_b]
                                 constraint_state.jac[n_con, i_d2, i_b] = gs.qd_float(0.0)
@@ -1446,7 +1451,7 @@ def add_joint_limit_constraints(
                                 constraint_state.jac[n_con, i_d2, i_b] = gs.qd_float(0.0)
                         constraint_state.jac[n_con, i_d, i_b] = jac
 
-                        if qd.static(static_rigid_sim_config.sparse_solve):
+                        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                             constraint_state.jac_n_relevant_dofs[n_con, i_b] = 1
                             constraint_state.jac_relevant_dofs[n_con, 0, i_b] = i_d
 
@@ -1503,7 +1508,7 @@ def add_frictionloss_constraints(
                             constraint_state.jac[i_con, i_d2, i_b] = gs.qd_float(0.0)
                         constraint_state.jac[i_con, i_d, i_b] = jac
 
-                        if qd.static(static_rigid_sim_config.sparse_solve):
+                        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                             constraint_state.jac_relevant_dofs[i_con, 0, i_b] = i_d
                             constraint_state.jac_n_relevant_dofs[i_con, i_b] = 1
 
@@ -1638,7 +1643,7 @@ def func_hessian_direct_batch(
             constraint_state.nt_H[i_b, i_d1, i_d2] = gs.qd_float(0.0)
 
     # Compute `H += J.T @ D @ J` using either dense or sparse implementation
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_c in range(constraint_state.n_constraints[i_b]):
             jac_n_relevant_dofs = constraint_state.jac_n_relevant_dofs[i_c, i_b]
             for i_d1_ in range(jac_n_relevant_dofs):
@@ -1872,48 +1877,31 @@ def func_hessian_direct_sparse_scatter(
             continue
         constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
-    BLOCK_DIM = qd.static(128)
-    MAX_NNZ_PER_ROW = qd.static(32)
-
-    qd.loop_config(name="nt_H_scatter", block_dim=BLOCK_DIM)
-    for i in range(_B * BLOCK_DIM):
-        tid = i % BLOCK_DIM
-        i_b = i // BLOCK_DIM
+    n_c_max = constraint_state.jac.shape[0]
+    qd.loop_config(name="nt_H_scatter")
+    for i_b, i_c in qd.ndrange(_B, n_c_max):
         n_c = constraint_state.n_constraints[i_b]
         if n_c == 0 or not constraint_state.improved[i_b]:
             continue
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
                 continue
+        if i_c >= n_c:
+            continue
+        if not constraint_state.active[i_c, i_b]:
+            continue
 
-        nz_idx = qd.simt.block.SharedArray((BLOCK_DIM, MAX_NNZ_PER_ROW), gs.qd_int)
-        nz_val = qd.simt.block.SharedArray((BLOCK_DIM, MAX_NNZ_PER_ROW), gs.qd_float)
-
-        i_c_base = 0
-        while i_c_base < n_c:
-            i_c = i_c_base + tid
-            if i_c < n_c and constraint_state.active[i_c, i_b]:
-                nnz = 0
-                for i_d in range(n_dofs):
-                    v = constraint_state.jac[i_c, i_d, i_b]
-                    if qd.abs(v) > EPS:
-                        # NB: relies on MAX_NNZ_PER_ROW being large enough; production scenes
-                        # are checked at warmup in tests (see test_e5_hessian_sparse_build).
-                        nz_idx[tid, nnz] = i_d
-                        nz_val[tid, nnz] = v
-                        nnz = nnz + 1
-
-                Dc = constraint_state.efc_D[i_c, i_b]
-                for ii in range(nnz):
-                    d_i = nz_idx[tid, ii]
-                    v_i = nz_val[tid, ii]
-                    for jj in range(ii + 1):
-                        d_j = nz_idx[tid, jj]
-                        v_j = nz_val[tid, jj]
-                        row = qd.max(d_i, d_j)
-                        col = qd.min(d_i, d_j)
-                        qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
-            i_c_base = i_c_base + BLOCK_DIM
+        nnz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+        Dc = constraint_state.efc_D[i_c, i_b]
+        for ii in range(nnz):
+            d_i = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
+            v_i = constraint_state.jac[i_c, d_i, i_b]
+            for jj in range(ii + 1):
+                d_j = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
+                v_j = constraint_state.jac[i_c, d_j, i_b]
+                row = qd.max(d_i, d_j)
+                col = qd.min(d_i, d_j)
+                qd.atomic_add(constraint_state.nt_H[i_b, row, col], v_i * v_j * Dc)
 
 
 @qd.func
@@ -2331,7 +2319,7 @@ def func_hessian_and_cholesky_factor_incremental_batch(
     static_rigid_sim_config: qd.template(),
 ) -> bool:
     is_degenerated = False
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         is_degenerated = func_hessian_and_cholesky_factor_incremental_sparse_batch(
             i_b, constraint_state, rigid_global_info
         )
@@ -2522,7 +2510,7 @@ def func_ls_init_and_eval_p0(
 
     for i_c in range(n_con):
         jv = gs.qd_float(0.0)
-        if qd.static(static_rigid_sim_config.sparse_solve):
+        if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
             for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
                 i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
                 jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
@@ -3258,7 +3246,7 @@ def func_update_constraint_batch(
             -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
         )
 
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_d in range(n_dofs):
             constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
         for i_c in range(constraint_state.n_constraints[i_b]):
@@ -3702,7 +3690,7 @@ def _initialize_Jaref_body(
     static_rigid_sim_config: qd.template(),
 ):
     Jaref = -constraint_state.aref[i_c, i_b]
-    if qd.static(static_rigid_sim_config.sparse_solve):
+    if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
         for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
             i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
             Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
@@ -3983,7 +3971,7 @@ def func_solve_iter(
 
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
             func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
-            if qd.static(static_rigid_sim_config.sparse_solve):
+            if qd.static(static_rigid_sim_config.sparse_solve or static_rigid_sim_config.hessian_sparse_build):
                 # Bypass incremental Cholesky when sparse_solve=True. The incremental rank-1 update
                 # assumes globally descending DOF order in jac_relevant_dofs, which doesn't hold
                 # for cross-entity constraints. Always use direct Hessian rebuild which has the max/min fix.

@@ -345,8 +345,12 @@ def get_constraint_state(constraint_solver, solver):
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
-    jac_relevant_dofs_shape = maybe_shape(jac_shape, constraint_solver.sparse_solve)
-    jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), constraint_solver.sparse_solve)
+    # jac_relevant_dofs / jac_n_relevant_dofs are needed by either the CPU sparse_solve path
+    # or the GPU sparse hessian-build path (hessian_sparse_build). When neither is on, we don't
+    # allocate them (they'd be 4 GB extra on dex_hand 4096 envs).
+    _needs_sparse_jac = bool(getattr(constraint_solver, "_hessian_sparse_build", False)) or constraint_solver.sparse_solve
+    jac_relevant_dofs_shape = maybe_shape(jac_shape, _needs_sparse_jac)
+    jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), _needs_sparse_jac)
 
     if math.prod(jac_shape) > np.iinfo(np.int32).max:
         gs.raise_exception(
