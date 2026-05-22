@@ -1674,11 +1674,18 @@ def func_cholesky_factor_direct_tiled(
         # Padding +1 to avoid memory bank conflicts that would cause access serialization
         H = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
 
-        # Copy the lower triangular part of the entire Hessian matrix to shared memory for efficiency
+        # Copy the lower triangular part of the entire Hessian matrix to shared memory for efficiency.
+        # In the incremental Cholesky path, the source array is nt_H_unfactored (which holds the
+        # delta-updated H); this fuses the K3 copy-back into the factor's load step and saves one
+        # full global-memory pass. Outside that path, source is nt_H (in-place factor, current
+        # behavior).
         i_pair = tid
         while i_pair < n_lower_tri:
             i_d1, i_d2 = linear_to_lower_tri(i_pair)
-            H[i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2]
+            if qd.static(skip_unchanged):
+                H[i_d1, i_d2] = constraint_state.nt_H_unfactored[i_b, i_d1, i_d2]
+            else:
+                H[i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2]
             i_pair = i_pair + BLOCK_DIM
         qd.simt.block.sync()
 
