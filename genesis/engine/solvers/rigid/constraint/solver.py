@@ -2207,8 +2207,9 @@ def func_hessian_and_cholesky_factor_direct(
     """
     _B = constraint_state.jac.shape[2]
 
-    if qd.static(static_rigid_sim_config.backend == gs.cpu or static_rigid_sim_config.sparse_solve):
-        # CPU
+    if qd.static(static_rigid_sim_config.backend == gs.cpu):
+        # CPU: use the per-batch loop (covers both dense and sparse). On GPU the new tiled paths handle
+        # both dense and sparse, so we route everything there regardless of sparse_solve.
         qd.loop_config(
             name="hess_cholesky_factor_direct",
             serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL,
