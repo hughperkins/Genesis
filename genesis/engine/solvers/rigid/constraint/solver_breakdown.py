@@ -835,16 +835,12 @@ def _func_newton_only_nt_hessian(
     static_rigid_sim_config: qd.template(),
 ):
     """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others)."""
-    if qd.static(static_rigid_sim_config.hessian_sparse_build):
-        solver.func_hessian_direct_sparse_scatter(
-            constraint_state=constraint_state,
-            rigid_global_info=rigid_global_info,
-            check_full_hessian=True,
-        )
-    else:
-        solver.func_hessian_direct_tiled(
-            constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
-        )
+    # NB: per-iter rebuild keeps the dense path even when hessian_sparse_build=True. The sparse
+    # path's two-kernel (M-init + scatter) launch cost dominates here because most blocks
+    # early-exit on use_full_hessian[i_b] == 0; dense launches one kernel that early-exits cheaper.
+    solver.func_hessian_direct_tiled(
+        constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
+    )
 
 
 @qd.func
@@ -858,12 +854,7 @@ def _func_newton_only_nt_hessian_and_cholesky(
     Matches origin/main behavior: H is rebuilt from scratch every iteration, then Cholesky overwrites nt_H with L
     in-place.  H patching is not used because the subsequent Cholesky would destroy H anyway.
     """
-    if qd.static(static_rigid_sim_config.hessian_sparse_build):
-        solver.func_hessian_direct_sparse_scatter(
-            constraint_state=constraint_state, rigid_global_info=rigid_global_info
-        )
-    else:
-        solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+    solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,
