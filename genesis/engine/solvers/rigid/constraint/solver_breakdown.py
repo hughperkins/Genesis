@@ -779,53 +779,115 @@ def _func_build_changed_and_decide_hessian_mode(
 def _func_patch_hessian_delta(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
     """Incrementally update H with delta contributions from changed constraints.
 
-    Adds or subtracts each changed constraint's J^T D J contribution depending on whether it became active or inactive.
-    Only runs on envs where use_full_hessian == 0 (others get a full rebuild instead).
+    Two implementations selected statically:
+
+    * **CSR sparse path** (Newton + GPU + tiled-cholesky-hessian + not-sparse_solve): per-env block of 32 threads,
+      each thread strides through ``n_changed`` constraints. For each changed constraint, walks the per-substep CSR
+      sidecar ``jac_csr_dofs[i_c, :n_nz, i_b]`` (only the non-zero DOFs, typically ~6 of 64 on dex_hand) and
+      ``atomic_add``-s ``sign * Ji * Jj`` into ``nt_H[i_b, row, col]`` for each pair in the lower triangle. The
+      CSR is built once per substep by ``kernel_build_jac_csr`` (already paid by ``func_hessian_sparse_jtdaj``).
+      Mirrors mjwarp's ``update_gradient_h_incremental_sparse``; this is the round-3 attempt from
+      ``sparse_patch_delta_2026may22.md`` plus the CSR infrastructure from ``sparse_jtdaj_2026may22.md``.
+
+    * **Dense fallback** (CPU, sparse_solve, non-tiled, or non-Newton): the original per-env block of 128 threads
+      that walks all ``n_lower_tri`` entries and sums over ``n_changed`` constraints with dense J indexing. Used
+      whenever the CSR sidecar isn't allocated.
+
+    Only runs on envs where ``use_full_hessian == 0`` (others get a full rebuild instead) and ``improved[i_b]``.
     """
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
-    n_lower_tri = n_dofs * (n_dofs + 1) // 2
 
-    BLOCK_DIM = qd.static(128)
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and not static_rigid_sim_config.sparse_solve
+        and static_rigid_sim_config.backend != gs.cpu
+    ):
+        # CSR sparse path. Per-env block of 32 threads, strided over n_changed constraints.
+        BLOCK_DIM = qd.static(32)
 
-    qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
-    for i in range(_B * BLOCK_DIM):
-        tid = i % BLOCK_DIM
-        i_b = i // BLOCK_DIM
-        if i_b >= _B:
-            continue
-        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
-            continue
-        if constraint_state.use_full_hessian[i_b] != 0:
-            continue
+        qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
+        for i in range(_B * BLOCK_DIM):
+            tid = i % BLOCK_DIM
+            i_b = i // BLOCK_DIM
+            if i_b >= _B:
+                continue
+            if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+                continue
+            if constraint_state.use_full_hessian[i_b] != 0:
+                continue
 
-        n_changed = constraint_state.incr_n_changed[i_b]
-        if n_changed == 0:
-            continue
+            n_changed = constraint_state.incr_n_changed[i_b]
+            if n_changed == 0:
+                continue
 
-        elem = tid
-        while elem < n_lower_tri:
-            i_d1, i_d2 = solver.linear_to_lower_tri(elem)
+            change_idx = tid
+            while change_idx < n_changed:
+                i_c = constraint_state.incr_changed_idx[change_idx, i_b]
+                D = constraint_state.efc_D[i_c, i_b]
+                # Sign: +D for constraints that became active (added to H), -D for those that became inactive.
+                sign = D
+                if not constraint_state.active[i_c, i_b]:
+                    sign = -D
 
-            delta = gs.qd_float(0.0)
-            for idx in range(n_changed):
-                i_c = constraint_state.incr_changed_idx[idx, i_b]
-                Ji = constraint_state.jac[i_c, i_d1, i_b]
-                if Ji != 0.0:
-                    Jj = constraint_state.jac[i_c, i_d2, i_b]
-                    if Jj != 0.0:
-                        D = constraint_state.efc_D[i_c, i_b]
-                        if constraint_state.active[i_c, i_b]:
-                            delta = delta + D * Ji * Jj
-                        else:
-                            delta = delta - D * Ji * Jj
+                # CSR walk: descending DOF indices in jac_csr_dofs[i_c, :n_nz, i_b]. For pair (ii, jj) with jj < ii,
+                # DOF[ii] < DOF[jj] → row = DOF[jj], col = DOF[ii] lands in lower triangle. Diagonal pair (ii, ii)
+                # → row = col = DOF[ii].
+                n_nz = constraint_state.jac_csr_n_nz[i_c, i_b]
+                for ii in range(n_nz):
+                    i_di = constraint_state.jac_csr_dofs[i_c, ii, i_b]
+                    Ji = constraint_state.jac[i_c, i_di, i_b]
+                    qd.atomic_add(constraint_state.nt_H[i_b, i_di, i_di], sign * Ji * Ji)
+                    for jj in range(ii):
+                        i_dj = constraint_state.jac_csr_dofs[i_c, jj, i_b]
+                        Jj = constraint_state.jac[i_c, i_dj, i_b]
+                        qd.atomic_add(constraint_state.nt_H[i_b, i_dj, i_di], sign * Ji * Jj)
+                change_idx = change_idx + BLOCK_DIM
+    else:
+        # Dense fallback: original per-env block of 128 over n_lower_tri.
+        n_lower_tri = n_dofs * (n_dofs + 1) // 2
+        BLOCK_DIM = qd.static(128)
 
-            if delta != 0.0:
-                constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
-            elem = elem + BLOCK_DIM
+        qd.loop_config(name="patch_hessian_delta", block_dim=BLOCK_DIM)
+        for i in range(_B * BLOCK_DIM):
+            tid = i % BLOCK_DIM
+            i_b = i // BLOCK_DIM
+            if i_b >= _B:
+                continue
+            if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+                continue
+            if constraint_state.use_full_hessian[i_b] != 0:
+                continue
+
+            n_changed = constraint_state.incr_n_changed[i_b]
+            if n_changed == 0:
+                continue
+
+            elem = tid
+            while elem < n_lower_tri:
+                i_d1, i_d2 = solver.linear_to_lower_tri(elem)
+
+                delta = gs.qd_float(0.0)
+                for idx in range(n_changed):
+                    i_c = constraint_state.incr_changed_idx[idx, i_b]
+                    Ji = constraint_state.jac[i_c, i_d1, i_b]
+                    if Ji != 0.0:
+                        Jj = constraint_state.jac[i_c, i_d2, i_b]
+                        if Jj != 0.0:
+                            D = constraint_state.efc_D[i_c, i_b]
+                            if constraint_state.active[i_c, i_b]:
+                                delta = delta + D * Ji * Jj
+                            else:
+                                delta = delta - D * Ji * Jj
+
+                if delta != 0.0:
+                    constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + delta
+                elem = elem + BLOCK_DIM
 
 
 @qd.func
@@ -1051,7 +1113,7 @@ def _kernel_solve_graph(
             # Fused path: H patching + fused Cholesky+Solve (L in shmem, H preserved in nt_H)
             _func_build_changed_and_decide_hessian_mode(constraint_state, static_rigid_sim_config)
             _func_newton_only_nt_hessian(constraint_state, rigid_global_info, static_rigid_sim_config)
-            _func_patch_hessian_delta(constraint_state, rigid_global_info)
+            _func_patch_hessian_delta(constraint_state, rigid_global_info, static_rigid_sim_config)
             _func_update_gradient_no_solve(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
