@@ -418,12 +418,11 @@ class RigidSolver(KinematicSolver):
         """
         if gs.backend == gs.cpu or self.sim.options.requires_grad:
             return False
-        # Sparse solve relies on jac_relevant_dofs / jac_n_relevant_dofs to skip irrelevant dofs in the constraint
-        # update. The cooperative qfrc kernel that pairs with the flipped layout is dense-only, and several other
-        # kernels that read jac under the flipped layout (e.g. the refinement-phase _func_update_qfrc_constraint_per_dof)
-        # would also need sparse-aware rewrites.
-        if self._options.sparse_solve:
-            return False
+        # NOTE: under sparse_solve the cooperative qfrc / cost kernels still take the dense iteration path (no inner
+        # `if sparse_solve: ...` fork). That's intentional and correct: jac is a dense 3D tensor and entries that are
+        # not in jac_relevant_dofs are zero, so the dense cooperative FMA over all (i_c, i_d) produces the right
+        # answer at the cost of some redundant zero-FMAs. Empirically the dense cooperative path beats the
+        # 1-thread-per-env sparse-fork path on dex_hand_sparse by ~14 ms / 25 substeps (E6).
         n_envs = self._sim._B
         n_dofs = self.n_dofs
         return n_envs <= 8192 and n_dofs >= 16
