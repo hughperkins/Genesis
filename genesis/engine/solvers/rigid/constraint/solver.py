@@ -3817,21 +3817,56 @@ def func_solve_init(
         constraint_state.use_full_hessian[i_b] = 1
     constraint_state.solver_iter_counter[()] = 0
 
-    if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-        func_hessian_and_cholesky_factor_direct(
+    # When the same conditions enable the fused Cholesky+Solve path in `_kernel_solve_graph`
+    # (solver_breakdown.py:1021), use it here too so that nt_H stays the Hessian (not L) after
+    # init returns. That lets graph iter 1 patch H instead of forced full rebuild
+    # (see _func_build_changed_and_decide_hessian_mode). The non-fused factor in init had to
+    # be paired with a non-fused solve in func_update_gradient (which reads L from nt_H), so
+    # we inline a grad-only kernel here and call the fused solve directly.
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+    ):
+        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+            qd.loop_config(
+                name="init_update_gradient_no_solve",
+                serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL,
+            )
+            for i_b, i_d in qd.ndrange(_B, n_dofs):
+                constraint_state.grad[i_d, i_b] = (
+                    constraint_state.Ma[i_d, i_b]
+                    - dofs_state.force[i_d, i_b]
+                    - constraint_state.qfrc_constraint[i_d, i_b]
+                )
+        else:
+            qd.loop_config(
+                name="init_update_gradient_no_solve",
+                serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL,
+            )
+            for i_d, i_b in qd.ndrange(n_dofs, _B):
+                constraint_state.grad[i_d, i_b] = (
+                    constraint_state.Ma[i_d, i_b]
+                    - dofs_state.force[i_d, i_b]
+                    - constraint_state.qfrc_constraint[i_d, i_b]
+                )
+        func_cholesky_and_solve_fused_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
+    else:
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+            func_hessian_and_cholesky_factor_direct(
+                entities_info=entities_info,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+
+        func_update_gradient(
+            dofs_state=dofs_state,
             entities_info=entities_info,
             constraint_state=constraint_state,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-    func_update_gradient(
-        dofs_state=dofs_state,
-        entities_info=entities_info,
-        constraint_state=constraint_state,
-        rigid_global_info=rigid_global_info,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
 
     if qd.static(static_rigid_sim_config.constraint_layout_transposed):
         qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)

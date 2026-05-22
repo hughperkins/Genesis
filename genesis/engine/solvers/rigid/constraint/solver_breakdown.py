@@ -762,9 +762,12 @@ def _func_build_changed_and_decide_hessian_mode(
     for i_b in range(_B):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             solver.func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
-            # First graph iteration must do full rebuild: nt_H contains L from func_solve_init's Cholesky, not H.
-            # Patching L would be wrong.
-            if iter_count <= 1:
+            # Previously iter 1 was forced to full rebuild because func_solve_init's non-fused
+            # Cholesky overwrote nt_H with L. After switching init to the fused Cholesky+Solve
+            # path (solver.py func_solve_init), nt_H stays the Hessian, so iter 1 can patch
+            # like iter 2+. Counter starts at 0 in init, then increments at the top of every
+            # graph iter, so iter_count <= 0 is unreachable here -- the gate becomes a no-op.
+            if iter_count <= 0:
                 constraint_state.use_full_hessian[i_b] = 1
             else:
                 n_changed = constraint_state.incr_n_changed[i_b]
