@@ -680,6 +680,7 @@ def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
         ),
         rigid_options=gs.options.RigidOptions(
             max_collision_pairs=200,
+            sparse_solve=True,
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
