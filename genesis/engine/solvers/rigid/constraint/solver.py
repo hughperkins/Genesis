@@ -1862,21 +1862,40 @@ def func_cholesky_factor_direct_tiled(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute the Cholesky factorization L of the Hessian matrix H = L @ L.T for a given environment `i_b`.
+    """Init-time blocked Cholesky factorization H = L L^T (dispatcher).
 
-    This implementation is specialized for GPU backend and highly optimized for it using a left-looking blocked algorithm
-    with Tile16x16 primitives (potrf, trsm, syr_sub, ger_sub), all operating entirely in registers via subgroup shuffles.
-    No shared memory or block synchronization needed. This function has no inherent DOF limit, but the fused variant
-    (func_cholesky_and_solve_fused_tiled) requires shared memory for L, so the caller gates both behind the same
-    shared-memory-based DOF threshold: n_dofs <= 64 (f64) or 96 (f32) with 48kB default shared memory, higher with
-    opt-in shared memory (e.g. 160/224 on RTX PRO 6000).
+    Dispatches at compile time between the pack-2 implementation (2 envs per 32-lane warp,
+    used when ``tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS``) and the original
+    single-env implementation (1 env per 16-lane warp, fallback for larger MAX_DOFS).
 
-    Beware the Hessian matrix is re-purposed to store its Cholesky factorization to spare memory resources.
+    The pack-2 path uses ``Tile16x16Pack2`` primitives (potrf, trsm, syr_sub, ger_sub) which
+    transparently double the warp utilization vs the single-env ``Tile16x16Cholesky`` path
+    (~2× more FFMA/cycle for SYRK and TRSM at no extra register pressure). Both POTRF unroll
+    (PR #2820) and SYRK pack-2 are now combined — see commit ``f7a4904b``
+    (``hp/syrk-pack2-potrf-unroll``) for the underlying primitive port.
 
-    Note that only the lower triangular part will be updated for efficiency, because the Hessian matrix is symmetric.
-    When n_dofs is not a multiple of 16, partial tiles are padded with identity (diagonal=1, off-diagonal=0) so the
-    factorization is correct for the original n_dofs x n_dofs submatrix. Tile slice ops handle the per-thread bounds
-    internally, so no `if tid < ...` guards are needed at the call site.
+    Beware the Hessian matrix is re-purposed in-place to store its Cholesky factorization.
+    Only the lower triangle is written (the upper triangle is never read by downstream
+    code).
+    """
+    if qd.static(static_rigid_sim_config.tiled_n_dofs <= _CHOLESKY_FUSED_PACK2_MAX_DOFS):
+        _func_cholesky_factor_direct_tiled_pack2(constraint_state, rigid_global_info, static_rigid_sim_config)
+    else:
+        _func_cholesky_factor_direct_tiled_single(constraint_state, rigid_global_info, static_rigid_sim_config)
+
+
+@qd.func
+def _func_cholesky_factor_direct_tiled_single(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Original single-env init-factor (one env per 16-lane warp).
+
+    Used as the fallback path when ``tiled_n_dofs > _CHOLESKY_FUSED_PACK2_MAX_DOFS``.
+    Reads/writes ``nt_H`` in-place. See ``func_cholesky_factor_direct_tiled`` for the
+    high-level docstring; algorithm is left-looking blocked Cholesky with register-resident
+    tiles.
     """
     EPS = rigid_global_info.EPS[None]
 
@@ -1941,6 +1960,109 @@ def func_cholesky_factor_direct_tiled(
 
             # Write L[k,k] back to global memory
             L_kk._store3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
+
+
+@qd.func
+def _func_cholesky_factor_direct_tiled_pack2(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Pack-2 init-factor: 2 envs per 32-lane warp, register-resident tiles, writes to nt_H.
+
+    Mirrors ``_func_cholesky_factor_direct_tiled_single`` (same left-looking blocked Cholesky
+    algorithm) but uses ``Tile16x16Pack2`` primitives so each warp factors two envs in
+    parallel. Tiles stay in registers; intermediate L tiles are read back from
+    ``constraint_state.nt_H[i_b_safe, ...]`` for prior-column subtracts — same pattern as the
+    single-env path but with per-half-warp ``i_b_safe``.
+
+    No shared memory needed (tiles live in registers via subgroup shuffles). Compared to the
+    fused pack-2 kernel, this kernel does not allocate ``L_sh`` and so has lower shmem-budget
+    pressure; the trade-off is that prior-column reads hit global memory instead of shared
+    memory, which is the same trade-off as the single-env init-factor vs fused single-env.
+
+    Tail handling: for odd ``_B``, the env_b half-warp of the tail pair mirrors env_a's
+    coordinates (via ``i_b_safe = min(env_b, _B-1)``) so the warp stays in lockstep; tile
+    stores are masked via ``my_active`` so env_a's L doesn't get corrupted by a duplicate
+    write from env_b lanes (which would otherwise re-write env_a's data — no correctness
+    bug, but wasted bandwidth).
+    """
+    EPS = rigid_global_info.EPS[None]
+
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    N_BLOCKS = (n_dofs + 16 - 1) // 16
+    _B_pairs_alloc = (_B + 1) // 2
+
+    qd.loop_config(name="cholesky_factor_direct_tiled_pack2", block_dim=32)
+    for i in range(_B_pairs_alloc * 32):
+        tid = i % 32
+        env_in_warp = tid >> 4
+        pair_idx = i // 32
+
+        slot_a = pair_idx * 2
+        slot_b = pair_idx * 2 + 1
+        slot_b_safe = qd.min(slot_b, _B - 1)
+        env_a = slot_a
+        env_b = slot_b_safe
+        i_b = env_a
+        if env_in_warp == 1:
+            i_b = env_b
+        i_b_safe = i_b
+        my_active = env_in_warp == 0 or slot_b < _B
+
+        # Skip whole-warp work if BOTH envs in the pair are inactive (no constraints or not
+        # improved). When only one half is inactive, we still run the warp (kept in lockstep
+        # for subgroup shuffles) but mask its stores via ``half_active``.
+        active_a = constraint_state.n_constraints[env_a] != 0 and constraint_state.improved[env_a]
+        active_b = my_active and constraint_state.n_constraints[env_b] != 0 and constraint_state.improved[env_b]
+        if not active_a and not active_b:
+            continue
+        # Per-half-warp store mask: env_in_warp's env is the one being modified by its
+        # half-warp's lanes. Reads are safe to do from i_b_safe regardless.
+        half_active = active_a if env_in_warp == 0 else active_b
+
+        # Same left-looking blocked Cholesky as the single-env version. Each Tile16x16Pack2
+        # operation processes two envs (env_a on lanes 0–15, env_b on lanes 16–31) in
+        # parallel via the half-warp split inside the tile primitives.
+        for kb in range(N_BLOCKS):
+            k0 = kb * 16
+            k1 = qd.min(k0 + 16, n_dofs)
+
+            L_kk = Tile16x16Pack2.eye(dtype=gs.qd_float)
+            L_kk._load3d(constraint_state.nt_H, i_b_safe, k0, k1, k0, k1)
+
+            # Prior-column subtracts read L[k,j] from nt_H[i_b_safe, ...] (each half-warp
+            # reads its own env's L). Identical structure to the single-env path.
+            for jb in range(kb):
+                j0 = jb * 16
+                for t in range(16):
+                    v = L_kk._resolve_vec3d(constraint_state.nt_H, i_b_safe, k0, k1, j0 + t)
+                    L_kk._ger_sub(v, v)
+
+            L_kk.cholesky_(EPS)
+
+            for ib in range(kb + 1, N_BLOCKS):
+                i0 = ib * 16
+                i1 = qd.min(i0 + 16, n_dofs)
+
+                L_ik = Tile16x16Pack2.zeros(dtype=gs.qd_float)
+                L_ik._load3d(constraint_state.nt_H, i_b_safe, i0, i1, k0, k1)
+
+                for jb in range(kb):
+                    j0 = jb * 16
+                    for t in range(16):
+                        v_own = L_ik._resolve_vec3d(constraint_state.nt_H, i_b_safe, i0, i1, j0 + t)
+                        v_diag = L_ik._resolve_vec3d(constraint_state.nt_H, i_b_safe, k0, k1, j0 + t)
+                        L_ik._ger_sub(v_own, v_diag)
+
+                L_kk.solve_triangular_(L_ik)
+
+                if half_active:
+                    L_ik._store3d(constraint_state.nt_H, i_b_safe, i0, i1, k0, k1)
+
+            if half_active:
+                L_kk._store3d(constraint_state.nt_H, i_b_safe, k0, k1, k0, k1)
 
 
 # Shared-memory budget threshold below which the pack-2 fused kernel (2 envs/warp) is used.
