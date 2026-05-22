@@ -284,6 +284,10 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     # In practice, this variable is re-purposed to store the Cholesky factor L st H = L @ L.T to spare memory resources.
     # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: V_ANNOTATION
+    # Unfactored lower-triangle of H, kept across Newton iterations when
+    # ``gpu_incr_cholesky=True`` so we can delta-update it between iters and refactor only when
+    # constraints changed. Same shape as nt_H. Zero-size when the flag is False.
+    nt_H_unfactored: V_ANNOTATION
     nt_vec: V_ANNOTATION
     # Compacted list of constraints whose active state changed, used by incremental Cholesky update
     # to reduce GPU thread divergence by iterating only over constraints that need processing.
@@ -320,6 +324,9 @@ def get_constraint_state(constraint_solver, solver):
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
     jac_relevant_dofs_shape = maybe_shape(jac_shape, constraint_solver.sparse_solve)
     jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), constraint_solver.sparse_solve)
+
+    _gpu_incr_cholesky = bool(getattr(constraint_solver, "_gpu_incr_cholesky", False))
+    nt_H_unfactored_shape = maybe_shape((_B, solver.n_dofs_, solver.n_dofs_), _gpu_incr_cholesky)
 
     if math.prod(jac_shape) > np.iinfo(np.int32).max:
         gs.raise_exception(
@@ -367,6 +374,7 @@ def get_constraint_state(constraint_solver, solver):
         cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
         nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
+        nt_H_unfactored=V(dtype=gs.qd_float, shape=nt_H_unfactored_shape),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
         efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
@@ -2037,6 +2045,12 @@ class StructRigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # When True, the GPU decomposed solver's per-iter Newton hessian + Cholesky pair is rewired to use an
+    # incremental delta-update of H from active-set changes (mjwarp-style update_gradient_h_incremental
+    # pattern), and skips the Cholesky refactor entirely on iters where no constraint changed. When False
+    # (default), the dense rebuild + refactor every iter is kept. Only consulted on GPU backend.
+    # See ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
+    gpu_incr_cholesky: bool = False
     tiled_n_dofs_per_entity: int = -1
     tiled_n_dofs: int = -1
     max_n_links_per_entity: int = -1

@@ -717,6 +717,8 @@ def _func_newton_only_nt_hessian(
 ):
     """Step 4: Newton Hessian update (Newton only)"""
     solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+    if qd.static(static_rigid_sim_config.gpu_incr_cholesky):
+        solver.func_hessian_copy_to_unfactored(constraint_state=constraint_state)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,

@@ -38,6 +38,10 @@ class ConstraintSolver:
         self.ls_iterations = rigid_solver._options.ls_iterations
         self.ls_tolerance = rigid_solver._options.ls_tolerance
         self.sparse_solve = rigid_solver._options.sparse_solve
+        # GPU incremental Cholesky flag. Read here so get_constraint_state's nt_H_unfactored shape
+        # gating can find it via getattr without depending on a fully built static_rigid_sim_config
+        # (which is finalized AFTER the constraint state is allocated).
+        self._gpu_incr_cholesky = bool(rigid_solver._should_use_gpu_incr_cholesky())
 
         # Note that it must be over-estimated because friction parameters and joint limits may be updated dynamically.
         # * 4 constraints per contact
@@ -1703,6 +1707,28 @@ def func_cholesky_factor_direct_tiled(
 
 
 @qd.func
+def func_hessian_copy_to_unfactored(
+    constraint_state: array_class.ConstraintState,
+):
+    """K1: snapshot lower-triangle of nt_H into nt_H_unfactored so we can keep the unfactored Hessian
+    across Newton iters and refactor only when the active set changes.
+
+    Called right after the dense Hessian build but BEFORE the in-place Cholesky factor overwrites
+    nt_H with L. Only consulted on the GPU path with ``gpu_incr_cholesky=True``. See
+    ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
+    """
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    qd.loop_config(name="hessian_copy_to_unfactored")
+    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
+        if i_d2 > i_d1:
+            continue
+        if not constraint_state.improved[i_b]:
+            continue
+        constraint_state.nt_H_unfactored[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2]
+
+
+@qd.func
 def func_hessian_and_cholesky_factor_direct_batch(
     i_b,
     entities_info: array_class.EntitiesInfo,
@@ -1751,6 +1777,9 @@ def func_hessian_and_cholesky_factor_direct(
     else:
         # GPU
         func_hessian_direct_tiled(constraint_state, rigid_global_info)
+
+        if qd.static(static_rigid_sim_config.gpu_incr_cholesky):
+            func_hessian_copy_to_unfactored(constraint_state)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)

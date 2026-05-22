@@ -1,4 +1,5 @@
 import math
+import os
 from typing import TYPE_CHECKING, Literal
 
 import quadrants as qd
@@ -354,6 +355,15 @@ class RigidSolver(KinematicSolver):
         self._func_vel_at_point = func_vel_at_point
         self._func_apply_coupling_force = func_apply_coupling_force
 
+    def _should_use_gpu_incr_cholesky(self) -> bool:
+        """Opt-in toggle for the mjwarp-style incremental Cholesky on the GPU decomposed path.
+
+        Off by default; set environment variable ``GS_GPU_INCR_CHOLESKY=1`` to enable. Only meaningful
+        on the GPU backend and only when the decomposed solver is used; the CPU path and the
+        ``sparse_solve=True`` path ignore this flag. See ``perso_hugh/doc/gpu_sparse_incr_cholesky.md``.
+        """
+        return os.environ.get("GS_GPU_INCR_CHOLESKY", "0") == "1"
+
     def _resolve_broadphase_traversal(self):
         if self._options.broadphase_traversal is not None:
             return self._options.broadphase_traversal
@@ -419,6 +429,7 @@ class RigidSolver(KinematicSolver):
                     enable_tiled_cholesky_hessian=enable_tiled_cholesky_hessian,
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
+                    gpu_incr_cholesky=self._should_use_gpu_incr_cholesky(),
                 )
 
             # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
