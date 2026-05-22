@@ -131,6 +131,18 @@ class ConstraintSolver:
             self.nt_H = cs.nt_H
             self.nt_vec = cs.nt_vec
 
+        # Gate for the sparse JTDAJ Hessian build path: matches the `_csr_active` predicate in
+        # `array_class.get_constraint_state` so the sidecar fields are guaranteed to be allocated when this is True.
+        self._enable_csr_sidecar = bool(
+            self._solver_type == gs.constraint_solver.Newton
+            and not self.sparse_solve
+            and gs.backend != gs.cpu
+            and getattr(rigid_solver._static_rigid_sim_config, "enable_tiled_cholesky_hessian", False)
+        )
+        if self._enable_csr_sidecar:
+            self.jac_csr_dofs = cs.jac_csr_dofs
+            self.jac_csr_n_nz = cs.jac_csr_n_nz
+
         self.reset()
 
         # Creating a dummy ContactIsland, needed as param for some functions,
@@ -232,6 +244,12 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
+        # Rebuild the per-substep CSR sidecar after J is finalised, so the sparse JTDAJ Hessian build can read
+        # `jac_csr_dofs`/`jac_csr_n_nz` without re-scanning the dense Jacobian inside the hot kernel.  Only the
+        # Newton + GPU + tiled-cholesky-hessian + not-sparse_solve path uses the sidecar; other configurations skip
+        # this work entirely.
+        if self._enable_csr_sidecar:
+            kernel_build_jac_csr(self.constraint_state)
 
     def resolve(self, entities_info=None, rigid_global_info=None):
         func_solve_init(
@@ -1678,6 +1696,133 @@ def func_hessian_direct_batch(
                 )
 
 
+@qd.kernel(fastcache=True)
+def kernel_build_jac_csr(
+    constraint_state: array_class.ConstraintState,
+):
+    """Build a per-substep CSR sidecar (`jac_csr_dofs`, `jac_csr_n_nz`) for the Jacobian.
+
+    For each constraint, walks ``jac[i_c, :, i_b]`` in **descending DOF index order** and writes the non-zero DOF
+    indices into ``jac_csr_dofs[i_c, k, i_b]`` (k = 0, 1, ...). The descending order matches the convention used by
+    ``jac_relevant_dofs`` in the existing ``sparse_solve=True`` path, so the sparse Hessian build can iterate
+    ``for ii in range(n_nz): for jj in range(ii+1)`` and trust that ``DOF[ii] <= DOF[jj]`` → ``(row, col) =
+    (DOF[jj], DOF[ii])`` lands in the lower triangle.
+
+    Per-env block of 128 threads, each thread strides through ``n_constraints[i_b]`` constraints. Called by
+    ``RigidConstraintSolver.build_jac_csr`` once per substep, right after ``add_inequality_constraints`` finalises J,
+    only when the Newton + GPU + tiled-cholesky-hessian + not-sparse_solve gate is on (otherwise the sidecar isn't
+    allocated and this kernel must not be invoked).
+    """
+    _B = constraint_state.jac.shape[2]
+    n_dofs = constraint_state.jac.shape[1]
+    BLOCK_DIM = qd.static(128)
+
+    qd.loop_config(name="build_jac_csr", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
+        n_c = constraint_state.n_constraints[i_b]
+
+        i_c = tid
+        while i_c < n_c:
+            n_nz = qd.cast(0, gs.qd_int)
+            # Walk DOFs in descending order so jac_csr_dofs[i_c, 0..n_nz-1, i_b] is descending.
+            for i_d_rev in range(n_dofs):
+                i_d = n_dofs - 1 - i_d_rev
+                if constraint_state.jac[i_c, i_d, i_b] != 0.0:
+                    constraint_state.jac_csr_dofs[i_c, n_nz, i_b] = i_d
+                    n_nz = n_nz + 1
+            constraint_state.jac_csr_n_nz[i_c, i_b] = n_nz
+            i_c = i_c + BLOCK_DIM
+
+
+@qd.func
+def func_hessian_sparse_jtdaj(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    check_full_hessian: qd.template() = False,
+):
+    """Sparse rebuild of H = M + J^T D J using the per-substep CSR sidecar.
+
+    Two-phase, lower-triangle only:
+      Phase A (M-init): per-env block of 128 threads writes ``nt_H[i_b, i_d1, i_d2] = M[i_d1, i_d2, i_b]`` for all
+        lower-triangle entries (each thread strides through ``n_lower_tri / 128`` entries).  No atomics.
+      Phase B (JTDAJ scatter): per-(env, constraint_slot) thread walks ``jac_csr_dofs[i_c, :n_nz, i_b]`` and
+        ``atomic_add``-s ``D[i_c] * Ji * Jj`` into ``nt_H[i_b, row, col]`` (row >= col, lower triangle).  ``D`` is
+        pre-masked by ``active[i_c, i_b]`` to fold in the constraint-active gate.
+
+    Mirrors mjwarp's ``_JTDAJ_sparse`` shape and atomic discipline.  Genesis stores H in the lower triangle (mjwarp
+    uses the upper triangle), so the ``row = max(i_d1, i_d2); col = min(...)`` pattern is used.
+
+    Gates: ``n_constraints[i_b] > 0 and improved[i_b]``, plus ``use_full_hessian[i_b] == 1`` if
+    ``check_full_hessian`` is set (caller patches the rest).
+    """
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    n_lower_tri = n_dofs * (n_dofs + 1) // 2
+    PHASE_A_BLOCK = qd.static(128)
+    # Cap the constraint-slot dim for Phase B's launch grid: most envs have n_c << len_constraints_ at steady state,
+    # so launching `len_constraints_` slots per env would explode the launch (similar to the failed naive exp 1 in
+    # sparse_patch_delta_2026may22.md).  We dispatch a fixed block of 32 threads per env and stride.
+    PHASE_B_BLOCK = qd.static(32)
+
+    # Phase A: write M to H lower triangle.
+    qd.loop_config(name="hessian_sparse_jtdaj_init_M", block_dim=PHASE_A_BLOCK)
+    for i in range(_B * PHASE_A_BLOCK):
+        tid = i % PHASE_A_BLOCK
+        i_b = i // PHASE_A_BLOCK
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+        pid = tid
+        while pid < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(pid)
+            constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+            pid = pid + PHASE_A_BLOCK
+
+    # Phase B: per-env block of 32 threads, each thread strides through n_constraints[i_b], walks CSR, atomic-adds
+    # JTDAJ contributions into lower triangle.
+    qd.loop_config(name="hessian_sparse_jtdaj_scatter", block_dim=PHASE_B_BLOCK)
+    for i in range(_B * PHASE_B_BLOCK):
+        tid = i % PHASE_B_BLOCK
+        i_b = i // PHASE_B_BLOCK
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+
+        n_c = constraint_state.n_constraints[i_b]
+        i_c = tid
+        while i_c < n_c:
+            # Fold the active mask into D so inactive constraints contribute 0 (matches the dense kernel's
+            # `efc_D[i_c_] = efc_D * active`).
+            D = constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+            if D != 0.0:
+                n_nz = constraint_state.jac_csr_n_nz[i_c, i_b]
+                # CSR is descending: jac_csr_dofs[i_c, 0] = highest DOF index.  For pair (ii, jj) with jj < ii,
+                # DOF[ii] < DOF[jj], so row = DOF[jj], col = DOF[ii] → lower triangle.
+                for ii in range(n_nz):
+                    i_di = constraint_state.jac_csr_dofs[i_c, ii, i_b]
+                    Ji = constraint_state.jac[i_c, i_di, i_b]
+                    # Diagonal: (DOF[ii], DOF[ii]) → row = col = i_di.
+                    qd.atomic_add(constraint_state.nt_H[i_b, i_di, i_di], D * Ji * Ji)
+                    for jj in range(ii):
+                        i_dj = constraint_state.jac_csr_dofs[i_c, jj, i_b]
+                        Jj = constraint_state.jac[i_c, i_dj, i_b]
+                        # i_di < i_dj (descending CSR, jj < ii) → row = i_dj, col = i_di.
+                        qd.atomic_add(constraint_state.nt_H[i_b, i_dj, i_di], D * Ji * Jj)
+            i_c = i_c + PHASE_B_BLOCK
+
+
 @qd.func
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
@@ -2113,8 +2258,17 @@ def func_hessian_and_cholesky_factor_direct(
                 static_rigid_sim_config=static_rigid_sim_config,
             )
     else:
-        # GPU
-        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        # GPU + dense.  Newton with tiled cholesky uses the sparse JTDAJ build path (per-substep CSR sidecar
+        # built by `kernel_build_jac_csr`); other configurations fall back to the dense tile-based build.  The
+        # gate matches the one used in `array_class.get_constraint_state` to allocate `jac_csr_dofs`/
+        # `jac_csr_n_nz`, so when sparse_jtdaj runs the sidecar is guaranteed to exist and be fresh.
+        if qd.static(
+            static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+            and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        ):
+            func_hessian_sparse_jtdaj(constraint_state, rigid_global_info)
+        else:
+            func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)

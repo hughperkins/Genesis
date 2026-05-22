@@ -832,11 +832,26 @@ def _func_patch_hessian_delta(
 def _func_newton_only_nt_hessian(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
 ):
-    """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others)."""
-    solver.func_hessian_direct_tiled(
-        constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
-    )
+    """Full Hessian rebuild for envs with use_full_hessian == 1 (skips others).
+
+    Newton + GPU + tiled-cholesky-hessian + not-sparse_solve goes through the sparse JTDAJ path (CSR walk +
+    atomic scatter, mjwarp-style); other configurations fall back to the dense tile-based rebuild.
+    """
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and not static_rigid_sim_config.sparse_solve
+        and static_rigid_sim_config.backend != gs.cpu
+    ):
+        solver.func_hessian_sparse_jtdaj(
+            constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
+        )
+    else:
+        solver.func_hessian_direct_tiled(
+            constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
+        )
 
 
 @qd.func
@@ -849,8 +864,19 @@ def _func_newton_only_nt_hessian_and_cholesky(
 
     Matches origin/main behavior: H is rebuilt from scratch every iteration, then Cholesky overwrites nt_H with L
     in-place.  H patching is not used because the subsequent Cholesky would destroy H anyway.
+
+    Hessian build picks sparse JTDAJ (Newton + GPU + tiled + not-sparse_solve) or dense tiled; Cholesky picks
+    tiled or batched.
     """
-    solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+    if qd.static(
+        static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
+        and static_rigid_sim_config.enable_tiled_cholesky_hessian
+        and not static_rigid_sim_config.sparse_solve
+        and static_rigid_sim_config.backend != gs.cpu
+    ):
+        solver.func_hessian_sparse_jtdaj(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
+    else:
+        solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(
             constraint_state=constraint_state,
@@ -1024,7 +1050,7 @@ def _kernel_solve_graph(
         ):
             # Fused path: H patching + fused Cholesky+Solve (L in shmem, H preserved in nt_H)
             _func_build_changed_and_decide_hessian_mode(constraint_state, static_rigid_sim_config)
-            _func_newton_only_nt_hessian(constraint_state, rigid_global_info)
+            _func_newton_only_nt_hessian(constraint_state, rigid_global_info, static_rigid_sim_config)
             _func_patch_hessian_delta(constraint_state, rigid_global_info)
             _func_update_gradient_no_solve(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config

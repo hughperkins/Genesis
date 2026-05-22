@@ -242,6 +242,13 @@ class ConstraintState:
     aref: qd.Tensor
     jac_relevant_dofs: qd.Tensor
     jac_n_relevant_dofs: qd.Tensor
+    # Per-substep CSR sidecar for J (descending-DOF-index list per constraint), built by
+    # ``_func_build_jac_csr`` after ``add_inequality_constraints`` finalises J for the substep, then consumed by
+    # the sparse JTDAJ Hessian build path (Newton + GPU + tiled-cholesky-hessian + not sparse_solve). Mirrors
+    # ``jac_relevant_dofs``/``jac_n_relevant_dofs`` but allocated independently so we don't have to flip
+    # ``sparse_solve`` semantics.
+    jac_csr_dofs: qd.Tensor
+    jac_csr_n_nz: qd.Tensor
     n_constraints_equality: qd.Tensor
     n_constraints_frictionloss: qd.Tensor
     improved: qd.Tensor
@@ -347,6 +354,18 @@ def get_constraint_state(constraint_solver, solver):
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
     jac_relevant_dofs_shape = maybe_shape(jac_shape, constraint_solver.sparse_solve)
     jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), constraint_solver.sparse_solve)
+    # CSR sidecar for the sparse JTDAJ Hessian build path. Allocated when Newton is used with the
+    # tiled-cholesky-hessian GPU path AND sparse_solve=False (sparse_solve already maintains
+    # jac_relevant_dofs which serves the same role). We allocate eagerly inside `get_constraint_state`
+    # only when the gate matches so non-Newton solvers and CPU runs don't pay the memory cost.
+    _csr_active = bool(
+        getattr(solver._static_rigid_sim_config, "solver_type", None) == gs.constraint_solver.Newton
+        and getattr(solver._static_rigid_sim_config, "enable_tiled_cholesky_hessian", False)
+        and not constraint_solver.sparse_solve
+        and gs.backend != gs.cpu
+    )
+    jac_csr_dofs_shape = maybe_shape(jac_shape, _csr_active)
+    jac_csr_n_nz_shape = maybe_shape((len_constraints_, _B), _csr_active)
 
     if math.prod(jac_shape) > np.iinfo(np.int32).max:
         gs.raise_exception(
@@ -420,6 +439,12 @@ def get_constraint_state(constraint_solver, solver):
             layout=jac_layout if constraint_solver.sparse_solve else None,
         ),
         jac_n_relevant_dofs=V(dtype=gs.qd_int, shape=jac_n_relevant_dofs_shape),
+        jac_csr_dofs=V(
+            dtype=gs.qd_int,
+            shape=jac_csr_dofs_shape,
+            layout=jac_layout if _csr_active else None,
+        ),
+        jac_csr_n_nz=V(dtype=gs.qd_int, shape=jac_csr_n_nz_shape),
         # Backward gradients
         dL_dqacc=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, _B), solver._requires_grad)),
         dL_dM=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, solver.n_dofs_, _B), solver._requires_grad)),
