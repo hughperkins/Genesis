@@ -971,19 +971,26 @@ def _func_update_search_direction(
 ):
     """Step 6: Check convergence and update search direction.
 
-    F1-E1: also performs the per-iter `early_exit_flag = 0` and `graph_counter -= 1`
-    writes that used to live in `check_early_exit_reset_flag` (a separate 1-thread
-    serial kernel). Both writes are scalar single-writer (lane 0 = i_b == 0) and the
-    grid-wide kernel boundary between this kernel and `check_early_exit_scan_values`
-    ensures the reset is visible before the atomic_max reads early_exit_flag."""
+    F1-E1+E3: also performs the per-iter early-exit bookkeeping that used to live in
+    two separate 1-thread serial kernels (`check_early_exit_reset_flag` and
+    `check_early_exit_set_counter`). The semantics are recast: instead of using
+    `early_exit_flag` as a 0/1 "did anyone improve" flag, we use it as a "remaining
+    iters if we continue" payload and zero `graph_counter`; then `scan_values` does
+    `atomic_max(graph_counter, early_exit_flag)` for each improved env, which leaves
+    `graph_counter` at 0 iff no env improved and at `iter_remaining` otherwise. The
+    do-while-cond then exits or continues with no separate `set_counter` kernel
+    needed."""
     _B = constraint_state.grad.shape[1]
     qd.loop_config(
         name="update_search_direction", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32
     )
     for i_b in range(_B):
         if i_b == 0:
-            constraint_state.early_exit_flag[()] = 0
-            graph_counter[()] = graph_counter[()] - 1
+            # iter_remaining = old_counter - 1 → save into early_exit_flag (repurposed).
+            # Then zero graph_counter so scan_values' atomic_max can "vote up" to
+            # iter_remaining iff any env improved.
+            constraint_state.early_exit_flag[()] = graph_counter[()] - 1
+            graph_counter[()] = 0
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             solver.func_terminate_or_update_descent_batch(
                 i_b,
@@ -1000,19 +1007,19 @@ def _func_check_early_exit(
 ):
     """Exit early if no batch element improved.
 
-    F1-E1: the per-iter `early_exit_flag = 0` reset and the `graph_counter -= 1`
-    decrement were hoisted into `_func_update_search_direction` lane 0, saving one
-    1-thread serial kernel (was `check_early_exit_reset_flag`) per Newton iter."""
+    F1-E1+E3: previously this function launched 3 separate kernels per Newton iter
+    (`check_early_exit_reset_flag`, `check_early_exit_scan_values`,
+    `check_early_exit_set_counter`). E1 hoisted `reset_flag`'s writes into the
+    preceding `update_search_direction` lane 0; E3 eliminates `set_counter` by
+    redefining `early_exit_flag` as the "iter_remaining" payload and having
+    `scan_values` atomic_max it onto `graph_counter`. After E3 only `scan_values`
+    remains here, so the function expands by 1 graph node saved per Newton iter
+    (3 → 1 = 2 fewer launches per Newton iter from this function)."""
     _B = constraint_state.grad.shape[1]
     qd.loop_config(name="check_early_exit_scan_values")
     for i_b in range(_B):
         if constraint_state.improved[i_b]:
-            qd.atomic_max(constraint_state.early_exit_flag[()], 1)
-
-    qd.loop_config(name="check_early_exit_set_counter")
-    for _ in range(1):
-        if constraint_state.early_exit_flag[()] == 0:
-            graph_counter[()] = 0
+            qd.atomic_max(graph_counter[()], constraint_state.early_exit_flag[()])
 
 
 # ============================================== Solve body dispatch ================================================
