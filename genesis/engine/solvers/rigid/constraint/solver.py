@@ -1912,14 +1912,15 @@ def func_hessian_direct_sparse_scatter(
     n_dofs = constraint_state.nt_H.shape[1]
 
     qd.loop_config(name="nt_H_init_M")
-    for i_b, i_d1 in qd.ndrange(_B, n_dofs):
+    for i_b, i_d1, i_d2 in qd.ndrange(_B, n_dofs, n_dofs):
+        if i_d2 > i_d1:
+            continue
         if qd.static(check_full_hessian):
             if constraint_state.use_full_hessian[i_b] == 0:
                 continue
         if not constraint_state.improved[i_b]:
             continue
-        for i_d2 in range(i_d1 + 1):
-            constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+        constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
 
     qd.loop_config(name="nt_H_scatter")
     for i_b, i_c_g in qd.ndrange(_B, _SCATTER_BLOCK):
