@@ -125,6 +125,12 @@ def kernel_compute_mass_matrix(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
             is_backward=False,
+            prepended_assemble=qd.static(
+                static_rigid_sim_config.backend != gs.cpu
+                and static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+                and static_rigid_sim_config.constraint_layout_transposed
+                and not static_rigid_sim_config.use_hibernation
+            ),
         )
 
 
@@ -157,13 +163,27 @@ def func_forward_dynamics(
         is_backward=is_backward,
     )
     func_factor_mass(
-        implicit_damping=False,
+        implicit_damping=qd.static(
+            (
+                static_rigid_sim_config.backend != gs.cpu
+                and static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+                and static_rigid_sim_config.constraint_layout_transposed
+                and not static_rigid_sim_config.use_hibernation
+            )
+            and static_rigid_sim_config.integrator == gs.integrator.approximate_implicitfast
+        ),
         entities_info=entities_info,
         dofs_state=dofs_state,
         dofs_info=dofs_info,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
+        prepended_assemble=qd.static(
+            static_rigid_sim_config.backend != gs.cpu
+            and static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+            and static_rigid_sim_config.constraint_layout_transposed
+            and not static_rigid_sim_config.use_hibernation
+        ),
     )
     func_torque_and_passive_force(
         entities_state=entities_state,
@@ -380,100 +400,111 @@ def func_compute_mass_matrix(
                         dofs_state.cdof_ang[i_d, i_b],
                     )
 
-    if qd.static(static_rigid_sim_config.constraint_layout_transposed and not static_rigid_sim_config.use_hibernation):
-        # Cooperative warp-per-(entity, env) writer over the lower triangle (inclusive of diagonal). Each cell's
-        # symmetric value is computed once via the sqrt-formula compressed pair index and written to both
-        # `[i_d, j_d, i_b]` and `[j_d, i_d, i_b]` inline, saving the upper-tri dot products that the previous
-        # two-pass path computed and then overwrote, and removing the separate mirror pass. Under the flipped
-        # mass_mat layout (i_d stride-1) the primary write coalesces; the inline mirror write is strided but
-        # replaces the previous mirror-pass read-write at similar cost.
-        _T = qd.static(_MASS_MAT_BLOCK)
-        n_entities = entities_info.n_links.shape[0]
-        _B_assemble = links_state.pos.shape[1]
-        qd.loop_config(name="mass_mat_assemble", block_dim=_T)
-        for i_flat in range(n_entities * _B_assemble * _T):
-            tid = i_flat % _T
-            i_eb = i_flat // _T
-            i_e = i_eb % n_entities
-            i_b = i_eb // n_entities
+    # Fusion gate: when assemble + armature + impint + factor_mass run in one tiled kernel
+    # (in func_factor_mass below), this skips the standalone assemble / armature / impint loops
+    # here. compute_mass_matrix still does crb_initialize, crb, mass_forward (which produce
+    # f_ang/f_vel) — those run unchanged.
+    if qd.static(
+        is_backward
+        or static_rigid_sim_config.backend == gs.cpu
+        or not static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+        or not static_rigid_sim_config.constraint_layout_transposed
+        or static_rigid_sim_config.use_hibernation
+    ):
+        if qd.static(static_rigid_sim_config.constraint_layout_transposed and not static_rigid_sim_config.use_hibernation):
+            # Cooperative warp-per-(entity, env) writer over the lower triangle (inclusive of diagonal). Each cell's
+            # symmetric value is computed once via the sqrt-formula compressed pair index and written to both
+            # `[i_d, j_d, i_b]` and `[j_d, i_d, i_b]` inline, saving the upper-tri dot products that the previous
+            # two-pass path computed and then overwrote, and removing the separate mirror pass. Under the flipped
+            # mass_mat layout (i_d stride-1) the primary write coalesces; the inline mirror write is strided but
+            # replaces the previous mirror-pass read-write at similar cost.
+            _T = qd.static(_MASS_MAT_BLOCK)
+            n_entities = entities_info.n_links.shape[0]
+            _B_assemble = links_state.pos.shape[1]
+            qd.loop_config(name="mass_mat_assemble", block_dim=_T)
+            for i_flat in range(n_entities * _B_assemble * _T):
+                tid = i_flat % _T
+                i_eb = i_flat // _T
+                i_e = i_eb % n_entities
+                i_b = i_eb // n_entities
 
-            d_s = entities_info.dof_start[i_e]
-            d_e = entities_info.dof_end[i_e]
-            n_e_e = d_e - d_s
-            n_lower_tri = n_e_e * (n_e_e + 1) // 2
+                d_s = entities_info.dof_start[i_e]
+                d_e = entities_info.dof_end[i_e]
+                n_e_e = d_e - d_s
+                n_lower_tri = n_e_e * (n_e_e + 1) // 2
 
-            i_pair = tid
-            while i_pair < n_lower_tri:
-                # Compressed lower-tri-inclusive index (matches tiled func_factor_mass): i_pair = i_d_ * (i_d_ + 1) / 2
-                # + j_d_, with j_d_ in [0, i_d_].
-                i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
-                j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
-                i_d = d_s + i_d_
-                j_d = d_s + j_d_
-                val = (
-                    dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
-                    + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
-                ) * rigid_global_info.mass_parent_mask[i_d, j_d]
-                rigid_global_info.mass_mat[i_d, j_d, i_b] = val
-                if i_d_ != j_d_:
-                    rigid_global_info.mass_mat[j_d, i_d, i_b] = val
-                i_pair += _T
-    else:
-        qd.loop_config(
-            name="mass_mat_assemble", serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        )
-        for i_0, i_b in (
-            qd.ndrange(1, links_state.pos.shape[1])
-            if qd.static(static_rigid_sim_config.use_hibernation)
-            else qd.ndrange(entities_info.n_links.shape[0], links_state.pos.shape[1])
-        ):
-            for i_1 in (
-                range(rigid_global_info.n_awake_entities[i_b])
+                i_pair = tid
+                while i_pair < n_lower_tri:
+                    # Compressed lower-tri-inclusive index (matches tiled func_factor_mass): i_pair = i_d_ * (i_d_ + 1) / 2
+                    # + j_d_, with j_d_ in [0, i_d_].
+                    i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
+                    j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                    i_d = d_s + i_d_
+                    j_d = d_s + j_d_
+                    val = (
+                        dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
+                        + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
+                    ) * rigid_global_info.mass_parent_mask[i_d, j_d]
+                    rigid_global_info.mass_mat[i_d, j_d, i_b] = val
+                    if i_d_ != j_d_:
+                        rigid_global_info.mass_mat[j_d, i_d, i_b] = val
+                    i_pair += _T
+        else:
+            qd.loop_config(
+                name="mass_mat_assemble", serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+            )
+            for i_0, i_b in (
+                qd.ndrange(1, links_state.pos.shape[1])
                 if qd.static(static_rigid_sim_config.use_hibernation)
-                else qd.static(range(1))
+                else qd.ndrange(entities_info.n_links.shape[0], links_state.pos.shape[1])
             ):
-                if func_check_index_range(
-                    i_1, 0, rigid_global_info.n_awake_entities[i_b], static_rigid_sim_config.use_hibernation
+                for i_1 in (
+                    range(rigid_global_info.n_awake_entities[i_b])
+                    if qd.static(static_rigid_sim_config.use_hibernation)
+                    else qd.static(range(1))
                 ):
-                    i_e = (
-                        rigid_global_info.awake_entities[i_1, i_b]
-                        if qd.static(static_rigid_sim_config.use_hibernation)
-                        else i_0
-                    )
-
-                    for i_d, j_d in qd.ndrange(
-                        (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
-                        (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
+                    if func_check_index_range(
+                        i_1, 0, rigid_global_info.n_awake_entities[i_b], static_rigid_sim_config.use_hibernation
                     ):
-                        rigid_global_info.mass_mat[i_d, j_d, i_b] = (
-                            dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
-                            + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
-                        ) * rigid_global_info.mass_parent_mask[i_d, j_d]
+                        i_e = (
+                            rigid_global_info.awake_entities[i_1, i_b]
+                            if qd.static(static_rigid_sim_config.use_hibernation)
+                            else i_0
+                        )
 
-                    for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-                        for j_d in range(i_d + 1, entities_info.dof_end[i_e]):
-                            rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
+                        for i_d, j_d in qd.ndrange(
+                            (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
+                            (entities_info.dof_start[i_e], entities_info.dof_end[i_e]),
+                        ):
+                            rigid_global_info.mass_mat[i_d, j_d, i_b] = (
+                                dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
+                                + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
+                            ) * rigid_global_info.mass_parent_mask[i_d, j_d]
 
-    # Take into account motor armature
-    qd.loop_config(name="armature", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_d, i_b in qd.ndrange(dofs_state.f_ang.shape[0], links_state.pos.shape[1]):
-        I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
-        func_add_safe_backward(rigid_global_info.mass_mat, (i_d, i_d, i_b), dofs_info.armature[I_d], BW)
+                        for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                            for j_d in range(i_d + 1, entities_info.dof_end[i_e]):
+                                rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
 
-    # Take into account first-order correction terms for implicit integration scheme right away
-    if qd.static(implicit_damping):
-        qd.loop_config(name="impint_order_1_corr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        # Take into account motor armature
+        qd.loop_config(name="armature", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         for i_d, i_b in qd.ndrange(dofs_state.f_ang.shape[0], links_state.pos.shape[1]):
             I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
-            rigid_global_info.mass_mat[i_d, i_d, i_b] = (
-                rigid_global_info.mass_mat[i_d, i_d, i_b] + dofs_info.damping[I_d] * rigid_global_info.substep_dt[None]
-            )
-            if dofs_state.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                # qM += d qfrc_actuator / d qvel = -act_bias[2] * dt
+            func_add_safe_backward(rigid_global_info.mass_mat, (i_d, i_d, i_b), dofs_info.armature[I_d], BW)
+
+        # Take into account first-order correction terms for implicit integration scheme right away
+        if qd.static(implicit_damping):
+            qd.loop_config(name="impint_order_1_corr", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+            for i_d, i_b in qd.ndrange(dofs_state.f_ang.shape[0], links_state.pos.shape[1]):
+                I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
                 rigid_global_info.mass_mat[i_d, i_d, i_b] = (
-                    rigid_global_info.mass_mat[i_d, i_d, i_b]
-                    - dofs_info.act_bias[I_d][2] * rigid_global_info.substep_dt[None]
+                    rigid_global_info.mass_mat[i_d, i_d, i_b] + dofs_info.damping[I_d] * rigid_global_info.substep_dt[None]
                 )
+                if dofs_state.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
+                    # qM += d qfrc_actuator / d qvel = -act_bias[2] * dt
+                    rigid_global_info.mass_mat[i_d, i_d, i_b] = (
+                        rigid_global_info.mass_mat[i_d, i_d, i_b]
+                        - dofs_info.act_bias[I_d][2] * rigid_global_info.substep_dt[None]
+                    )
 
 
 @qd.func
@@ -485,7 +516,18 @@ def func_factor_mass(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
     is_backward: qd.template(),
+    prepended_assemble: qd.template(),
 ):
+    # When `prepended_assemble` is True, the same per-(entity, env) tiled block first computes
+    # `mass_mat[i_d,j_d,i_b]` from `f_ang/cdof_*`/`f_vel/cdof_*` directly into shared memory
+    # AND writes them to global, then folds armature + impint diagonal corrections into shmem
+    # AND global, before factoring. This replaces the standalone `mass_mat_assemble`,
+    # `armature`, and `impint_order_1_corr` loops in `func_compute_mass_matrix` (which are
+    # statically gated off via `_fuse_assemble_into_factor` over there). Only valid when:
+    # backend != cpu, enable_tiled_cholesky_mass_matrix, constraint_layout_transposed,
+    # not use_hibernation, not is_backward, AND `implicit_damping` is True iff the integrator
+    # is approximate_implicitfast (matches the `implicit_damping` arg compute_mass_matrix
+    # received, since that's what writes diagonal damping/control terms in the unfused path).
     BW = qd.static(is_backward)
 
     if qd.static(not BW):
@@ -548,7 +590,11 @@ def func_factor_mass(
                 if i_b >= _B:
                     continue
 
-                if rigid_global_info.mass_mat_mask[i_e, i_b]:
+                if rigid_global_info.mass_mat_mask[i_e, i_b] or qd.static(prepended_assemble):
+                    # NOTE: when prepended_assemble, we still run assemble + diag updates even if
+                    # mass_mat_mask is False, because compute_mass_matrix's assemble loop is
+                    # unconditional and downstream consumers depend on global mass_mat being up to
+                    # date. We only skip the factor body when mass_mat_mask is False.
                     entity_dof_start = entities_info.dof_start[i_e]
                     entity_dof_end = entities_info.dof_end[i_e]
                     n_dofs = entities_info.n_dofs[i_e]
@@ -556,67 +602,109 @@ def func_factor_mass(
 
                     mass_mat = qd.simt.block.SharedArray((MAX_DOFS_PER_ENTITY, MAX_DOFS_PER_ENTITY + 1), gs.qd_float)
 
-                    i_pair = tid
-                    while i_pair < n_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
-                        i_d = entity_dof_start + i_d_
-                        j_d = entity_dof_start + j_d_
-                        mass_mat[i_d_, j_d_] = rigid_global_info.mass_mat[i_d, j_d, i_b]
-                        i_pair = i_pair + BLOCK_DIM
-                    qd.simt.block.sync()
+                    if qd.static(prepended_assemble):
+                        # Fused assemble: compute mass_mat values via the f_ang/f_vel dot products,
+                        # write to both shmem (for the factor below) and to global (for downstream
+                        # consumers like the constraint solver that read mass_mat directly).
+                        i_pair = tid
+                        while i_pair < n_lower_tri:
+                            i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
+                            j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                            i_d = entity_dof_start + i_d_
+                            j_d = entity_dof_start + j_d_
+                            val = (
+                                dofs_state.f_ang[i_d, i_b].dot(dofs_state.cdof_ang[j_d, i_b])
+                                + dofs_state.f_vel[i_d, i_b].dot(dofs_state.cdof_vel[j_d, i_b])
+                            ) * rigid_global_info.mass_parent_mask[i_d, j_d]
+                            mass_mat[i_d_, j_d_] = val
+                            rigid_global_info.mass_mat[i_d, j_d, i_b] = val
+                            if i_d_ != j_d_:
+                                rigid_global_info.mass_mat[j_d, i_d, i_b] = val
+                            i_pair = i_pair + BLOCK_DIM
+                        qd.simt.block.sync()
 
-                    if qd.static(implicit_damping):
+                        # Fused armature: add armature[I_d] to diagonal (shmem AND global).
+                        # In the unfused path this is the kernel_4 "armature" loop.
                         i_d_ = tid
                         while i_d_ < n_dofs:
                             i_d = entity_dof_start + i_d_
                             I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
-                            mass_mat[i_d_, i_d_] = (
-                                mass_mat[i_d_, i_d_] + dofs_info.damping[I_d] * rigid_global_info.substep_dt[None]
-                            )
-                            if qd.static(static_rigid_sim_config.integrator == gs.integrator.implicitfast):
+                            diag_add = dofs_info.armature[I_d]
+                            if qd.static(implicit_damping):
+                                # Match func_compute_mass_matrix's impint_order_1_corr loop.
+                                diag_add = diag_add + dofs_info.damping[I_d] * rigid_global_info.substep_dt[None]
                                 if dofs_state.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
-                                    mass_mat[i_d_, i_d_] = (
-                                        mass_mat[i_d_, i_d_]
-                                        - dofs_info.act_bias[I_d][2] * rigid_global_info.substep_dt[None]
+                                    diag_add = (
+                                        diag_add - dofs_info.act_bias[I_d][2] * rigid_global_info.substep_dt[None]
                                     )
+                            new_diag = mass_mat[i_d_, i_d_] + diag_add
+                            mass_mat[i_d_, i_d_] = new_diag
+                            rigid_global_info.mass_mat[i_d, i_d, i_b] = new_diag
                             i_d_ = i_d_ + BLOCK_DIM
                         qd.simt.block.sync()
+                    else:
+                        i_pair = tid
+                        while i_pair < n_lower_tri:
+                            i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
+                            j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                            i_d = entity_dof_start + i_d_
+                            j_d = entity_dof_start + j_d_
+                            mass_mat[i_d_, j_d_] = rigid_global_info.mass_mat[i_d, j_d, i_b]
+                            i_pair = i_pair + BLOCK_DIM
+                        qd.simt.block.sync()
 
-                    for j in range(n_dofs):
-                        i_d_ = n_dofs - j - 1
-                        i_d = entity_dof_end - j - 1
-
-                        D_inv = 1.0 / mass_mat[i_d_, i_d_]
-                        if tid == 0:
-                            rigid_global_info.mass_mat_D_inv[i_d, i_b] = D_inv
-                            # FIXME: Diagonal coeffs of L are ignored in computations, so no need to update them.
-                            rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
-
-                        j_d_ = i_d_ - 1 - tid
-                        while j_d_ >= 0:
-                            a = mass_mat[i_d_, j_d_] * D_inv
-                            for k_d in range(j_d_ + 1):
-                                mass_mat[j_d_, k_d] = mass_mat[j_d_, k_d] - a * mass_mat[i_d_, k_d]
-                            mass_mat[i_d_, j_d_] = a
-                            j_d_ = j_d_ - BLOCK_DIM
-                        if qd.static(static_rigid_sim_config.backend == gs.cuda):
-                            if i_d_ <= WARP_SIZE:
-                                qd.simt.warp.sync(qd.u32(0xFFFFFFFF))
-                            else:
-                                qd.simt.block.sync()
-                        else:
+                        if qd.static(implicit_damping):
+                            i_d_ = tid
+                            while i_d_ < n_dofs:
+                                i_d = entity_dof_start + i_d_
+                                I_d = [i_d, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d
+                                mass_mat[i_d_, i_d_] = (
+                                    mass_mat[i_d_, i_d_] + dofs_info.damping[I_d] * rigid_global_info.substep_dt[None]
+                                )
+                                if qd.static(static_rigid_sim_config.integrator == gs.integrator.implicitfast):
+                                    if dofs_state.ctrl_mode[i_d, i_b] <= gs.CTRL_MODE.VELOCITY:
+                                        mass_mat[i_d_, i_d_] = (
+                                            mass_mat[i_d_, i_d_]
+                                            - dofs_info.act_bias[I_d][2] * rigid_global_info.substep_dt[None]
+                                        )
+                                i_d_ = i_d_ + BLOCK_DIM
                             qd.simt.block.sync()
 
-                    i_pair = tid
-                    n_strict_lower_tri = n_dofs * (n_dofs - 1) // 2
-                    while i_pair < n_strict_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) + 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ - 1) // 2
-                        i_d = entity_dof_start + i_d_
-                        j_d = entity_dof_start + j_d_
-                        rigid_global_info.mass_mat_L[i_d, j_d, i_b] = mass_mat[i_d_, j_d_]
-                        i_pair = i_pair + BLOCK_DIM
+                    if rigid_global_info.mass_mat_mask[i_e, i_b]:
+                        for j in range(n_dofs):
+                            i_d_ = n_dofs - j - 1
+                            i_d = entity_dof_end - j - 1
+
+                            D_inv = 1.0 / mass_mat[i_d_, i_d_]
+                            if tid == 0:
+                                rigid_global_info.mass_mat_D_inv[i_d, i_b] = D_inv
+                                # FIXME: Diagonal coeffs of L are ignored in computations, so no need to update them.
+                                rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
+
+                            j_d_ = i_d_ - 1 - tid
+                            while j_d_ >= 0:
+                                a = mass_mat[i_d_, j_d_] * D_inv
+                                for k_d in range(j_d_ + 1):
+                                    mass_mat[j_d_, k_d] = mass_mat[j_d_, k_d] - a * mass_mat[i_d_, k_d]
+                                mass_mat[i_d_, j_d_] = a
+                                j_d_ = j_d_ - BLOCK_DIM
+                            if qd.static(static_rigid_sim_config.backend == gs.cuda):
+                                if i_d_ <= WARP_SIZE:
+                                    qd.simt.warp.sync(qd.u32(0xFFFFFFFF))
+                                else:
+                                    qd.simt.block.sync()
+                            else:
+                                qd.simt.block.sync()
+
+                        i_pair = tid
+                        n_strict_lower_tri = n_dofs * (n_dofs - 1) // 2
+                        while i_pair < n_strict_lower_tri:
+                            i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) + 1) // 2, qd.i32)
+                            j_d_ = i_pair - i_d_ * (i_d_ - 1) // 2
+                            i_d = entity_dof_start + i_d_
+                            j_d = entity_dof_start + j_d_
+                            rigid_global_info.mass_mat_L[i_d, j_d, i_b] = mass_mat[i_d_, j_d_]
+                            i_pair = i_pair + BLOCK_DIM
     else:
         # Cholesky decomposition that has safe access pattern and robust handling of divide by zero for AD. Even though
         # it is logically equivalent to the above block, it shows slightly numerical difference in the result, and thus
@@ -1439,13 +1527,27 @@ def kernel_forward_dynamics_without_qacc(
         is_backward=is_backward,
     )
     func_factor_mass(
-        implicit_damping=False,
+        implicit_damping=qd.static(
+            (
+                static_rigid_sim_config.backend != gs.cpu
+                and static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+                and static_rigid_sim_config.constraint_layout_transposed
+                and not static_rigid_sim_config.use_hibernation
+            )
+            and static_rigid_sim_config.integrator == gs.integrator.approximate_implicitfast
+        ),
         entities_info=entities_info,
         dofs_state=dofs_state,
         dofs_info=dofs_info,
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
+        prepended_assemble=qd.static(
+            static_rigid_sim_config.backend != gs.cpu
+            and static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+            and static_rigid_sim_config.constraint_layout_transposed
+            and not static_rigid_sim_config.use_hibernation
+        ),
     )
     func_torque_and_passive_force(
         entities_state=entities_state,
@@ -1540,6 +1642,7 @@ def func_implicit_damping(
         rigid_global_info=rigid_global_info,
         static_rigid_sim_config=static_rigid_sim_config,
         is_backward=is_backward,
+        prepended_assemble=False,
     )
     func_solve_mass(
         vec=dofs_state.force,
