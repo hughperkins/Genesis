@@ -624,7 +624,7 @@ def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, **
     )
 
 
-def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
+def make_dex_hand(n_envs, solver=None, gjk=None, sparse_solve=False, **scene_kwargs):
     shadow_hand_path = Path(get_hf_dataset(pattern="shadow_hand/*"))
     dex_path = Path(get_hf_dataset(pattern="dex/*"))
 
@@ -680,6 +680,7 @@ def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
         ),
         rigid_options=gs.options.RigidOptions(
             max_collision_pairs=200,
+            sparse_solve=sparse_solve,
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
@@ -988,6 +989,12 @@ def dex_hand(solver, n_envs, gjk):
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
+@pytest.fixture
+def dex_hand_sparse(solver, n_envs, gjk):
+    _, step_fn, meta = make_dex_hand(n_envs, solver=solver, gjk=gjk, sparse_solve=True)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
 # ---------------------------------------------------------------------------
 # Parametrized benchmark test
 # ---------------------------------------------------------------------------
@@ -1028,6 +1035,7 @@ def dex_hand(solver, n_envs, gjk):
         ("shadow_hand_cubes", None, None, 0, gs.cpu),
         ("shadow_hand_cubes_sparse", None, None, 0, gs.cpu),
         ("dex_hand", None, None, 4096, gs.gpu),
+        ("dex_hand_sparse", None, None, 4096, gs.gpu),
     ],
 )
 def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):

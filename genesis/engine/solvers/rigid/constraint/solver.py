@@ -1682,6 +1682,7 @@ def func_hessian_direct_batch(
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
     check_full_hessian: qd.template() = False,
 ):
     """Compute the Hessian matrix `H = M + J.T @ D @ J of the optimization problem for all environment at once.
@@ -1697,7 +1698,25 @@ def func_hessian_direct_tiled(
 
     When check_full_hessian is True (used with H patching), skips envs where use_full_hessian == 0 (those get patched
     instead of rebuilt).
+
+    When ``static_rigid_sim_config.sparse_solve`` is True (and n_dofs is small enough to fit in a single block of
+    shared memory), uses an MJWarp-style sparse scatter via per-constraint ``jac_relevant_dofs`` lists and shared-
+    memory ``atomic_add``. This is significantly faster on scenes where the Jacobian has few nnz per row
+    (e.g. dex_hand has ~5 nnz / 62 dofs per constraint).
     """
+    if qd.static(static_rigid_sim_config.sparse_solve):
+        _func_hessian_direct_tiled_sparse(constraint_state, rigid_global_info, check_full_hessian)
+    else:
+        _func_hessian_direct_tiled_dense(constraint_state, rigid_global_info, check_full_hessian)
+
+
+@qd.func
+def _func_hessian_direct_tiled_dense(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    check_full_hessian: qd.template() = False,
+):
+    """Dense tiled Hessian rebuild — see ``func_hessian_direct_tiled`` docstring."""
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
 
@@ -1772,12 +1791,7 @@ def func_hessian_direct_tiled(
                             i_c_ = i_c_ + BLOCK_DIM
                         qd.simt.block.sync()
 
-                    # Compute `H += J.T @ D @ J` for a single Hessian block.
-                    # E1 (sparse-jacobian-hessian): skip the second shmem load + FMA when the row entry is exactly zero.
-                    # On dex_hand the dense `jac_row` tile is ~92% zeros, so the skip eliminates most of the inner work.
-                    # Within a warp all threads execute the same `j_c_` loop and only branch on their own per-element
-                    # `jac_row[j_c_, i_d1_]`; the conditional reduces (read+FMA) to a register read most of the time and
-                    # leaves the rare nonzero path untouched.
+                    # Compute `H += J.T @ D @ J` for a single Hessian block
                     if is_diag_tile:
                         n_lower_tri_tile = n_dofs_tile_row * (n_dofs_tile_row + 1) // 2
                         pid = tid
@@ -1789,9 +1803,7 @@ def func_hessian_direct_tiled(
                             if i_c_start == 0:
                                 coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
-                                Ji = jac_row[j_c_, i_d1_]
-                                if Ji != 0.0:
-                                    coef = coef + Ji * jac_row[j_c_, i_d2_] * efc_D[j_c_]
+                                coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_] * efc_D[j_c_]
                             if i_c_start == 0:
                                 constraint_state.nt_H[i_b, i_d1, i_d2] = coef
                             else:
@@ -1809,9 +1821,7 @@ def func_hessian_direct_tiled(
                             if i_c_start == 0:
                                 coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
-                                Ji = jac_row[j_c_, i_d1_]
-                                if Ji != 0.0:
-                                    coef = coef + Ji * jac_col[j_c_, i_d2_] * efc_D[j_c_]
+                                coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_] * efc_D[j_c_]
                             if i_c_start == 0:
                                 constraint_state.nt_H[i_b, i_d1, i_d2] = coef
                             else:
@@ -1831,6 +1841,97 @@ def func_hessian_direct_tiled(
                 i_d1, i_d2 = linear_to_lower_tri(i_pair)
                 constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                 i_pair = i_pair + BLOCK_DIM
+
+
+@qd.func
+def _func_hessian_direct_tiled_sparse(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    check_full_hessian: qd.template() = False,
+):
+    """Sparse-Jacobian Hessian rebuild via per-constraint scatter into a shared-memory H accumulator.
+
+    Algorithm (one block per env, ``BLOCK_DIM`` threads cooperating):
+
+    1. Initialise an ``MAX_DOFS × MAX_DOFS`` shared-memory ``H`` with the lower-triangle of the mass matrix.
+    2. For each constraint ``i_c``, threads distribute over the
+       ``n_rel * (n_rel + 1) / 2`` ``(i_d1, i_d2)`` pairs in
+       ``jac_relevant_dofs[i_c, :, i_b]``. Each thread does one
+       ``D * J_i * J_j`` FMA into shared memory via ``qd.atomic_add``.
+    3. Write the shared-memory ``H`` back to ``constraint_state.nt_H[i_b]``.
+
+    No dense Jacobian column is ever loaded or multiplied. On scenes where the Jacobian is sparse (e.g. dex_hand,
+    where ~92% of dense entries are zero), this avoids the O(n_dofs² × n_constraints) FMAs of the dense tiled path
+    and instead does O(n_constraints × n_rel²) FMAs.
+
+    Constraints:
+    - ``n_dofs`` must fit within a single shmem block (i.e. ``n_dofs <= MAX_DOFS``). For typical robotics scenes
+      where the decomposed solver's tiled Cholesky is enabled, ``n_dofs <= 64``.
+
+    Matches the MJWarp ``_JTDAJ_sparse`` algorithm modulo the shared-memory accumulator (MJWarp accumulates directly
+    into a dense global-memory ``H`` via ``wp.atomic_add``).
+    """
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+
+    BLOCK_DIM = qd.static(128)
+    MAX_DOFS = qd.static(64)
+
+    n_lower_tri = n_dofs * (n_dofs + 1) // 2
+
+    qd.loop_config(name="hessian_direct_tiled_sparse", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+
+        # Shared-memory H accumulator. Lower triangle is what we actually use; upper is unused but allocated for
+        # simple 2D indexing without a per-cell linear-to-lower-tri conversion in the hot loop.
+        H_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS), gs.qd_float)
+
+        # Initialise H_sh with M (lower triangle only — atomics later only touch lower triangle).
+        i_pair = tid
+        while i_pair < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(i_pair)
+            H_sh[i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+            i_pair = i_pair + BLOCK_DIM
+        qd.simt.block.sync()
+
+        # Scatter J^T D J: per constraint, threads cooperate over the lower triangle of the constraint's relevant
+        # DOF pairs. Each (i_d1_, i_d2_) pair contributes D * J[i_d1] * J[i_d2] to H[max(i_d1, i_d2), min(...)].
+        n_c = constraint_state.n_constraints[i_b]
+        for i_c in range(n_c):
+            n_rel = constraint_state.jac_n_relevant_dofs[i_c, i_b]
+            n_pairs = n_rel * (n_rel + 1) // 2
+            D_active = constraint_state.efc_D[i_c, i_b] * constraint_state.active[i_c, i_b]
+
+            pair = tid
+            while pair < n_pairs:
+                i_d1_, i_d2_ = linear_to_lower_tri(pair)
+                i_d1 = constraint_state.jac_relevant_dofs[i_c, i_d1_, i_b]
+                i_d2 = constraint_state.jac_relevant_dofs[i_c, i_d2_, i_b]
+                Ji = constraint_state.jac[i_c, i_d1, i_b]
+                Jj = constraint_state.jac[i_c, i_d2, i_b]
+                # jac_relevant_dofs is descending within an entity but cross-entity pairs may have i_d2 > i_d1.
+                # Enforce lower-triangle convention row >= col.
+                row = qd.max(i_d1, i_d2)
+                col = qd.min(i_d1, i_d2)
+                qd.atomic_add(H_sh[row, col], Ji * Jj * D_active)
+                pair = pair + BLOCK_DIM
+        qd.simt.block.sync()
+
+        # Write H_sh back to global nt_H.
+        i_pair = tid
+        while i_pair < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(i_pair)
+            constraint_state.nt_H[i_b, i_d1, i_d2] = H_sh[i_d1, i_d2]
+            i_pair = i_pair + BLOCK_DIM
 
 
 @qd.func
@@ -2123,7 +2224,7 @@ def func_hessian_and_cholesky_factor_direct(
             )
     else:
         # GPU
-        func_hessian_direct_tiled(constraint_state, rigid_global_info)
+        func_hessian_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
             func_cholesky_factor_direct_tiled(constraint_state, rigid_global_info, static_rigid_sim_config)
