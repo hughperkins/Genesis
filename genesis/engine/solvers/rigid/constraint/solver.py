@@ -2293,8 +2293,9 @@ def func_cholesky_solve_tiled(
     API for it yet. As a result, warp-level intrinsics are currently disabled if not running on CUDA backend. On top of
     that, most if not all, Warp-level intrinsics are only supporting 32bits precision.
     """
-    # Performance is optimal for BLOCK_DIM = 64
-    BLOCK_DIM = qd.static(64)
+    # Single-warp variant: BLOCK_DIM=32 eliminates inter-warp barrier coordination
+    # in the per-row barriers (deskai9 round 4 attempt, 2026-05-22).
+    BLOCK_DIM = qd.static(32)
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
     ENABLE_WARP_REDUCTION = qd.static(static_rigid_sim_config.backend == gs.cuda and gs.qd_float == qd.f32)
     WARP_SIZE = qd.static(32)
