@@ -1981,9 +1981,9 @@ def func_cholesky_and_solve_fused_tiled(
         L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
         v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
 
-        skip_factor = (
-            constraint_state.use_full_hessian[i_b] == 0 and constraint_state.incr_n_changed[i_b] == 0
-        )
+        # E1.5: force factor path -- isolate the cache-write cost on the factor path.
+        # Skip path is logically equivalent but unreachable.
+        skip_factor = False
 
         if skip_factor:
             # Reuse previous iter's L: load tiles from nt_L_cache directly into L_sh, skip factor loop.
