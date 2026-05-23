@@ -1702,7 +1702,11 @@ def func_hessian_direct_tiled_body(
     BLOCK_DIM; the per-thread workload scales inversely with BLOCK_DIM.
     """
     MAX_CONSTRAINTS_PER_BLOCK = qd.static(32)
-    MAX_DOFS_PER_BLOCK = qd.static(64)
+    MAX_DOFS_PER_BLOCK = qd.static(32)
+    # Halved from 64 to 32 to reduce shmem footprint (8 KB → 4 KB per Jacobian tile, total 16 KB → 8 KB).
+    # For dex_hand with n_dofs=24 the algorithm still runs in a single tile pass; for workloads with
+    # n_dofs > 32 the tile loop runs twice instead of once. Trade: slightly more loop iterations vs.
+    # higher SM occupancy when this body is used inside the E5 megakernel.
 
     n_dofs = constraint_state.nt_H.shape[1]
     n_c = constraint_state.n_constraints[i_b]
@@ -4702,8 +4706,8 @@ def func_solve_body_megakernel(
         v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
 
         # Shmem for the tiled Hessian rebuild (matches func_hessian_direct_tiled_body's MAX_* statics).
-        jac_row_sh = qd.simt.block.SharedArray((32, 64), gs.qd_float)
-        jac_col_sh = qd.simt.block.SharedArray((32, 64), gs.qd_float)
+        jac_row_sh = qd.simt.block.SharedArray((32, 32), gs.qd_float)
+        jac_col_sh = qd.simt.block.SharedArray((32, 32), gs.qd_float)
         efc_D_sh = qd.simt.block.SharedArray((32,), gs.qd_float)
 
         # Shmem for the cooperative linesearch_p0 tree reductions (6 accumulators × 16 lanes).
