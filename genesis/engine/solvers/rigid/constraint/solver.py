@@ -3957,6 +3957,11 @@ def func_terminate_or_update_descent_batch(
     improved = grad_norm > tol_scaled and improvement > tol_scaled
     constraint_state.improved[i_b] = improved
 
+    # Record cost in cost_history[niter, b]. Slot 0 was set in func_solve_init to init cost; this
+    # records cost AFTER iter (niter_per_env-1)'s update. Cap at 15 (cost_history rows = 16).
+    slot = qd.min(constraint_state.niter_per_env[i_b], 15)
+    constraint_state.cost_history[slot, i_b] = constraint_state.cost[i_b]
+
     # Update search direction if necessary
     if improved:
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
@@ -4220,6 +4225,10 @@ def func_solve_init(
         constraint_state.improved[i_b] = constraint_state.n_constraints[i_b] > 0
         constraint_state.use_full_hessian[i_b] = 1
         constraint_state.niter_per_env[i_b] = 0
+        # Record cost at iter 0 (init cost, before any Newton step) in slot 0.
+        constraint_state.cost_history[0, i_b] = constraint_state.cost[i_b]
+        for k in range(1, 16):
+            constraint_state.cost_history[k, i_b] = gs.qd_float(-1.0)
     constraint_state.solver_iter_counter[()] = 0
 
     if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):

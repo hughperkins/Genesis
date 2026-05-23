@@ -326,6 +326,10 @@ class ConstraintState:
     # 'improved' (i.e. still iterating). Resets at substep start. Mirrors mjw's d.solver_niter
     # so we can compare per-env iter-count distributions apples-to-apples.
     niter_per_env: qd.Tensor
+    # Per-env per-iter cost history. cost_history[k, b] = cost[b] at the START of iter k (i.e.
+    # BEFORE iter k's linesearch update). Up to MAX_ITER_HISTORY iters; later iters overwrite the
+    # last slot. Resets to -1.0 at substep start, then iter k recorded if env still improved.
+    cost_history: qd.Tensor
     # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
     graph_counter: qd.types.ndarray()
     early_exit_flag: qd.Tensor
@@ -451,6 +455,7 @@ def get_constraint_state(constraint_solver, solver):
         use_full_hessian=V(dtype=qd.i32, shape=(_B,)),
         solver_iter_counter=V(dtype=qd.i32, shape=()),
         niter_per_env=V(dtype=qd.i32, shape=(_B,)),
+        cost_history=V(dtype=gs.qd_float, shape=(16, _B)),
         graph_counter=qd.ndarray(qd.i32, shape=()),
         early_exit_flag=V(dtype=qd.i32, shape=()),
     )
