@@ -2961,6 +2961,113 @@ def func_ls_init_and_eval_p0(
 
 
 @qd.func
+def _func_linesearch_eval_at_alpha_coop16(
+    i_b,
+    tid,
+    alpha,
+    sh_t0,
+    sh_t1,
+    sh_t2,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """16-lane cooperative version of ``_func_linesearch_eval_at_alpha`` (for E5 megakernel).
+
+    Same algorithm as ``_func_linesearch_eval_constraints_at_n_alphas_coop`` but with shmem tree reductions over 16
+    lanes instead of 32-lane subgroup reductions. Caller provides 3 shmem arrays of size 16 for the t_0/t_1/t_2
+    reductions; they can be reused across calls.
+
+    Returns (alpha, cost, grad, hess), same signature as the original.
+    """
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    # Equality contribution: quad_gauss + eq_sum (lane 0 holds the seed; tree reduction broadcasts).
+    base_0 = gs.qd_float(0.0)
+    base_1 = gs.qd_float(0.0)
+    base_2 = gs.qd_float(0.0)
+    if tid == 0:
+        base_0 = constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+        base_1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+        base_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+    t_0_local = base_0
+    t_1_local = base_1
+    t_2_local = base_2
+
+    # Friction constraints [ne, nef): 5 loads + recompute quad, single-alpha eval; stride 16.
+    i_c = ne + tid
+    while i_c < nef:
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        f = constraint_state.efc_frictionloss[i_c, i_b]
+        r = constraint_state.diag[i_c, i_b]
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        rf = r * f
+        x = Jaref_c + alpha * jv_c
+        ln = x <= -rf
+        lp = x >= rf
+        ak_qf_0, ak_qf_1, ak_qf_2 = qf_0, qf_1, qf_2
+        if ln or lp:
+            ak_qf_0 = ln * f * (-0.5 * rf - Jaref_c) + lp * f * (-0.5 * rf + Jaref_c)
+            ak_qf_1 = ln * (-f * jv_c) + lp * (f * jv_c)
+            ak_qf_2 = 0.0
+        t_0_local = t_0_local + ak_qf_0
+        t_1_local = t_1_local + ak_qf_1
+        t_2_local = t_2_local + ak_qf_2
+        i_c = i_c + 16
+
+    # Contact constraints [nef, n_con): 3 loads + recompute quad, single-alpha eval; stride 16.
+    i_c2 = nef + tid
+    while i_c2 < n_con:
+        Jaref_c = constraint_state.Jaref[i_c2, i_b]
+        jv_c = constraint_state.jv[i_c2, i_b]
+        D = constraint_state.efc_D[i_c2, i_b]
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        x = Jaref_c + alpha * jv_c
+        act = gs.qd_bool(x < 0)
+        t_0_local = t_0_local + qf_0 * act
+        t_1_local = t_1_local + qf_1 * act
+        t_2_local = t_2_local + qf_2 * act
+        i_c2 = i_c2 + 16
+
+    sh_t0[tid] = t_0_local
+    sh_t1[tid] = t_1_local
+    sh_t2[tid] = t_2_local
+    qd.simt.block.sync()
+
+    stride = 8
+    while stride > 0:
+        if tid < stride:
+            sh_t0[tid] = sh_t0[tid] + sh_t0[tid + stride]
+            sh_t1[tid] = sh_t1[tid] + sh_t1[tid + stride]
+            sh_t2[tid] = sh_t2[tid] + sh_t2[tid + stride]
+        qd.simt.block.sync()
+        stride = stride // 2
+
+    t0_final = sh_t0[0]
+    t1_final = sh_t1[0]
+    t2_final = sh_t2[0]
+
+    cost = alpha * alpha * t2_final + alpha * t1_final + t0_final
+    grad = 2 * alpha * t2_final + t1_final
+    hess = 2 * t2_final
+    if hess <= 0.0:
+        hess = rigid_global_info.EPS[None]
+
+    if tid == 0:
+        constraint_state.ls_it[i_b] = constraint_state.ls_it[i_b] + 1
+
+    return alpha, cost, grad, hess
+
+
+@qd.func
 def _func_linesearch_eval_constraints_at_n_alphas_serial(
     i_b,
     alphas,
@@ -4608,6 +4715,7 @@ def func_solve_body_megakernel(
         sh_ls3 = qd.simt.block.SharedArray((16,), gs.qd_float)
         sh_ls4 = qd.simt.block.SharedArray((16,), gs.qd_float)
         sh_ls5 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        # Reuse 3 of the above for the linesearch eval coop16 tree reductions (3 accumulators).
 
         if constraint_state.n_constraints[i_b] > 0:
             # First iter must factor; subsequent iters may skip when active set is unchanged.
@@ -4644,44 +4752,51 @@ def func_solve_body_megakernel(
                     )
                     qd.simt.block.sync()
 
-                    # Phase 1b: linesearch refinement (still serial on tid 0; ~3-5 Newton-step iters, each iter
-                    # does O(n_dofs + n_constraints) work — not the bottleneck).
-                    if tid == 0 and constraint_state.improved[i_b]:
+                    # Phase 1b: linesearch refinement. The first 2 evals (Newton step + fallback to alpha=0) run
+                    # cooperatively on all 16 lanes via the coop16 eval; the bracketing walk + 3-alpha polish
+                    # still run serial on tid 0 (control-flow-heavy, fewer-than-5 iters typical).
+                    if constraint_state.improved[i_b]:
                         alpha_newton = constraint_state.ls_alpha_newton[i_b]
                         p0_cost = constraint_state.ls_p0_cost[i_b]
                         gtol = constraint_state.ls_gtol[i_b]
 
-                        alpha = gs.qd_float(0.0)
                         if alpha_newton > 0.0:
-                            constraint_state.ls_alpha[i_b] = 0.0
-                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
-                                i_b, 0, alpha_newton, constraint_state, rigid_global_info, coop=False
+                            if tid == 0:
+                                constraint_state.ls_alpha[i_b] = 0.0
+
+                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
+                                i_b, tid, alpha_newton, sh_ls0, sh_ls1, sh_ls2, constraint_state, rigid_global_info
                             )
                             if p0_cost < p1_cost:
-                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
-                                    i_b, 0, gs.qd_float(0.0), constraint_state, rigid_global_info, coop=False
+                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
+                                    i_b, tid, gs.qd_float(0.0), sh_ls0, sh_ls1, sh_ls2,
+                                    constraint_state, rigid_global_info,
                                 )
-                            if p1_cost < p0_cost:
+                            if p1_cost < p0_cost and tid == 0:
                                 constraint_state.ls_alpha[i_b] = p1_alpha
+
                             if qd.abs(p1_deriv_0) > gtol:
-                                res_alpha, ls_result = func_linesearch_refine(
-                                    i_b,
-                                    0,
-                                    p1_alpha,
-                                    p1_cost,
-                                    p1_deriv_0,
-                                    p1_deriv_1,
-                                    p0_cost,
-                                    gtol,
-                                    constraint_state,
-                                    rigid_global_info,
-                                    coop=False,
-                                )
-                                # Skip status 7 (brackets stalled, midpoint non-improving)
-                                if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
-                                    constraint_state.ls_alpha[i_b] = res_alpha
-                        alpha = constraint_state.ls_alpha[i_b]
-                        if qd.abs(alpha) < EPS_val:
+                                # Bracketing walk + 3-alpha polish: still serial on tid 0 (control-flow heavy).
+                                if tid == 0:
+                                    res_alpha, ls_result = func_linesearch_refine(
+                                        i_b,
+                                        0,
+                                        p1_alpha,
+                                        p1_cost,
+                                        p1_deriv_0,
+                                        p1_deriv_1,
+                                        p0_cost,
+                                        gtol,
+                                        constraint_state,
+                                        rigid_global_info,
+                                        coop=False,
+                                    )
+                                    if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
+                                        constraint_state.ls_alpha[i_b] = res_alpha
+
+                        qd.simt.block.sync()
+                        alpha_val = constraint_state.ls_alpha[i_b]
+                        if tid == 0 and qd.abs(alpha_val) < EPS_val:
                             constraint_state.improved[i_b] = False
                     qd.simt.block.sync()
 
