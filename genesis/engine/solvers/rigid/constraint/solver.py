@@ -689,7 +689,12 @@ def _add_friction_constraint(
 
     if qd.static(static_rigid_sim_config.sparse_solve):
         constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-        _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+        # E9: sort skipped under sparse_solve. The main solver always uses the direct Hessian rebuild for sparse_solve
+        # (see func_hessian_and_cholesky_factor_direct_batch dispatch in solver.py:4005). The sparse consumers
+        # (`_func_hessian_direct_tiled_sparse`, `func_hessian_and_cholesky_factor_direct_batch`, decomp linesearch
+        # jv computation) all use `qd.max(i_d1, i_d2) / qd.min(i_d1, i_d2)` (lower-triangle convention) or
+        # order-independent summation, so a globally descending list is not required. The order is needed only for
+        # the incremental Cholesky in `solver_island.py`, which has its own construction code with its own sort.
     imp, aref = gu.imp_aref(contact_data_sol_params, -contact_data_penetration, jac_qvel, -contact_data_penetration)
 
     diag = invweight + contact_data_friction * contact_data_friction * invweight
@@ -833,7 +838,7 @@ def _add_collision_constraints_per_contact(
 
                 if qd.static(static_rigid_sim_config.sparse_solve):
                     constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-                    _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+                    # E9: sort skipped under sparse_solve. See `_add_friction_constraint` for the rationale.
                 imp, aref = gu.imp_aref(
                     contact_data_sol_params, -contact_data_penetration, jac_qvel, -contact_data_penetration
                 )
@@ -984,9 +989,7 @@ def func_equality_connect(
 
         if qd.static(static_rigid_sim_config.sparse_solve):
             constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-            # Sort needed: DOFs from two entities are only descending within each
-            # entity. Incremental Cholesky requires globally descending order.
-            _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+            # E9: sort skipped under sparse_solve. See `_add_friction_constraint` for the rationale.
 
         pos_diff = global_anchor1 - global_anchor2
         penetration = pos_diff.norm()
@@ -1090,7 +1093,7 @@ def func_equality_joint(
             constraint_state.jac_relevant_dofs[n_con, con_n_relevant_dofs, i_b] = i_dof2
             con_n_relevant_dofs += 1
         constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-        _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+        # E9: sort skipped under sparse_solve. See `_add_friction_constraint` for the rationale.
 
 
 @qd.kernel(fastcache=True)
@@ -1324,7 +1327,7 @@ def func_equality_weld(
 
         if qd.static(static_rigid_sim_config.sparse_solve):
             constraint_state.jac_n_relevant_dofs[n_con, i_b] = con_n_relevant_dofs
-            _sort_relevant_dofs_descending(constraint_state, n_con, con_n_relevant_dofs, i_b)
+            # E9: sort skipped under sparse_solve. See `_add_friction_constraint` for the rationale.
 
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel, pos_error[i])
         diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
@@ -1380,7 +1383,7 @@ def func_equality_weld(
     if qd.static(static_rigid_sim_config.sparse_solve):
         for i_con in range(n_con, n_con + 3):
             constraint_state.jac_n_relevant_dofs[i_con, i_b] = con_n_relevant_dofs
-            _sort_relevant_dofs_descending(constraint_state, i_con, con_n_relevant_dofs, i_b)
+            # E9: sort skipped under sparse_solve. See `_add_friction_constraint` for the rationale.
 
     for i_con in range(n_con, n_con + 3):
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel[i_con - n_con], rot_error[i_con - n_con])
