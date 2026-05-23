@@ -240,15 +240,13 @@ class ConstraintState:
     jac: qd.Tensor
     diag: qd.Tensor
     aref: qd.Tensor
+    # CSR sidecar for J (descending-DOF-index list per constraint).  Allocated when EITHER ``sparse_solve=True``
+    # (CPU-tuned sparse solve path) OR ``csr_sidecar_enabled=True`` (Newton + GPU + tiled-cholesky-hessian + not
+    # sparse_solve).  In the latter case the dense-J constraint-construction kernels write the CSR alongside the
+    # dense ``jac`` writes (no separate per-substep build pass), so the sparse JTDAJ Hessian build and sparse
+    # patch path can walk it directly without a 37 us/substep scan kernel.
     jac_relevant_dofs: qd.Tensor
     jac_n_relevant_dofs: qd.Tensor
-    # Per-substep CSR sidecar for J (descending-DOF-index list per constraint), built by
-    # ``_func_build_jac_csr`` after ``add_inequality_constraints`` finalises J for the substep, then consumed by
-    # the sparse JTDAJ Hessian build path (Newton + GPU + tiled-cholesky-hessian + not sparse_solve). Mirrors
-    # ``jac_relevant_dofs``/``jac_n_relevant_dofs`` but allocated independently so we don't have to flip
-    # ``sparse_solve`` semantics.
-    jac_csr_dofs: qd.Tensor
-    jac_csr_n_nz: qd.Tensor
     n_constraints_equality: qd.Tensor
     n_constraints_frictionloss: qd.Tensor
     improved: qd.Tensor
@@ -352,20 +350,19 @@ def get_constraint_state(constraint_solver, solver):
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
     efc_b_shape = maybe_shape((len_constraints_, _B), solver._options.noslip_iterations > 0)
-    jac_relevant_dofs_shape = maybe_shape(jac_shape, constraint_solver.sparse_solve)
-    jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), constraint_solver.sparse_solve)
-    # CSR sidecar for the sparse JTDAJ Hessian build path. Allocated when Newton is used with the
-    # tiled-cholesky-hessian GPU path AND sparse_solve=False (sparse_solve already maintains
-    # jac_relevant_dofs which serves the same role). We allocate eagerly inside `get_constraint_state`
-    # only when the gate matches so non-Newton solvers and CPU runs don't pay the memory cost.
+    # CSR sidecar for J: allocated when EITHER sparse_solve=True (CPU-tuned sparse solve path) OR when the
+    # Newton + GPU + tiled-cholesky-hessian + not-sparse_solve gate is on. In the latter case the constraint-
+    # construction kernels write the CSR rows alongside the dense jac writes (no separate per-substep scan
+    # pass), so the sparse JTDAJ Hessian build and sparse patch path can walk it directly.
     _csr_active = bool(
         getattr(solver._static_rigid_sim_config, "solver_type", None) == gs.constraint_solver.Newton
         and getattr(solver._static_rigid_sim_config, "enable_tiled_cholesky_hessian", False)
         and not constraint_solver.sparse_solve
         and gs.backend != gs.cpu
     )
-    jac_csr_dofs_shape = maybe_shape(jac_shape, _csr_active)
-    jac_csr_n_nz_shape = maybe_shape((len_constraints_, _B), _csr_active)
+    _csr_needed = constraint_solver.sparse_solve or _csr_active
+    jac_relevant_dofs_shape = maybe_shape(jac_shape, _csr_needed)
+    jac_n_relevant_dofs_shape = maybe_shape((len_constraints_, _B), _csr_needed)
 
     if math.prod(jac_shape) > np.iinfo(np.int32).max:
         gs.raise_exception(
@@ -436,15 +433,9 @@ def get_constraint_state(constraint_solver, solver):
         jac_relevant_dofs=V(
             dtype=gs.qd_int,
             shape=jac_relevant_dofs_shape,
-            layout=jac_layout if constraint_solver.sparse_solve else None,
+            layout=jac_layout if _csr_needed else None,
         ),
         jac_n_relevant_dofs=V(dtype=gs.qd_int, shape=jac_n_relevant_dofs_shape),
-        jac_csr_dofs=V(
-            dtype=gs.qd_int,
-            shape=jac_csr_dofs_shape,
-            layout=jac_layout if _csr_active else None,
-        ),
-        jac_csr_n_nz=V(dtype=gs.qd_int, shape=jac_csr_n_nz_shape),
         # Backward gradients
         dL_dqacc=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, _B), solver._requires_grad)),
         dL_dM=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, solver.n_dofs_, _B), solver._requires_grad)),
@@ -2123,6 +2114,12 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # When True, constraint-construction kernels also write the per-row CSR sidecar (jac_relevant_dofs /
+    # jac_n_relevant_dofs) alongside the dense Jacobian, so the sparse JTDAJ Hessian build and the sparse patch
+    # path can walk it without a separate per-substep scan kernel.  Independent of `sparse_solve` (which switches
+    # the whole solve to a CPU-tuned sparse path).  Set by the same gate as `_csr_active` in
+    # `get_constraint_state` (Newton + GPU + tiled-cholesky-hessian + not-sparse_solve).
+    csr_sidecar_enabled: bool = False
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.

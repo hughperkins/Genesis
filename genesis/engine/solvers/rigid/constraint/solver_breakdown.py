@@ -786,12 +786,12 @@ def _func_patch_hessian_delta(
     Two implementations selected statically:
 
     * **CSR sparse path** (Newton + GPU + tiled-cholesky-hessian + not-sparse_solve): per-env block of 32 threads,
-      each thread strides through ``n_changed`` constraints. For each changed constraint, walks the per-substep CSR
-      sidecar ``jac_csr_dofs[i_c, :n_nz, i_b]`` (only the non-zero DOFs, typically ~6 of 64 on dex_hand) and
+      each thread strides through ``n_changed`` constraints. For each changed constraint, walks the per-row CSR
+      sidecar ``jac_relevant_dofs[i_c, :n_nz, i_b]`` (only the non-zero DOFs, typically ~6 of 64 on dex_hand) and
       ``atomic_add``-s ``sign * Ji * Jj`` into ``nt_H[i_b, row, col]`` for each pair in the lower triangle. The
-      CSR is built once per substep by ``kernel_build_jac_csr`` (already paid by ``func_hessian_sparse_jtdaj``).
-      Mirrors mjwarp's ``update_gradient_h_incremental_sparse``; this is the round-3 attempt from
-      ``sparse_patch_delta_2026may22.md`` plus the CSR infrastructure from ``sparse_jtdaj_2026may22.md``.
+      CSR is emitted inline by the constraint-construction kernels (``csr_sidecar_enabled=True``; see
+      ``free_csr_2026may22.md``), so no separate per-substep scan pass is required.  Mirrors mjwarp's
+      ``update_gradient_h_incremental_sparse``.
 
     * **Dense fallback** (CPU, sparse_solve, non-tiled, or non-Newton): the original per-env block of 128 threads
       that walks all ``n_lower_tri`` entries and sums over ``n_changed`` constraints with dense J indexing. Used
@@ -835,16 +835,16 @@ def _func_patch_hessian_delta(
                 if not constraint_state.active[i_c, i_b]:
                     sign = -D
 
-                # CSR walk: descending DOF indices in jac_csr_dofs[i_c, :n_nz, i_b]. For pair (ii, jj) with jj < ii,
-                # DOF[ii] < DOF[jj] → row = DOF[jj], col = DOF[ii] lands in lower triangle. Diagonal pair (ii, ii)
-                # → row = col = DOF[ii].
-                n_nz = constraint_state.jac_csr_n_nz[i_c, i_b]
+                # CSR walk: descending DOF indices in jac_relevant_dofs[i_c, :n_nz, i_b]. For pair (ii, jj) with
+                # jj < ii, DOF[ii] < DOF[jj] → row = DOF[jj], col = DOF[ii] lands in lower triangle. Diagonal pair
+                # (ii, ii) → row = col = DOF[ii].
+                n_nz = constraint_state.jac_n_relevant_dofs[i_c, i_b]
                 for ii in range(n_nz):
-                    i_di = constraint_state.jac_csr_dofs[i_c, ii, i_b]
+                    i_di = constraint_state.jac_relevant_dofs[i_c, ii, i_b]
                     Ji = constraint_state.jac[i_c, i_di, i_b]
                     qd.atomic_add(constraint_state.nt_H[i_b, i_di, i_di], sign * Ji * Ji)
                     for jj in range(ii):
-                        i_dj = constraint_state.jac_csr_dofs[i_c, jj, i_b]
+                        i_dj = constraint_state.jac_relevant_dofs[i_c, jj, i_b]
                         Jj = constraint_state.jac[i_c, i_dj, i_b]
                         qd.atomic_add(constraint_state.nt_H[i_b, i_dj, i_di], sign * Ji * Jj)
                 change_idx = change_idx + BLOCK_DIM

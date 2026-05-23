@@ -472,9 +472,19 @@ class RigidSolver(KinematicSolver):
                 tiled_n_dofs = min(max(math.ceil(self.n_dofs / 32), 1), max_n_warps) * 32
                 tiled_n_dofs_per_entity = min(max(math.ceil(max_n_dofs_per_entity / 32), 1), max_n_warps) * 32
 
+                # csr_sidecar_enabled tracks the same gate as `_csr_active` in array_class.get_constraint_state:
+                # only the Newton + GPU + tiled-cholesky-hessian + not-sparse_solve path consumes the sidecar.
+                # When True, the constraint-construction kernels write jac_relevant_dofs / jac_n_relevant_dofs
+                # alongside the dense Jacobian (no separate per-substep scan pass needed).
+                csr_sidecar_enabled = (
+                    self._options.constraint_solver == gs.constraint_solver.Newton
+                    and enable_tiled_cholesky_hessian
+                    and not self._options.sparse_solve
+                )
                 static_rigid_sim_config.update(
                     enable_tiled_cholesky_mass_matrix=enable_tiled_cholesky_mass_matrix,
                     enable_tiled_cholesky_hessian=enable_tiled_cholesky_hessian,
+                    csr_sidecar_enabled=csr_sidecar_enabled,
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
                 )
