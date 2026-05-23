@@ -5027,6 +5027,7 @@ def func_solve_body_megakernel(
 @func_solve_body.register(
     is_compatible=lambda *args, **kwargs: (
         _os_e5.environ.get("GS_E5_MEGAKERNEL", "0") == "1"
+        and _os_e5.environ.get("GS_E5_BLOCK_DIM", "32") == "32"
         and not (cfg := _get_static_config(*args, **kwargs)).requires_grad
         and cfg.solver_type == gs.constraint_solver.Newton
         and not cfg.sparse_solve
@@ -5264,6 +5265,272 @@ def func_solve_body_megakernel_t32(
                             while i_d_s < n_dofs_static:
                                 constraint_state.search[i_d_s, i_b] = -constraint_state.Mgrad[i_d_s, i_b]
                                 i_d_s = i_d_s + 32
+                        qd.simt.block.sync()
+        else:
+            if tid == 0:
+                constraint_state.improved[i_b] = False
+
+
+@func_solve_body.register(
+    is_compatible=lambda *args, **kwargs: (
+        _os_e5.environ.get("GS_E5_MEGAKERNEL", "0") == "1"
+        and _os_e5.environ.get("GS_E5_BLOCK_DIM", "32") == "64"
+        and not (cfg := _get_static_config(*args, **kwargs)).requires_grad
+        and cfg.solver_type == gs.constraint_solver.Newton
+        and not cfg.sparse_solve
+        and cfg.cholesky_tile_size == 32
+    )
+)
+@qd.kernel(fastcache=True)
+def func_solve_body_megakernel_t32_b64(
+    entities_info: array_class.EntitiesInfo,
+    dofs_info: array_class.DofsInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    _n_iterations: int,
+):
+    """block_dim=64 variant of the t32 megakernel.
+
+    Hypothesis: hessian rebuild + linesearch p0 benefit from 2x more lanes; the Tile32x32 cholesky factor stays
+    at 32 lanes (sub-warp 1 redundantly computes the same factor — wasted work but no deadlock, since Tile32x32
+    uses subgroup-internal ops). update_constraint_coop and cholesky body sub keep stride 32 to avoid cross-warp
+    reduction refactor; sub-warp 1 does redundant work in those.
+
+    Net hypothesis: hessian-rebuild speedup at block_dim=64 outweighs the redundant-work cost in the other phases.
+    Enabled via GS_E5_MEGAKERNEL=1 GS_E5_BLOCK_DIM=64.
+    """
+    EPS_val = rigid_global_info.EPS[None]
+    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    _B = constraint_state.grad.shape[1]
+    n_dofs_static = constraint_state.qacc.shape[0]
+
+    qd.loop_config(name="solve_megakernel_t32_b64", block_dim=64)
+    for i_flat in range(_B * 64):
+        tid = i_flat % 64
+        i_b = i_flat // 64
+        if i_b >= _B:
+            continue
+
+        L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
+        v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
+
+        jac_row_sh = qd.simt.block.SharedArray((32, 32), gs.qd_float)
+        jac_col_sh = qd.simt.block.SharedArray((32, 32), gs.qd_float)
+        efc_D_sh = qd.simt.block.SharedArray((32,), gs.qd_float)
+
+        # 64-lane shmem reductions for linesearch_p0_coop and eval (both templated, use shmem tree reduction).
+        sh_ls0 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        sh_ls1 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        sh_ls2 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        sh_ls3 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        sh_ls4 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        sh_ls5 = qd.simt.block.SharedArray((64,), gs.qd_float)
+        # Cross-warp scratch (subgroup ops cap at 32 lanes; we combine two 32-lane sums via shmem).
+        sh_gn = qd.simt.block.SharedArray((2,), gs.qd_float)
+
+        if constraint_state.n_constraints[i_b] > 0:
+            local_iter = 0
+            keep_iterating = True
+            while keep_iterating:
+                if local_iter >= rigid_global_info.iterations[None]:
+                    keep_iterating = False
+                elif not constraint_state.improved[i_b]:
+                    keep_iterating = False
+                else:
+                    local_iter = local_iter + 1
+
+                    func_ls_init_and_eval_p0_coop(
+                        i_b,
+                        tid,
+                        qd.static(64),
+                        sh_ls0,
+                        sh_ls1,
+                        sh_ls2,
+                        sh_ls3,
+                        sh_ls4,
+                        sh_ls5,
+                        dofs_info,
+                        entities_info,
+                        dofs_state,
+                        constraint_state,
+                        rigid_global_info,
+                        static_rigid_sim_config,
+                    )
+                    qd.simt.block.sync()
+
+                    if constraint_state.improved[i_b]:
+                        alpha_newton = constraint_state.ls_alpha_newton[i_b]
+                        p0_cost = constraint_state.ls_p0_cost[i_b]
+                        gtol = constraint_state.ls_gtol[i_b]
+
+                        if alpha_newton > 0.0:
+                            if tid == 0:
+                                constraint_state.ls_alpha[i_b] = 0.0
+
+                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
+                                i_b, tid, alpha_newton, sh_ls0, sh_ls1, sh_ls2,
+                                constraint_state, rigid_global_info, qd.static(64),
+                            )
+                            if p0_cost < p1_cost:
+                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
+                                    i_b, tid, gs.qd_float(0.0), sh_ls0, sh_ls1, sh_ls2,
+                                    constraint_state, rigid_global_info, qd.static(64),
+                                )
+                            if p1_cost < p0_cost and tid == 0:
+                                constraint_state.ls_alpha[i_b] = p1_alpha
+
+                            if qd.abs(p1_deriv_0) > gtol:
+                                # Refine bracketing + polish uses 32-lane subgroup ops. Sub-warp 1 does
+                                # redundant work but reaches all syncs (no deadlock).
+                                res_alpha, ls_result = func_linesearch_refine(
+                                    i_b,
+                                    tid,
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    p0_cost,
+                                    gtol,
+                                    constraint_state,
+                                    rigid_global_info,
+                                    coop=True,
+                                )
+                                if tid == 0 and qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
+                                    constraint_state.ls_alpha[i_b] = res_alpha
+
+                        qd.simt.block.sync()
+                        alpha_val = constraint_state.ls_alpha[i_b]
+                        if tid == 0 and qd.abs(alpha_val) < EPS_val:
+                            constraint_state.improved[i_b] = False
+                    qd.simt.block.sync()
+
+                    if constraint_state.improved[i_b]:
+                        alpha_iter = constraint_state.ls_alpha[i_b]
+                        i_d_a = tid
+                        while i_d_a < n_dofs_static:
+                            constraint_state.qacc[i_d_a, i_b] = (
+                                constraint_state.qacc[i_d_a, i_b]
+                                + constraint_state.search[i_d_a, i_b] * alpha_iter
+                            )
+                            constraint_state.Ma[i_d_a, i_b] = (
+                                constraint_state.Ma[i_d_a, i_b] + constraint_state.mv[i_d_a, i_b] * alpha_iter
+                            )
+                            i_d_a = i_d_a + 64
+                        n_c_app = constraint_state.n_constraints[i_b]
+                        i_c_a = tid
+                        while i_c_a < n_c_app:
+                            constraint_state.Jaref[i_c_a, i_b] = (
+                                constraint_state.Jaref[i_c_a, i_b]
+                                + constraint_state.jv[i_c_a, i_b] * alpha_iter
+                            )
+                            i_c_a = i_c_a + 64
+                        qd.simt.block.sync()
+
+                        # update_constraint with _T=32, LOG2_T=5: sub-warp 1 redundantly processes constraints
+                        # that lanes 0-31 also process (benign races on active/efc_force writes; identical values).
+                        func_update_constraint_batch_coop(
+                            i_b,
+                            tid,
+                            constraint_state.qacc,
+                            constraint_state.Ma,
+                            constraint_state.cost,
+                            constraint_state.Jaref,
+                            constraint_state.jv,
+                            constraint_state.efc_D,
+                            constraint_state.efc_frictionloss,
+                            constraint_state.diag,
+                            constraint_state.active,
+                            constraint_state.prev_active,
+                            constraint_state.efc_force,
+                            constraint_state.qfrc_constraint,
+                            constraint_state.jac,
+                            constraint_state.n_constraints,
+                            constraint_state.n_constraints_equality,
+                            constraint_state.n_constraints_frictionloss,
+                            constraint_state.gauss,
+                            constraint_state.prev_cost,
+                            dofs_state.force,
+                            dofs_state.acc_smooth,
+                            static_rigid_sim_config,
+                            qd.static(32),
+                            qd.static(5),
+                        )
+                        qd.simt.block.sync()
+
+                        if tid == 0:
+                            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+                    qd.simt.block.sync()
+
+                    if constraint_state.improved[i_b]:
+                        skip_factor = (local_iter > 1) and (constraint_state.incr_n_changed[i_b] == 0)
+
+                        if not skip_factor:
+                            func_hessian_direct_tiled_body(
+                                i_b,
+                                tid,
+                                qd.static(64),
+                                jac_row_sh,
+                                jac_col_sh,
+                                efc_D_sh,
+                                constraint_state,
+                                rigid_global_info,
+                            )
+                            qd.simt.block.sync()
+
+                        i_d_g = tid
+                        while i_d_g < n_dofs_static:
+                            constraint_state.grad[i_d_g, i_b] = (
+                                constraint_state.Ma[i_d_g, i_b]
+                                - dofs_state.force[i_d_g, i_b]
+                                - constraint_state.qfrc_constraint[i_d_g, i_b]
+                            )
+                            i_d_g = i_d_g + 64
+                        qd.simt.block.sync()
+
+                        # Cholesky body: stride 32 internally (Tile32x32 needs 32 lanes per subgroup); sub-warp 1
+                        # redundantly computes the same factor.
+                        func_cholesky_and_solve_body_skip_t32(
+                            i_b,
+                            tid,
+                            L_sh,
+                            v_sh,
+                            skip_factor,
+                            constraint_state,
+                            rigid_global_info,
+                            static_rigid_sim_config,
+                        )
+                        qd.simt.block.sync()
+
+                        # Grad-norm: two-stage reduction (32-lane subgroup, then cross-warp via shmem).
+                        gn_partial = gs.qd_float(0.0)
+                        i_d_gn = tid
+                        while i_d_gn < n_dofs_static:
+                            g = constraint_state.grad[i_d_gn, i_b]
+                            gn_partial = gn_partial + g * g
+                            i_d_gn = i_d_gn + 64
+                        gn_sub = qd.simt.subgroup.reduce_all_add_tiled(gn_partial, 5)
+                        if tid == 0:
+                            sh_gn[0] = gn_sub
+                        if tid == 32:
+                            sh_gn[1] = gn_sub
+                        qd.simt.block.sync()
+                        gn_total = sh_gn[0] + sh_gn[1]
+
+                        grad_norm = qd.sqrt(gn_total)
+                        tol_scaled = (
+                            rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs_static)
+                        ) * rigid_global_info.tolerance[None]
+                        improvement = constraint_state.prev_cost[i_b] - constraint_state.cost[i_b]
+                        improved_local = grad_norm > tol_scaled and improvement > tol_scaled
+                        if tid == 0:
+                            constraint_state.improved[i_b] = improved_local
+                        if improved_local:
+                            i_d_s = tid
+                            while i_d_s < n_dofs_static:
+                                constraint_state.search[i_d_s, i_b] = -constraint_state.Mgrad[i_d_s, i_b]
+                                i_d_s = i_d_s + 64
                         qd.simt.block.sync()
         else:
             if tid == 0:
