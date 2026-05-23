@@ -1053,6 +1053,7 @@ def _kernel_solve_graph(
     is_compatible=lambda *args, **kwargs: (
         not (static_rigid_sim_config := solver._get_static_config(*args, **kwargs)).requires_grad
         and static_rigid_sim_config.prefer_decomposed_solver != 0
+        and not __import__("os").environ.get("GS_E5_MEGAKERNEL", "0") == "1"
     )
 )
 def func_solve_decomposed(

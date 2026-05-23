@@ -11,6 +11,8 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
 from genesis.utils._tile16 import Tile16x16Cholesky
+
+import os as _os_e5  # used by func_solve_body_megakernel registration (GS_E5_MEGAKERNEL=1 to force)
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
 
 from ..collider.contact_island import ContactIsland
@@ -4102,7 +4104,10 @@ def func_solve_body(
 
 
 @func_solve_body.register(
-    is_compatible=lambda *args, **kwargs: _get_static_config(*args, **kwargs).prefer_decomposed_solver != 1
+    is_compatible=lambda *args, **kwargs: (
+        _get_static_config(*args, **kwargs).prefer_decomposed_solver != 1
+        and not _os_e5.environ.get("GS_E5_MEGAKERNEL", "0") == "1"
+    )
 )
 @qd.kernel(fastcache=True)
 def func_solve_body_monolith(
@@ -4151,10 +4156,9 @@ def func_solve_body_monolith(
 
 @func_solve_body.register(
     is_compatible=lambda *args, **kwargs: (
-        not (cfg := _get_static_config(*args, **kwargs)).requires_grad
-        and cfg.prefer_decomposed_solver != 0
+        _os_e5.environ.get("GS_E5_MEGAKERNEL", "0") == "1"
+        and not (cfg := _get_static_config(*args, **kwargs)).requires_grad
         and cfg.solver_type == gs.constraint_solver.Newton
-        and cfg.enable_tiled_cholesky_hessian
         and not cfg.sparse_solve
     )
 )
