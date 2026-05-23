@@ -1107,12 +1107,10 @@ def func_convex_convex_contact(
                         is_mpr_guess_direction_available = (qd.abs(normal_ws) > EPS).any()
                         for i_mpr in range(2):
                             if i_mpr == 1:
-                                # Try without warm-start if no contact was detected using it.
-                                # When penetration depth is very shallow, MPR may wrongly classify two geometries as not
-                                # in contact while they actually are. This helps to improve contact persistence without
-                                # increasing much the overall computational cost since the fallback should not be
-                                # triggered very often.
-                                if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
+                                # [q1b-no-mpr-retry] retry-without-warmstart disabled to isolate its
+                                # contribution to the default-vs-compat contact-count gap. Restore by
+                                # changing `qd.static(False)` back to `qd.static(not ...enable_mujoco_compatibility)`.
+                                if qd.static(False):
                                     if (i_detection == 0) and not is_col and is_mpr_guess_direction_available:
                                         normal_ws = qd.Vector.zero(gs.qd_float, 3)
                                         is_mpr_guess_direction_available = False
@@ -1514,7 +1512,8 @@ def _func_multicontact_run_detection(
                 is_mpr_guess_direction_available = (qd.abs(normal_ws) > EPS).any()
                 for i_mpr in range(2):
                     if i_mpr == 1:
-                        if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
+                        # [q1b-no-mpr-retry] retry-without-warmstart disabled (was: not enable_mujoco_compatibility)
+                        if qd.static(False):
                             if is_initial_detection and not is_col and is_mpr_guess_direction_available:
                                 normal_ws = qd.Vector.zero(gs.qd_float, 3)
                                 is_mpr_guess_direction_available = False
@@ -2424,7 +2423,8 @@ def _func_narrowphase_contact0(
                     is_mpr_guess_direction_available = (qd.abs(normal_ws) > EPS).any()
                     for i_mpr in range(2):
                         if i_mpr == 1:
-                            if qd.static(not static_rigid_sim_config.enable_mujoco_compatibility):
+                            # [q1b-no-mpr-retry] retry-without-warmstart disabled (was: not enable_mujoco_compatibility)
+                            if qd.static(False):
                                 if not is_col and is_mpr_guess_direction_available:
                                     normal_ws = qd.Vector.zero(gs.qd_float, 3)
                                     is_mpr_guess_direction_available = False
