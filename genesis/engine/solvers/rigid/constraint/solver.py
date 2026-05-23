@@ -1943,36 +1943,33 @@ def func_cholesky_factor_direct_tiled(
 
 
 @qd.func
-def func_cholesky_and_solve_fused_tiled(
+def func_cholesky_and_solve_body(
+    i_b,
+    tid,
+    L_sh,
+    v_sh,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Fused Cholesky factorization and triangular solve, keeping L in shared memory.
+    """Per-env body of fused Cholesky factor + triangular solve.
 
-    Factorizes H = L L^T using register-resident 16x16 tiles, storing completed L tiles in shared memory. Then solves
-    L L^T x = g (forward + backward substitution) in-place and writes the result to Mgrad, without ever writing L to
-    global memory.
+    Operates on a single env (i_b) with the caller's 16-lane block (tid in 0..15) and pre-allocated shared memory:
+
+    - L_sh: SharedArray (MAX_DOFS, MAX_DOFS+1) — holds the factored L on return. Designed to PERSIST across multiple
+      calls (e.g. across Newton iters in a megakernel) so a future skip-unchanged path can reuse it without re-factor.
+    - v_sh: SharedArray (MAX_DOFS,) — scratch for forward/backward substitution.
+
+    Reads ``nt_H[i_b]`` as input (current Hessian). Writes ``Mgrad[i_b]`` as output.
+
+    Skips early if the env has no constraints or its improved flag is False — caller must NOT rely on L_sh being
+    overwritten in that case (callers wanting a clean L should check the flags themselves before calling).
     """
-    EPS = rigid_global_info.EPS[None]
-    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
-
-    _B = constraint_state.grad.shape[1]
-    n_dofs = constraint_state.nt_H.shape[1]
-    N_BLOCKS = (n_dofs + 16 - 1) // 16
-
-    qd.loop_config(name="cholesky_and_solve_fused_tiled", block_dim=16)
-    for i in range(_B * 16):
-        tid = i % 16
-        i_b = i // 16
-        if i_b >= _B:
-            continue
-        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
-            continue
-
-        # +1 padding avoids shared memory bank conflicts on column-wise access (backward substitution, factorization)
-        L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
-        v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
+    # Inverted gate (Quadrants doesn't allow `return` inside a non-static if).
+    if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+        EPS = rigid_global_info.EPS[None]
+        n_dofs = constraint_state.nt_H.shape[1]
+        N_BLOCKS = (n_dofs + 16 - 1) // 16
 
         # --- Blocked Cholesky factorization (same algorithm as func_cholesky_factor_direct_tiled) ---
         # Loop over column blocks sequentially: each column block depends on all prior columns (inherent to
@@ -2064,6 +2061,41 @@ def func_cholesky_and_solve_fused_tiled(
         while k < n_dofs:
             constraint_state.Mgrad[k, i_b] = v_sh[k]
             k = k + 16
+
+
+@qd.func
+def func_cholesky_and_solve_fused_tiled(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Fused Cholesky factorization and triangular solve, keeping L in shared memory.
+
+    Factorizes H = L L^T using register-resident 16x16 tiles, storing completed L tiles in shared memory. Then solves
+    L L^T x = g (forward + backward substitution) in-place and writes the result to Mgrad, without ever writing L to
+    global memory.
+
+    Thin wrapper around ``func_cholesky_and_solve_body``: allocates per-block shared memory and dispatches to the body
+    for each env. The body is reusable from a megakernel that owns its own outer parallel-for and wants to drive
+    cholesky as one phase of many (E5 path).
+    """
+    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    _B = constraint_state.grad.shape[1]
+
+    qd.loop_config(name="cholesky_and_solve_fused_tiled", block_dim=16)
+    for i in range(_B * 16):
+        tid = i % 16
+        i_b = i // 16
+        if i_b >= _B:
+            continue
+
+        # +1 padding avoids shared memory bank conflicts on column-wise access (backward substitution, factorization)
+        L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
+        v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
+
+        func_cholesky_and_solve_body(
+            i_b, tid, L_sh, v_sh, constraint_state, rigid_global_info, static_rigid_sim_config
+        )
 
 
 @qd.func
