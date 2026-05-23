@@ -3462,6 +3462,115 @@ def func_update_constraint_batch(
 
 
 @qd.func
+def func_update_constraint_batch_coop(
+    i_b,
+    tid,
+    qacc: qd.Tensor,
+    Ma: qd.Tensor,
+    cost: qd.Tensor,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """16-lane cooperative version of ``func_update_constraint_batch`` (for E5 megakernel).
+
+    Same semantics, but with the three serial-on-tid-0 loops parallelised over the 16 lanes:
+    1. Per-constraint active / efc_force / floss_cost reduction (stride 16 over n_c).
+    2. Per-dof qfrc_constraint accumulation (stride 16 over n_dofs).
+    3. Per-dof gauss reduction (stride 16, then 16-lane subgroup reduce).
+    4. Per-constraint quadratic-cost reduction (stride 16, then 16-lane subgroup reduce).
+
+    Caller must enter with all 16 lanes active. No internal block.sync(); the caller is responsible for syncing
+    afterwards if downstream phases depend on the writes to qfrc_constraint / gauss / cost / active / efc_force.
+    """
+    n_dofs = constraint_state.qfrc_constraint.shape[0]
+    n_c = constraint_state.n_constraints[i_b]
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+
+    if tid == 0:
+        constraint_state.prev_cost[i_b] = cost[i_b]
+
+    # Phase 1: per-constraint active / efc_force / floss_cost (stride 16).
+    floss_cost_partial = gs.qd_float(0.0)
+    i_c = tid
+    while i_c < n_c:
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+            constraint_state.prev_active[i_c, i_b] = constraint_state.active[i_c, i_b]
+        active_local = True
+
+        floss_force = gs.qd_float(0.0)
+        if ne <= i_c and i_c < nef:
+            f = constraint_state.efc_frictionloss[i_c, i_b]
+            r = constraint_state.diag[i_c, i_b]
+            rf = r * f
+            linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
+            linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
+            active_local = not (linear_neg or linear_pos)
+            floss_force = linear_neg * f + linear_pos * -f
+            floss_cost_local = linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b])
+            floss_cost_local = floss_cost_local + linear_pos * f * (-0.5 * rf + constraint_state.Jaref[i_c, i_b])
+            floss_cost_partial = floss_cost_partial + floss_cost_local
+        elif nef <= i_c:
+            active_local = constraint_state.Jaref[i_c, i_b] < 0
+
+        constraint_state.active[i_c, i_b] = active_local
+        constraint_state.efc_force[i_c, i_b] = floss_force + (
+            -constraint_state.Jaref[i_c, i_b] * constraint_state.efc_D[i_c, i_b] * active_local
+        )
+        i_c = i_c + 16
+    floss_cost_total = qd.simt.subgroup.reduce_all_add_tiled(floss_cost_partial, 4)
+    qd.simt.block.sync()
+
+    # Phase 2: per-dof qfrc_constraint accumulation (stride 16).
+    if qd.static(static_rigid_sim_config.sparse_solve):
+        # Sparse path: keep serial (jac_relevant_dofs has variable layout per i_c, hard to coop cleanly).
+        if tid == 0:
+            for i_d in range(n_dofs):
+                constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
+            for i_c2 in range(n_c):
+                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c2, i_b]):
+                    i_d = constraint_state.jac_relevant_dofs[i_c2, i_d_, i_b]
+                    constraint_state.qfrc_constraint[i_d, i_b] = (
+                        constraint_state.qfrc_constraint[i_d, i_b]
+                        + constraint_state.jac[i_c2, i_d, i_b] * constraint_state.efc_force[i_c2, i_b]
+                    )
+    else:
+        i_d = tid
+        while i_d < n_dofs:
+            qfrc = gs.qd_float(0.0)
+            for i_c2 in range(n_c):
+                qfrc = qfrc + constraint_state.jac[i_c2, i_d, i_b] * constraint_state.efc_force[i_c2, i_b]
+            constraint_state.qfrc_constraint[i_d, i_b] = qfrc
+            i_d = i_d + 16
+
+    # Phase 3: per-dof gauss reduction.
+    gauss_partial = gs.qd_float(0.0)
+    i_d = tid
+    while i_d < n_dofs:
+        v = 0.5 * (Ma[i_d, i_b] - dofs_state.force[i_d, i_b]) * (qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
+        gauss_partial = gauss_partial + v
+        i_d = i_d + 16
+    gauss_total = qd.simt.subgroup.reduce_all_add_tiled(gauss_partial, 4)
+
+    # Phase 4: per-constraint quadratic-cost reduction.
+    cost_q_partial = gs.qd_float(0.0)
+    i_c = tid
+    while i_c < n_c:
+        cost_q_partial = cost_q_partial + 0.5 * (
+            constraint_state.Jaref[i_c, i_b] ** 2
+            * constraint_state.efc_D[i_c, i_b]
+            * constraint_state.active[i_c, i_b]
+        )
+        i_c = i_c + 16
+    cost_q_total = qd.simt.subgroup.reduce_all_add_tiled(cost_q_partial, 4)
+
+    if tid == 0:
+        constraint_state.gauss[i_b] = gauss_total
+        cost[i_b] = floss_cost_total + gauss_total + cost_q_total
+
+
+@qd.func
 def _func_update_efc_force_body(
     i_c,
     i_b,
@@ -4320,10 +4429,10 @@ def func_solve_body_megakernel(
                 else:
                     local_iter = local_iter + 1
 
-                    # Phase 1-5: serial linesearch + apply alpha + update_constraint_batch.
-                    # Runs entirely on tid 0 (matches the monolith's per-env serialisation).
+                    # Phase 1: linesearch (still serial on tid 0; broadcast alpha via shared memory to all lanes).
+                    alpha_sh = qd.simt.block.SharedArray((1,), gs.qd_float)
                     if tid == 0:
-                        alpha = func_linesearch_batch(
+                        alpha_sh[0] = func_linesearch_batch(
                             i_b,
                             entities_info=entities_info,
                             dofs_state=dofs_state,
@@ -4331,34 +4440,54 @@ def func_solve_body_megakernel(
                             constraint_state=constraint_state,
                             static_rigid_sim_config=static_rigid_sim_config,
                         )
-                        if qd.abs(alpha) < EPS_val:
+                        if qd.abs(alpha_sh[0]) < EPS_val:
                             constraint_state.improved[i_b] = False
-                        else:
-                            for i_d in range(n_dofs_static):
-                                constraint_state.qacc[i_d, i_b] = (
-                                    constraint_state.qacc[i_d, i_b]
-                                    + constraint_state.search[i_d, i_b] * alpha
-                                )
-                                constraint_state.Ma[i_d, i_b] = (
-                                    constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
-                                )
-                            for i_c in range(constraint_state.n_constraints[i_b]):
-                                constraint_state.Jaref[i_c, i_b] = (
-                                    constraint_state.Jaref[i_c, i_b]
-                                    + constraint_state.jv[i_c, i_b] * alpha
-                                )
-                            func_update_constraint_batch(
-                                i_b,
-                                qacc=constraint_state.qacc,
-                                Ma=constraint_state.Ma,
-                                cost=constraint_state.cost,
-                                dofs_state=dofs_state,
-                                constraint_state=constraint_state,
-                                static_rigid_sim_config=static_rigid_sim_config,
-                            )
-                            # Phase 6: build changed constraint list (per-env serial).
-                            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
                     qd.simt.block.sync()
+
+                    if constraint_state.improved[i_b]:
+                        alpha = alpha_sh[0]
+
+                        # Phase 2: apply alpha to qacc / Ma (per-dof, stride 16).
+                        i_d_apply = tid
+                        while i_d_apply < n_dofs_static:
+                            constraint_state.qacc[i_d_apply, i_b] = (
+                                constraint_state.qacc[i_d_apply, i_b]
+                                + constraint_state.search[i_d_apply, i_b] * alpha
+                            )
+                            constraint_state.Ma[i_d_apply, i_b] = (
+                                constraint_state.Ma[i_d_apply, i_b]
+                                + constraint_state.mv[i_d_apply, i_b] * alpha
+                            )
+                            i_d_apply = i_d_apply + 16
+
+                        # Phase 3: apply alpha to Jaref (per-constraint, stride 16).
+                        n_c_apply = constraint_state.n_constraints[i_b]
+                        i_c_apply = tid
+                        while i_c_apply < n_c_apply:
+                            constraint_state.Jaref[i_c_apply, i_b] = (
+                                constraint_state.Jaref[i_c_apply, i_b]
+                                + constraint_state.jv[i_c_apply, i_b] * alpha
+                            )
+                            i_c_apply = i_c_apply + 16
+                        qd.simt.block.sync()
+
+                        # Phase 4: update constraint state (16-lane cooperative).
+                        func_update_constraint_batch_coop(
+                            i_b,
+                            tid,
+                            constraint_state.qacc,
+                            constraint_state.Ma,
+                            constraint_state.cost,
+                            dofs_state,
+                            constraint_state,
+                            static_rigid_sim_config,
+                        )
+                        qd.simt.block.sync()
+
+                        # Phase 5: build changed constraint list (per-env serial on tid 0; cheap).
+                        if tid == 0:
+                            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+                        qd.simt.block.sync()
 
                     if constraint_state.improved[i_b]:
                         # Decide whether the active set is unchanged enough to skip the factor.
