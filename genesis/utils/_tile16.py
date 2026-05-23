@@ -642,14 +642,7 @@ def _make_tile16x16_class(dtype):
 
             L is a Tile16x16 holding the lower-triangular Cholesky factor (from cholesky_).  On return, self holds
             the solution X.
-
-            deskai9 Opp-B (2026-05-22): pre-invert L's diagonal once outside the column loop
-            to save the per-column divide. Microbench saved 0.4% wall-time / ~15-40 FFMA per
-            lane (target gap to mjwarp's 125 FFMA/tile was 82, see T6).
             """
-            tid = qd.i32(qd.simt.subgroup.invocation_id())
-            inv_diag_local = qd.cast(1.0, dtype) / L._get_col(tid)  # type: ignore[reportOperatorIssue]
-
             for c in range(16):
                 dot = qd.cast(0.0, dtype)
                 for j in range(16):
@@ -657,8 +650,8 @@ def _make_tile16x16_class(dtype):
                         Lkj = qd.simt.subgroup.shuffle(L._get_col(j), qd.u32(c))
                         dot += self._get_col(j) * Lkj  # type: ignore[reportOperatorIssue]
 
-                inv_diag_c = qd.simt.subgroup.shuffle(inv_diag_local, qd.u32(c))
-                new_val = (self._get_col(c) - dot) * inv_diag_c  # type: ignore[reportOperatorIssue]
+                diag_c = qd.simt.subgroup.shuffle(L._get_col(c), qd.u32(c))
+                new_val = (self._get_col(c) - dot) / diag_c  # type: ignore[reportOperatorIssue]
                 self._set_col(c, new_val)
 
         def solve_triangular_(self, B: Any, lower: bool = True) -> None:
