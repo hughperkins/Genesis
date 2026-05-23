@@ -668,6 +668,87 @@ def _make_tile32x32_class(dtype):
                 self.r31 = val
 
         @qd.func
+        def _set_col_static(self, k: qd.template(), val):
+            """Template-specialized variant of ``_set_col`` for use at qd.static-unrolled call sites in cholesky_.
+
+            With ``k`` declared ``qd.template()``, quadrants emits one specialization of this @qd.func per unique
+            python-int ``k`` value (cached and reused across call sites).  Inside a specialization ``k`` is a
+            python int, so the 32-way ``if k == N: self.rN = val`` cascade Python-folds: only the matching branch
+            is walked by the AST transformer, the other 31 evaluate to const-False and are skipped without body
+            traversal.
+
+            Compared to inlining the cascade at the call site (the original S1 form), this replaces the per-site
+            cascade walk (32 if-node walks × 32 outer-k iters × 2 sites = 2048 walks inside ``cholesky_``) with
+            32 cached specialization traces of ~3 nodes each (~100 walks total).  Generated PTX should be
+            byte-identical: each specialization emits exactly one ``self.rN = val`` line, same as the inline
+            cascade folds to today.
+            """
+            if k == 0:
+                self.r0 = val
+            if k == 1:
+                self.r1 = val
+            if k == 2:
+                self.r2 = val
+            if k == 3:
+                self.r3 = val
+            if k == 4:
+                self.r4 = val
+            if k == 5:
+                self.r5 = val
+            if k == 6:
+                self.r6 = val
+            if k == 7:
+                self.r7 = val
+            if k == 8:
+                self.r8 = val
+            if k == 9:
+                self.r9 = val
+            if k == 10:
+                self.r10 = val
+            if k == 11:
+                self.r11 = val
+            if k == 12:
+                self.r12 = val
+            if k == 13:
+                self.r13 = val
+            if k == 14:
+                self.r14 = val
+            if k == 15:
+                self.r15 = val
+            if k == 16:
+                self.r16 = val
+            if k == 17:
+                self.r17 = val
+            if k == 18:
+                self.r18 = val
+            if k == 19:
+                self.r19 = val
+            if k == 20:
+                self.r20 = val
+            if k == 21:
+                self.r21 = val
+            if k == 22:
+                self.r22 = val
+            if k == 23:
+                self.r23 = val
+            if k == 24:
+                self.r24 = val
+            if k == 25:
+                self.r25 = val
+            if k == 26:
+                self.r26 = val
+            if k == 27:
+                self.r27 = val
+            if k == 28:
+                self.r28 = val
+            if k == 29:
+                self.r29 = val
+            if k == 30:
+                self.r30 = val
+            if k == 31:
+                self.r31 = val
+
+        @qd.func
         def _ger_sub(self, a, b):
             """General rank-1 subtract in-place: self -= a @ b^T."""
             for j in qd.static(range(32)):
@@ -759,70 +840,7 @@ def _make_tile32x32_class(dtype):
                 diag_val = qd.cast(0.0, dtype)
                 if tid == k:
                     diag_val = qd.sqrt(qd.max(self._r(k) - my_norm_sq, eps))
-                    if k == 0:
-                        self.r0 = diag_val
-                    if k == 1:
-                        self.r1 = diag_val
-                    if k == 2:
-                        self.r2 = diag_val
-                    if k == 3:
-                        self.r3 = diag_val
-                    if k == 4:
-                        self.r4 = diag_val
-                    if k == 5:
-                        self.r5 = diag_val
-                    if k == 6:
-                        self.r6 = diag_val
-                    if k == 7:
-                        self.r7 = diag_val
-                    if k == 8:
-                        self.r8 = diag_val
-                    if k == 9:
-                        self.r9 = diag_val
-                    if k == 10:
-                        self.r10 = diag_val
-                    if k == 11:
-                        self.r11 = diag_val
-                    if k == 12:
-                        self.r12 = diag_val
-                    if k == 13:
-                        self.r13 = diag_val
-                    if k == 14:
-                        self.r14 = diag_val
-                    if k == 15:
-                        self.r15 = diag_val
-                    if k == 16:
-                        self.r16 = diag_val
-                    if k == 17:
-                        self.r17 = diag_val
-                    if k == 18:
-                        self.r18 = diag_val
-                    if k == 19:
-                        self.r19 = diag_val
-                    if k == 20:
-                        self.r20 = diag_val
-                    if k == 21:
-                        self.r21 = diag_val
-                    if k == 22:
-                        self.r22 = diag_val
-                    if k == 23:
-                        self.r23 = diag_val
-                    if k == 24:
-                        self.r24 = diag_val
-                    if k == 25:
-                        self.r25 = diag_val
-                    if k == 26:
-                        self.r26 = diag_val
-                    if k == 27:
-                        self.r27 = diag_val
-                    if k == 28:
-                        self.r28 = diag_val
-                    if k == 29:
-                        self.r29 = diag_val
-                    if k == 30:
-                        self.r30 = diag_val
-                    if k == 31:
-                        self.r31 = diag_val
+                    self._set_col_static(k, diag_val)
 
                 diag_k = qd.simt.subgroup.shuffle(diag_val, qd.u32(k))
 
@@ -841,70 +859,7 @@ def _make_tile32x32_class(dtype):
                 new_val = qd.cast(0.0, dtype)
                 if tid > k:  # type: ignore[reportOperatorIssue]
                     new_val = (self._r(k) - dot) / diag_k  # type: ignore[reportOperatorIssue]
-                    if k == 0:
-                        self.r0 = new_val
-                    if k == 1:
-                        self.r1 = new_val
-                    if k == 2:
-                        self.r2 = new_val
-                    if k == 3:
-                        self.r3 = new_val
-                    if k == 4:
-                        self.r4 = new_val
-                    if k == 5:
-                        self.r5 = new_val
-                    if k == 6:
-                        self.r6 = new_val
-                    if k == 7:
-                        self.r7 = new_val
-                    if k == 8:
-                        self.r8 = new_val
-                    if k == 9:
-                        self.r9 = new_val
-                    if k == 10:
-                        self.r10 = new_val
-                    if k == 11:
-                        self.r11 = new_val
-                    if k == 12:
-                        self.r12 = new_val
-                    if k == 13:
-                        self.r13 = new_val
-                    if k == 14:
-                        self.r14 = new_val
-                    if k == 15:
-                        self.r15 = new_val
-                    if k == 16:
-                        self.r16 = new_val
-                    if k == 17:
-                        self.r17 = new_val
-                    if k == 18:
-                        self.r18 = new_val
-                    if k == 19:
-                        self.r19 = new_val
-                    if k == 20:
-                        self.r20 = new_val
-                    if k == 21:
-                        self.r21 = new_val
-                    if k == 22:
-                        self.r22 = new_val
-                    if k == 23:
-                        self.r23 = new_val
-                    if k == 24:
-                        self.r24 = new_val
-                    if k == 25:
-                        self.r25 = new_val
-                    if k == 26:
-                        self.r26 = new_val
-                    if k == 27:
-                        self.r27 = new_val
-                    if k == 28:
-                        self.r28 = new_val
-                    if k == 29:
-                        self.r29 = new_val
-                    if k == 30:
-                        self.r30 = new_val
-                    if k == 31:
-                        self.r31 = new_val
+                    self._set_col_static(k, new_val)
                 if tid > k:  # type: ignore[reportOperatorIssue]
                     my_norm_sq += new_val * new_val
 
