@@ -34,6 +34,25 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(scope="session")
+def bench_mujoco_compat(pytestconfig):
+    """Read the --mujoco-compatibility CLI flag (added in conftest.py).
+
+    When True, all benchmark scenes in this file force enable_mujoco_compatibility=True
+    on the rigid solver options.
+    """
+    return pytestconfig.getoption("--mujoco-compatibility")
+
+
+def _mujoco_compat_kwargs(mujoco_compat):
+    """Returns {'enable_mujoco_compatibility': True} when mujoco_compat is True, else {}.
+
+    Used to splat into RigidOptions / get_rigid_solver_options so the override is only
+    applied when the --mujoco-compatibility pytest flag is set.
+    """
+    return dict(enable_mujoco_compatibility=True) if mujoco_compat else {}
+
+
 def get_rigid_solver_options(**kwargs):
     timestamp = get_git_commit_timestamp()
 
@@ -216,13 +235,14 @@ def get_file_morph_options(**kwargs):
 # ---------------------------------------------------------------------------
 
 
-def make_go2(n_envs, solver=None, gjk=None, **scene_kwargs):
+def make_go2(n_envs, solver=None, gjk=None, mujoco_compat=False, **scene_kwargs):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
                 **(dict(constraint_solver=solver) if solver is not None else {}),
                 **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+                **_mujoco_compat_kwargs(mujoco_compat),
             )
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
@@ -261,13 +281,16 @@ def make_go2(n_envs, solver=None, gjk=None, **scene_kwargs):
     return scene, step, SceneMeta(compile_time=compile_time)
 
 
-def make_anymal(n_envs, solver=None, gjk=None, control=None, with_kinematic=False, **scene_kwargs):
+def make_anymal(
+    n_envs, solver=None, gjk=None, control=None, with_kinematic=False, mujoco_compat=False, **scene_kwargs
+):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
                 dt=STEP_DT,
                 **(dict(constraint_solver=solver) if solver is not None else {}),
                 **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+                **_mujoco_compat_kwargs(mujoco_compat),
             )
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
@@ -318,7 +341,14 @@ def make_anymal(n_envs, solver=None, gjk=None, control=None, with_kinematic=Fals
 
 
 def make_franka(
-    n_envs, solver=None, gjk=None, is_collision_free=False, is_randomized=False, accessors=False, **scene_kwargs
+    n_envs,
+    solver=None,
+    gjk=None,
+    is_collision_free=False,
+    is_randomized=False,
+    accessors=False,
+    mujoco_compat=False,
+    **scene_kwargs,
 ):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
@@ -327,6 +357,7 @@ def make_franka(
                 enable_neutral_collision=True,
                 **(dict(constraint_solver=solver) if solver is not None else {}),
                 **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+                **_mujoco_compat_kwargs(mujoco_compat),
             )
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
@@ -396,11 +427,12 @@ def make_franka(
     return scene, step, SceneMeta(compile_time=compile_time)
 
 
-def make_duck_in_box(n_envs, solver=None, gjk=None, hard=False, **scene_kwargs):
+def make_duck_in_box(n_envs, solver=None, gjk=None, hard=False, mujoco_compat=False, **scene_kwargs):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **(dict(constraint_solver=solver) if solver is not None else {}),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            **_mujoco_compat_kwargs(mujoco_compat),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
     )
@@ -445,7 +477,7 @@ def make_duck_in_box(n_envs, solver=None, gjk=None, hard=False, **scene_kwargs):
     return scene, step, SceneMeta(compile_time=compile_time)
 
 
-def make_box_pyramid(n_envs, solver=None, gjk=None, n_cubes=3, **scene_kwargs):
+def make_box_pyramid(n_envs, solver=None, gjk=None, n_cubes=3, mujoco_compat=False, **scene_kwargs):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
@@ -453,6 +485,7 @@ def make_box_pyramid(n_envs, solver=None, gjk=None, n_cubes=3, **scene_kwargs):
                 tolerance=1e-5,
                 **(dict(constraint_solver=solver) if solver is not None else {}),
                 **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+                **_mujoco_compat_kwargs(mujoco_compat),
             )
         ),
         **{
@@ -495,7 +528,7 @@ def make_box_pyramid(n_envs, solver=None, gjk=None, n_cubes=3, **scene_kwargs):
     return scene, step, SceneMeta(compile_time=compile_time)
 
 
-def make_g1_fall(n_envs, solver=None, gjk=None, **scene_kwargs):
+def make_g1_fall(n_envs, solver=None, gjk=None, mujoco_compat=False, **scene_kwargs):
     step_dt = 0.005
 
     scene = gs.Scene(
@@ -506,6 +539,7 @@ def make_g1_fall(n_envs, solver=None, gjk=None, **scene_kwargs):
             ls_iterations=20,
             **(dict(constraint_solver=solver) if solver is not None else {}),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            **_mujoco_compat_kwargs(mujoco_compat),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
     )
@@ -550,7 +584,7 @@ def make_g1_fall(n_envs, solver=None, gjk=None, **scene_kwargs):
     )
 
 
-def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, **scene_kwargs):
+def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, mujoco_compat=False, **scene_kwargs):
     _STEP_DT = 1.0 / 30
     TABLE_Z = 0.762
 
@@ -562,6 +596,7 @@ def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, **
             sparse_solve=sparse_solve,
             **(dict(constraint_solver=solver) if solver is not None else {}),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            **_mujoco_compat_kwargs(mujoco_compat),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
     )
@@ -624,7 +659,7 @@ def make_shadow_hand_cubes(n_envs, solver=None, gjk=None, sparse_solve=False, **
     )
 
 
-def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
+def make_dex_hand(n_envs, solver=None, gjk=None, mujoco_compat=False, **scene_kwargs):
     shadow_hand_path = Path(get_hf_dataset(pattern="shadow_hand/*"))
     dex_path = Path(get_hf_dataset(pattern="dex/*"))
 
@@ -681,6 +716,7 @@ def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
         rigid_options=gs.options.RigidOptions(
             max_collision_pairs=200,
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
+            **_mujoco_compat_kwargs(mujoco_compat),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
     )
@@ -875,116 +911,138 @@ def factory_logger(stream_writers):
 
 
 @pytest.fixture
-def go2(solver, n_envs, gjk):
-    _, step_fn, meta = make_go2(n_envs, solver=solver, gjk=gjk)
+def go2(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_go2(n_envs, solver=solver, gjk=gjk, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def anymal_zero(solver, n_envs, gjk):
-    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control=None)
+def anymal_zero(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control=None, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def anymal_uniform(solver, n_envs, gjk):
-    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="uniform")
+def anymal_uniform(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="uniform", mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def anymal_random(solver, n_envs, gjk):
-    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="per_env")
+def anymal_random(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="per_env", mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def anymal_uniform_kinematic(solver, n_envs, gjk):
-    _, step_fn, meta = make_anymal(n_envs, solver=solver, gjk=gjk, control="uniform", with_kinematic=True)
+def anymal_uniform_kinematic(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_anymal(
+        n_envs, solver=solver, gjk=gjk, control="uniform", with_kinematic=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def franka(solver, n_envs, gjk):
-    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk)
+def franka(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def franka_random(solver, n_envs, gjk):
-    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_randomized=True)
+def franka_random(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_franka(
+        n_envs, solver=solver, gjk=gjk, is_randomized=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def franka_free(solver, n_envs, gjk):
-    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_collision_free=True)
+def franka_free(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_franka(
+        n_envs, solver=solver, gjk=gjk, is_collision_free=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def franka_accessors(solver, n_envs, gjk):
-    _, step_fn, meta = make_franka(n_envs, solver=solver, gjk=gjk, is_collision_free=True, accessors=True)
+def franka_accessors(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_franka(
+        n_envs, solver=solver, gjk=gjk, is_collision_free=True, accessors=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def duck_in_box_easy(solver, n_envs, gjk):
-    _, step_fn, meta = make_duck_in_box(n_envs, solver=solver, gjk=gjk, hard=False)
+def duck_in_box_easy(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_duck_in_box(
+        n_envs, solver=solver, gjk=gjk, hard=False, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def duck_in_box_hard(solver, n_envs, gjk):
-    _, step_fn, meta = make_duck_in_box(n_envs, solver=solver, gjk=gjk, hard=True)
+def duck_in_box_hard(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_duck_in_box(
+        n_envs, solver=solver, gjk=gjk, hard=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def box_pyramid_3(solver, n_envs, gjk):
-    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=3)
+def box_pyramid_3(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_box_pyramid(
+        n_envs, solver=solver, gjk=gjk, n_cubes=3, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def box_pyramid_4(solver, n_envs, gjk):
-    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=4)
+def box_pyramid_4(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_box_pyramid(
+        n_envs, solver=solver, gjk=gjk, n_cubes=4, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def box_pyramid_5(solver, n_envs, gjk):
-    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=5)
+def box_pyramid_5(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_box_pyramid(
+        n_envs, solver=solver, gjk=gjk, n_cubes=5, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def box_pyramid_6(solver, n_envs, gjk):
-    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=6)
+def box_pyramid_6(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_box_pyramid(
+        n_envs, solver=solver, gjk=gjk, n_cubes=6, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def g1_fall(solver, n_envs, gjk):
-    _, step_fn, meta = make_g1_fall(n_envs, solver=solver, gjk=gjk)
+def g1_fall(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_g1_fall(n_envs, solver=solver, gjk=gjk, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def shadow_hand_cubes(solver, n_envs, gjk):
-    _, step_fn, meta = make_shadow_hand_cubes(n_envs, solver=solver, gjk=gjk)
+def shadow_hand_cubes(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_shadow_hand_cubes(n_envs, solver=solver, gjk=gjk, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def shadow_hand_cubes_sparse(solver, n_envs, gjk):
-    _, step_fn, meta = make_shadow_hand_cubes(n_envs, solver=solver, gjk=gjk, sparse_solve=True)
+def shadow_hand_cubes_sparse(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_shadow_hand_cubes(
+        n_envs, solver=solver, gjk=gjk, sparse_solve=True, mujoco_compat=bench_mujoco_compat
+    )
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
 @pytest.fixture
-def dex_hand(solver, n_envs, gjk):
-    _, step_fn, meta = make_dex_hand(n_envs, solver=solver, gjk=gjk)
+def dex_hand(solver, n_envs, gjk, bench_mujoco_compat):
+    _, step_fn, meta = make_dex_hand(n_envs, solver=solver, gjk=gjk, mujoco_compat=bench_mujoco_compat)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
@@ -1030,7 +1088,7 @@ def dex_hand(solver, n_envs, gjk):
         ("dex_hand", None, None, 4096, gs.gpu),
     ],
 )
-def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):
+def test_speed(factory_logger, request, runnable, solver, gjk, n_envs, bench_mujoco_compat):
     with factory_logger(
         {
             "env": runnable,
@@ -1038,6 +1096,7 @@ def test_speed(factory_logger, request, runnable, solver, gjk, n_envs):
             **({"constraint_solver": solver} if solver is not None else {}),
             "use_contact_island": False,
             **({"gjk_collision": gjk} if gjk is not None else {}),
+            **({"mujoco_compatibility": True} if bench_mujoco_compat else {}),
         }
     ) as logger:
         logger.write(request.getfixturevalue(runnable))

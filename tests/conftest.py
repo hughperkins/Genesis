@@ -508,6 +508,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="speed_test.txt",
         help="Base filepath for speed test reports (default: speed_test.txt).",
     )
+    parser.addoption(
+        "--mujoco-compatibility",
+        action="store_true",
+        default=False,
+        help="Force enable_mujoco_compatibility=True in rigid solver options for benchmarks "
+             "(test_rigid_benchmarks.py).",
+    )
 
 
 @pytest.fixture(scope="session")
