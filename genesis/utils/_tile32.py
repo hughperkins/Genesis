@@ -826,17 +826,20 @@ def _make_tile32x32_class(dtype):
 
                 diag_k = qd.simt.subgroup.shuffle(diag_val, qd.u32(k))
 
-                dot0 = qd.cast(0.0, dtype)
-                dot1 = qd.cast(0.0, dtype)
-                for j in qd.static(range(32)):
-                    if k > j:
-                        my_col = self._r(j)
-                        Lkj = qd.simt.subgroup.shuffle(my_col, qd.u32(k))
-                        if j % 2 == 0:
-                            dot0 += Lkj * my_col  # type: ignore[reportOperatorIssue]
-                        else:
-                            dot1 += Lkj * my_col  # type: ignore[reportOperatorIssue]
-                dot = dot0 + dot1
+                # F6: runtime inner-j loop (length k) instead of qd.static(range(32)) with `if k > j` predicate.
+                # Trades the 1024-iter static unroll (32 outer x 32 inner) for a single runtime loop body that
+                # iterates 0+1+...+31 = 496 times across all outer-k iters.  AST shrinks ~16x for the inner loop;
+                # LLVM sees ~300 ops in the inner body instead of ~5000.  Cost: self._get_col(j) with runtime j
+                # is a 32-way cascade switch table -- if quadrants lowers it to register-indexed `selp`/`shfl`
+                # chains, runtime is preserved; if it falls back to local memory the +2.6 % win evaporates.
+                #
+                # Dropped the 2-way dot0/dot1 split: it depended on static j to interleave even/odd accumulators
+                # for ILP.  With runtime j the GPU scheduler has to extract ILP from the single FMA chain itself.
+                dot = qd.cast(0.0, dtype)
+                for j in range(k):
+                    my_col = self._get_col(j)
+                    Lkj = qd.simt.subgroup.shuffle(my_col, qd.u32(k))
+                    dot += Lkj * my_col  # type: ignore[reportOperatorIssue]
 
                 new_val = qd.cast(0.0, dtype)
                 if tid > k:  # type: ignore[reportOperatorIssue]
