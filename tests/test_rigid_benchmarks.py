@@ -941,6 +941,18 @@ def duck_in_box_hard(solver, n_envs, gjk):
 
 
 @pytest.fixture
+def box_pyramid_1(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=1)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_2(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=2)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
 def box_pyramid_3(solver, n_envs, gjk):
     _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=3)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
@@ -961,6 +973,18 @@ def box_pyramid_5(solver, n_envs, gjk):
 @pytest.fixture
 def box_pyramid_6(solver, n_envs, gjk):
     _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=6)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_7(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=7)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
+@pytest.fixture
+def box_pyramid_8(solver, n_envs, gjk):
+    _, step_fn, meta = make_box_pyramid(n_envs, solver=solver, gjk=gjk, n_cubes=8)
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
@@ -1019,11 +1043,15 @@ def dex_hand(solver, n_envs, gjk):
         ("franka_random", gs.constraint_solver.CG, None, 30000, gs.gpu),
         ("franka_random", gs.constraint_solver.Newton, None, 30000, gs.gpu),
         ("franka_random", None, None, 0, gs.cpu),
+        ("box_pyramid_1", None, None, 4096, gs.gpu),
+        ("box_pyramid_2", None, None, 4096, gs.gpu),
         ("box_pyramid_3", None, None, 4096, gs.gpu),
         ("box_pyramid_4", None, None, 4096, gs.gpu),
         ("box_pyramid_5", None, None, 4096, gs.gpu),
         ("box_pyramid_6", None, True, 4096, gs.gpu),
         ("box_pyramid_6", None, False, 4096, gs.gpu),
+        ("box_pyramid_7", None, None, 4096, gs.gpu),
+        ("box_pyramid_8", None, None, 4096, gs.gpu),
         ("g1_fall", gs.constraint_solver.Newton, None, 4096, gs.gpu),
         ("shadow_hand_cubes", None, None, 0, gs.cpu),
         ("shadow_hand_cubes_sparse", None, None, 0, gs.cpu),
