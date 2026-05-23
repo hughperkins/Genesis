@@ -468,7 +468,8 @@ def func_contact_orthogonals(
     axis_0 = qd.Vector.zero(gs.qd_float, 3)
     axis_1 = qd.Vector.zero(gs.qd_float, 3)
 
-    if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+    # [q1b-pattern-frame] force compat-style mju_makeFrame to isolate frame contribution
+    if qd.static(True):
         # Choose between world axes Y or Z to avoid colinearity issue
         if qd.abs(normal[1]) < 0.5:
             axis_0[1] = 1.0

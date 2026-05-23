@@ -1019,7 +1019,9 @@ def func_convex_convex_contact(
 
             # Apply perturbations to thread-local state
             if multi_contact and is_col_0:
-                if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+                # [q1b-pattern-frame] force compat-style single-axis perturbation pattern
+                # to isolate its contribution to the contact-count gap.
+                if qd.static(True):
                     # Match MuJoCo's perturbation pattern: single axis at a time
                     # i_detection 1: (axis_0, -angle), 2: (axis_0, +angle),
                     # 3: (axis_1, -angle), 4: (axis_1, +angle)
