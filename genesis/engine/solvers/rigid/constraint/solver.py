@@ -1700,14 +1700,14 @@ def func_hessian_direct_tiled(
     instead of rebuilt).
 
     When ``static_rigid_sim_config.sparse_solve`` is True (and n_dofs is small enough to fit in a single block of
-    shared memory), uses an MJWarp-style sparse scatter via per-constraint ``jac_relevant_dofs`` lists and shared-
-    memory ``atomic_add``. This is significantly faster on scenes where the Jacobian has few nnz per row
-    (e.g. dex_hand has ~5 nnz / 62 dofs per constraint).
+    shared memory), an MJWarp-style sparse scatter via per-constraint ``jac_relevant_dofs`` lists and shared-memory
+    ``atomic_add`` is available (``_func_hessian_direct_tiled_sparse``). On dex_hand we found the dense tiled path
+    is actually faster (312 us/call sparse-scatter vs 252 us/call dense-tile -- shmem atomics + indirect global
+    reads outweigh the sparsity benefit on this workload), so we route sparse_solve to the dense path by default
+    here. The sparse-scatter variant is preserved for future workloads where the FMA-skip from sparsity is large
+    enough to amortise the atomic overhead.
     """
-    if qd.static(static_rigid_sim_config.sparse_solve):
-        _func_hessian_direct_tiled_sparse(constraint_state, rigid_global_info, check_full_hessian)
-    else:
-        _func_hessian_direct_tiled_dense(constraint_state, rigid_global_info, check_full_hessian)
+    _func_hessian_direct_tiled_dense(constraint_state, rigid_global_info, check_full_hessian)
 
 
 @qd.func
