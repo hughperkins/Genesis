@@ -11,6 +11,7 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
 from genesis.utils._tile16 import Tile16x16Cholesky
+from genesis.utils._tile32 import Tile32x32Cholesky
 
 import os as _os_e5  # used by func_solve_body_megakernel registration (GS_E5_MEGAKERNEL=1 to force)
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
