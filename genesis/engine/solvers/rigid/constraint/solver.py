@@ -4429,10 +4429,11 @@ def func_solve_body_megakernel(
                 else:
                     local_iter = local_iter + 1
 
-                    # Phase 1: linesearch (still serial on tid 0; broadcast alpha via shared memory to all lanes).
-                    alpha_sh = qd.simt.block.SharedArray((1,), gs.qd_float)
+                    # Phase 1-5: linesearch + apply alpha + update_constraint + build_changed_list (serial on tid 0).
+                    # The apply-alpha loops and update_constraint inner loops are the next coop candidates but
+                    # require struct-field-analysis-aware refactoring; left as future work.
                     if tid == 0:
-                        alpha_sh[0] = func_linesearch_batch(
+                        alpha = func_linesearch_batch(
                             i_b,
                             entities_info=entities_info,
                             dofs_state=dofs_state,
@@ -4440,54 +4441,33 @@ def func_solve_body_megakernel(
                             constraint_state=constraint_state,
                             static_rigid_sim_config=static_rigid_sim_config,
                         )
-                        if qd.abs(alpha_sh[0]) < EPS_val:
+                        if qd.abs(alpha) < EPS_val:
                             constraint_state.improved[i_b] = False
-                    qd.simt.block.sync()
-
-                    if constraint_state.improved[i_b]:
-                        alpha = alpha_sh[0]
-
-                        # Phase 2: apply alpha to qacc / Ma (per-dof, stride 16).
-                        i_d_apply = tid
-                        while i_d_apply < n_dofs_static:
-                            constraint_state.qacc[i_d_apply, i_b] = (
-                                constraint_state.qacc[i_d_apply, i_b]
-                                + constraint_state.search[i_d_apply, i_b] * alpha
+                        else:
+                            for i_d in range(n_dofs_static):
+                                constraint_state.qacc[i_d, i_b] = (
+                                    constraint_state.qacc[i_d, i_b]
+                                    + constraint_state.search[i_d, i_b] * alpha
+                                )
+                                constraint_state.Ma[i_d, i_b] = (
+                                    constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+                                )
+                            for i_c in range(constraint_state.n_constraints[i_b]):
+                                constraint_state.Jaref[i_c, i_b] = (
+                                    constraint_state.Jaref[i_c, i_b]
+                                    + constraint_state.jv[i_c, i_b] * alpha
+                                )
+                            func_update_constraint_batch(
+                                i_b,
+                                qacc=constraint_state.qacc,
+                                Ma=constraint_state.Ma,
+                                cost=constraint_state.cost,
+                                dofs_state=dofs_state,
+                                constraint_state=constraint_state,
+                                static_rigid_sim_config=static_rigid_sim_config,
                             )
-                            constraint_state.Ma[i_d_apply, i_b] = (
-                                constraint_state.Ma[i_d_apply, i_b]
-                                + constraint_state.mv[i_d_apply, i_b] * alpha
-                            )
-                            i_d_apply = i_d_apply + 16
-
-                        # Phase 3: apply alpha to Jaref (per-constraint, stride 16).
-                        n_c_apply = constraint_state.n_constraints[i_b]
-                        i_c_apply = tid
-                        while i_c_apply < n_c_apply:
-                            constraint_state.Jaref[i_c_apply, i_b] = (
-                                constraint_state.Jaref[i_c_apply, i_b]
-                                + constraint_state.jv[i_c_apply, i_b] * alpha
-                            )
-                            i_c_apply = i_c_apply + 16
-                        qd.simt.block.sync()
-
-                        # Phase 4: update constraint state (16-lane cooperative).
-                        func_update_constraint_batch_coop(
-                            i_b,
-                            tid,
-                            constraint_state.qacc,
-                            constraint_state.Ma,
-                            constraint_state.cost,
-                            dofs_state,
-                            constraint_state,
-                            static_rigid_sim_config,
-                        )
-                        qd.simt.block.sync()
-
-                        # Phase 5: build changed constraint list (per-env serial on tid 0; cheap).
-                        if tid == 0:
                             func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
-                        qd.simt.block.sync()
+                    qd.simt.block.sync()
 
                     if constraint_state.improved[i_b]:
                         # Decide whether the active set is unchanged enough to skip the factor.
