@@ -4878,14 +4878,15 @@ def func_solve_body_megakernel(
                             )
                             qd.simt.block.sync()
 
-                        # Phase 8: compute grad = Ma - force - qfrc_constraint on tid 0.
-                        if tid == 0:
-                            for i_d in range(n_dofs_static):
-                                constraint_state.grad[i_d, i_b] = (
-                                    constraint_state.Ma[i_d, i_b]
-                                    - dofs_state.force[i_d, i_b]
-                                    - constraint_state.qfrc_constraint[i_d, i_b]
-                                )
+                        # Phase 8: compute grad = Ma - force - qfrc_constraint (16-lane stride over n_dofs).
+                        i_d_g = tid
+                        while i_d_g < n_dofs_static:
+                            constraint_state.grad[i_d_g, i_b] = (
+                                constraint_state.Ma[i_d_g, i_b]
+                                - dofs_state.force[i_d_g, i_b]
+                                - constraint_state.qfrc_constraint[i_d_g, i_b]
+                            )
+                            i_d_g = i_d_g + 16
                         qd.simt.block.sync()
 
                         # Phase 9-10: tiled cholesky factor (16 lanes) + solve, with optional factor skip.
@@ -4902,15 +4903,29 @@ def func_solve_body_megakernel(
                         )
                         qd.simt.block.sync()
 
-                        # Phase 11: update search direction (per-env serial on tid 0). Sets ``improved`` based on
-                        # convergence; the next iter's `while` predicate reads it to decide whether to break.
+                        # Phase 11: update search direction (16-lane coop).
+                        # Compute grad_norm = sqrt(sum(grad^2)) cooperatively.
+                        gn_partial = gs.qd_float(0.0)
+                        i_d_gn = tid
+                        while i_d_gn < n_dofs_static:
+                            g = constraint_state.grad[i_d_gn, i_b]
+                            gn_partial = gn_partial + g * g
+                            i_d_gn = i_d_gn + 16
+                        gn_total = qd.simt.subgroup.reduce_all_add_tiled(gn_partial, 4)
+                        grad_norm = qd.sqrt(gn_total)
+                        tol_scaled = (
+                            rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs_static)
+                        ) * rigid_global_info.tolerance[None]
+                        improvement = constraint_state.prev_cost[i_b] - constraint_state.cost[i_b]
+                        improved_local = grad_norm > tol_scaled and improvement > tol_scaled
                         if tid == 0:
-                            func_terminate_or_update_descent_batch(
-                                i_b,
-                                constraint_state=constraint_state,
-                                rigid_global_info=rigid_global_info,
-                                static_rigid_sim_config=static_rigid_sim_config,
-                            )
+                            constraint_state.improved[i_b] = improved_local
+                        # Search update: search[i_d] = -Mgrad[i_d] (Newton path; 16-lane stride).
+                        if improved_local:
+                            i_d_s = tid
+                            while i_d_s < n_dofs_static:
+                                constraint_state.search[i_d_s, i_b] = -constraint_state.Mgrad[i_d_s, i_b]
+                                i_d_s = i_d_s + 16
                         qd.simt.block.sync()
         else:
             if tid == 0:
