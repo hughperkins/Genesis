@@ -5115,36 +5115,35 @@ def func_solve_body_megakernel_t32(
                             if tid == 0:
                                 constraint_state.ls_alpha[i_b] = 0.0
 
-                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
-                                i_b, tid, alpha_newton, sh_ls0, sh_ls1, sh_ls2,
-                                constraint_state, rigid_global_info, qd.static(32),
+                            # block_dim=32 = exactly one warp -> use the existing 32-lane coop refine path
+                            # (subgroup ops). This parallelizes the bracketing walk + 3-alpha polish across
+                            # the full warp, eliminating the largest remaining serial bottleneck.
+                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
+                                i_b, tid, alpha_newton, constraint_state, rigid_global_info, coop=True
                             )
                             if p0_cost < p1_cost:
-                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha_coop16(
-                                    i_b, tid, gs.qd_float(0.0), sh_ls0, sh_ls1, sh_ls2,
-                                    constraint_state, rigid_global_info, qd.static(32),
+                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
+                                    i_b, tid, gs.qd_float(0.0), constraint_state, rigid_global_info, coop=True
                                 )
                             if p1_cost < p0_cost and tid == 0:
                                 constraint_state.ls_alpha[i_b] = p1_alpha
 
                             if qd.abs(p1_deriv_0) > gtol:
-                                # Bracketing walk + 3-alpha polish: still serial on tid 0.
-                                if tid == 0:
-                                    res_alpha, ls_result = func_linesearch_refine(
-                                        i_b,
-                                        0,
-                                        p1_alpha,
-                                        p1_cost,
-                                        p1_deriv_0,
-                                        p1_deriv_1,
-                                        p0_cost,
-                                        gtol,
-                                        constraint_state,
-                                        rigid_global_info,
-                                        coop=False,
-                                    )
-                                    if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
-                                        constraint_state.ls_alpha[i_b] = res_alpha
+                                res_alpha, ls_result = func_linesearch_refine(
+                                    i_b,
+                                    tid,
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    p0_cost,
+                                    gtol,
+                                    constraint_state,
+                                    rigid_global_info,
+                                    coop=True,
+                                )
+                                if tid == 0 and qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
+                                    constraint_state.ls_alpha[i_b] = res_alpha
 
                         qd.simt.block.sync()
                         alpha_val = constraint_state.ls_alpha[i_b]
