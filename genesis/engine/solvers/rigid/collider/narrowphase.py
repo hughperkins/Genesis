@@ -969,7 +969,8 @@ def func_convex_convex_contact(
         tolerance = func_compute_tolerance(
             i_ga, i_gb, i_b, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
         )
-        if qd.static(static_rigid_sim_config.enable_mujoco_compatibility):
+        # [q1b-mj-ccd-tol] force MJ tolerance formula (regardless of flag)
+        if qd.static(True):
             tolerance = func_compute_mj_tolerance(
                 i_ga, i_gb, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
             )

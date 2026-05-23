@@ -130,17 +130,12 @@ class Collider:
         self.clear()
 
     def _init_static_config(self) -> None:
-        # Identify the convex collision detection (ccd) algorithm
+        # [q1b-mj-ccd-tol] force MJ-style CCD (regardless of flag) to isolate its
+        # contribution to the contact-count gap on dex_hand (which uses MPR).
         if self._solver._options.use_gjk_collision:
-            if self._solver._enable_mujoco_compatibility:
-                ccd_algorithm = CCD_ALGORITHM_CODE.MJ_GJK
-            else:
-                ccd_algorithm = CCD_ALGORITHM_CODE.GJK
+            ccd_algorithm = CCD_ALGORITHM_CODE.MJ_GJK
         else:
-            if self._solver._enable_mujoco_compatibility:
-                ccd_algorithm = CCD_ALGORITHM_CODE.MJ_MPR
-            else:
-                ccd_algorithm = CCD_ALGORITHM_CODE.MPR
+            ccd_algorithm = CCD_ALGORITHM_CODE.MJ_MPR
 
         n_contacts_per_pair = 20 if self._solver._static_rigid_sim_config.requires_grad else 5
         if (
