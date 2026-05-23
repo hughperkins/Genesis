@@ -2078,11 +2078,17 @@ def func_cholesky_and_solve_fused_tiled(
     Thin wrapper around ``func_cholesky_and_solve_body``: allocates per-block shared memory and dispatches to the body
     for each env. The body is reusable from a megakernel that owns its own outer parallel-for and wants to drive
     cholesky as one phase of many (E5 path).
+
+    Additionally fuses ``func_terminate_or_update_descent_batch`` (formerly the body of
+    ``_func_update_search_direction``) into the same per-env block: it executes on tid 0 right after cholesky's
+    block.sync (Mgrad is visible in shared memory to tid 0 via the gmem write that the body's tail just performed).
+    This eliminates one kernel launch per Newton iter and keeps the per-env state Mgrad → search hot in the same
+    block. (First step toward the E5 megakernel; see perso_hugh/doc/chol_skip_singleenv_2026may22.md b.2.2.)
     """
     MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
     _B = constraint_state.grad.shape[1]
 
-    qd.loop_config(name="cholesky_and_solve_fused_tiled", block_dim=16)
+    qd.loop_config(name="cholesky_solve_search_fused", block_dim=16)
     for i in range(_B * 16):
         tid = i % 16
         i_b = i // 16
@@ -2096,6 +2102,21 @@ def func_cholesky_and_solve_fused_tiled(
         func_cholesky_and_solve_body(
             i_b, tid, L_sh, v_sh, constraint_state, rigid_global_info, static_rigid_sim_config
         )
+
+        qd.simt.block.sync()
+
+        # --- Fused update_search_direction (E5-b.2.2) ---
+        # The original kernel ran one thread per env with block_dim=32; we get equivalent per-env serialisation
+        # by gating on tid 0 of our 16-lane block. Subsequent kernels in the solver loop expect ``improved`` and
+        # ``search`` to be updated, which this preserves.
+        if tid == 0:
+            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                func_terminate_or_update_descent_batch(
+                    i_b,
+                    constraint_state=constraint_state,
+                    rigid_global_info=rigid_global_info,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
 
 
 @qd.func

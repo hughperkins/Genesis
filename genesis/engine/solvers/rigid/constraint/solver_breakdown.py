@@ -1022,13 +1022,16 @@ def _kernel_solve_graph(
             static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
             and static_rigid_sim_config.enable_tiled_cholesky_hessian
         ):
-            # Fused path: H patching + fused Cholesky+Solve (L in shmem, H preserved in nt_H)
+            # Fused path: H patching + fused Cholesky+Solve+SearchDir (L in shmem, H preserved in nt_H)
             _func_build_changed_and_decide_hessian_mode(constraint_state, static_rigid_sim_config)
             _func_newton_only_nt_hessian(constraint_state, rigid_global_info)
             _func_patch_hessian_delta(constraint_state, rigid_global_info)
             _func_update_gradient_no_solve(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
+            # E5-b.2.2: cholesky kernel now also fuses update_search_direction (per-env serial work via tid 0
+            # of the same 16-lane block). The `_func_update_search_direction` dispatch below is skipped for
+            # this fused path.
             _func_cholesky_and_solve_fused(constraint_state, rigid_global_info, static_rigid_sim_config)
         elif qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
             # Non-fused path: full H rebuild + separate Cholesky every iteration (Cholesky overwrites nt_H with L,
@@ -1037,11 +1040,12 @@ def _kernel_solve_graph(
             _func_update_gradient(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
+            _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config)
         else:
             _func_update_gradient(
                 entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
             )
-        _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config)
+            _func_update_search_direction(constraint_state, rigid_global_info, static_rigid_sim_config)
         _func_check_early_exit(constraint_state, graph_counter)
 
 
