@@ -424,9 +424,9 @@ class RigidSolver(KinematicSolver):
         # would also need sparse-aware rewrites.
         if self._options.sparse_solve:
             return False
-        n_envs = self._sim._B
-        n_dofs = self.n_dofs
-        return n_envs <= 8192 and n_dofs >= 16
+        # Benchmarking override: force the transposed constraint layout on for all GPU workloads, regardless of n_envs
+        # / n_dofs, so we can measure the full perf surface on a 5090 without the previous narrow gating.
+        return True
 
     def _build_static_config(self):
         static_rigid_sim_config = dict(
