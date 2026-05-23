@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -17,6 +18,7 @@ from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tens
 from ..collider.contact_island import ContactIsland
 from . import backward as backward_constraint_solver
 from . import noslip as constraint_noslip
+
 
 
 @qd.func
@@ -2095,11 +2097,10 @@ def _cholesky_and_solve_fused_tiled_impl(
         # so the monolith body's first iter can run incremental as usual.
         # The decomposed body path uses ``nt_H`` to hold H (patched), not L; it never sets this
         # flag, so the writeback never fires on that path.
+        # Coalesced row-major fullsquare: writing the full n_dofs*n_dofs square is cheaper than
+        # predicating on the lower triangle (warp branch divergence), and all genesis readers of
+        # nt_H touch only the lower triangle.
         if qd.static(write_L_to_nt_H):
-            # Coalesced row-major writeback (fullsquare): walk a flattened n_dofs*n_dofs grid in
-            # tid-strided order so adjacent lanes write adjacent column entries. No predicate on
-            # upper triangle — writing the full square is cheaper than predicate divergence, and
-            # all genesis readers of nt_H touch only the lower triangle.
             i_flat = tid
             n_dofs_sq = n_dofs * n_dofs
             while i_flat < n_dofs_sq:
