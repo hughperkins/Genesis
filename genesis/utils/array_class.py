@@ -322,6 +322,10 @@ class ConstraintState:
     use_full_hessian: qd.Tensor
     # Solver loop iteration counter (0-indexed, increments each iteration in the graph loop)
     solver_iter_counter: qd.Tensor
+    # Per-env Newton-iter counter. Increments in build_changed_decide when this env is still
+    # 'improved' (i.e. still iterating). Resets at substep start. Mirrors mjw's d.solver_niter
+    # so we can compare per-env iter-count distributions apples-to-apples.
+    niter_per_env: qd.Tensor
     # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
     graph_counter: qd.types.ndarray()
     early_exit_flag: qd.Tensor
@@ -446,6 +450,7 @@ def get_constraint_state(constraint_solver, solver):
         timers=V(dtype=qd.i64 if gs.backend != gs.metal else qd.i32, shape=(10, _B)),
         use_full_hessian=V(dtype=qd.i32, shape=(_B,)),
         solver_iter_counter=V(dtype=qd.i32, shape=()),
+        niter_per_env=V(dtype=qd.i32, shape=(_B,)),
         graph_counter=qd.ndarray(qd.i32, shape=()),
         early_exit_flag=V(dtype=qd.i32, shape=()),
     )

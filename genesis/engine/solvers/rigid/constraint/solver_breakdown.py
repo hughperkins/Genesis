@@ -761,6 +761,7 @@ def _func_build_changed_and_decide_hessian_mode(
     qd.loop_config(name="build_changed_decide", block_dim=32)
     for i_b in range(_B):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            constraint_state.niter_per_env[i_b] = constraint_state.niter_per_env[i_b] + 1
             solver.func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
             # First graph iteration must do full rebuild: nt_H contains L from func_solve_init's Cholesky, not H.
             # Patching L would be wrong.

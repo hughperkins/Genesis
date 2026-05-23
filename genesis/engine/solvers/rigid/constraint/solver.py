@@ -4219,6 +4219,7 @@ def func_solve_init(
     for i_b in qd.ndrange(_B):
         constraint_state.improved[i_b] = constraint_state.n_constraints[i_b] > 0
         constraint_state.use_full_hessian[i_b] = 1
+        constraint_state.niter_per_env[i_b] = 0
     constraint_state.solver_iter_counter[()] = 0
 
     if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
