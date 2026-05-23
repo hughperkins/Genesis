@@ -1681,6 +1681,120 @@ def func_hessian_direct_batch(
 
 
 @qd.func
+def func_hessian_direct_tiled_body(
+    i_b,
+    tid,
+    BLOCK_DIM: qd.template(),
+    jac_row,
+    jac_col,
+    efc_D_sh,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Per-env body of ``func_hessian_direct_tiled``, callable from a caller-owned parallel-for.
+
+    Same blocked algorithm: stripes over (constraints, dof_row_block, dof_col_block), accumulates J^T D J into nt_H,
+    then adds M. Caller provides per-block shared memory for jac_row / jac_col / efc_D (sizes determined by the
+    caller's MAX_CONSTRAINTS_PER_BLOCK and MAX_DOFS_PER_BLOCK static constants — must match the tile sizes used here).
+
+    Designed for use inside the E5 megakernel where the outer parallel-for is owned by the megakernel and BLOCK_DIM
+    is the megakernel's block_dim (16). All strided loops use ``tid + BLOCK_DIM * k`` so they're correct for any
+    BLOCK_DIM; the per-thread workload scales inversely with BLOCK_DIM.
+    """
+    MAX_CONSTRAINTS_PER_BLOCK = qd.static(32)
+    MAX_DOFS_PER_BLOCK = qd.static(64)
+
+    n_dofs = constraint_state.nt_H.shape[1]
+    n_c = constraint_state.n_constraints[i_b]
+    # Note: the original tiled algorithm adds M implicitly via the `i_c_start == 0` init path
+    # (coef = mass_mat[d1, d2]). No separate "add M" loop is needed — mass_mat is dense and zeros out
+    # cross-entity pairs, matching the entity-aware loop in func_hessian_direct_batch.
+
+    i_c_start = 0
+    while i_c_start < n_c:
+        n_conts_tile = qd.min(MAX_CONSTRAINTS_PER_BLOCK, n_c - i_c_start)
+
+        # Load efc_D (constraints tile, masked by active) into shared memory.
+        i_c_ = tid
+        while i_c_ < n_conts_tile:
+            efc_D_sh[i_c_] = (
+                constraint_state.efc_D[i_c_start + i_c_, i_b] * constraint_state.active[i_c_start + i_c_, i_b]
+            )
+            i_c_ = i_c_ + BLOCK_DIM
+
+        i_d1_start = 0
+        while i_d1_start < n_dofs:
+            n_dofs_tile_row = qd.min(MAX_DOFS_PER_BLOCK, n_dofs - i_d1_start)
+
+            i_c_ = tid
+            while i_c_ < n_conts_tile:
+                for i_d_ in range(n_dofs_tile_row):
+                    jac_row[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d1_start + i_d_, i_b]
+                i_c_ = i_c_ + BLOCK_DIM
+            qd.simt.block.sync()
+
+            i_d2_start = 0
+            while i_d2_start <= i_d1_start:
+                n_dofs_tile_col = qd.min(MAX_DOFS_PER_BLOCK, n_dofs - i_d2_start)
+                is_diag_tile = i_d1_start == i_d2_start
+
+                if not is_diag_tile:
+                    i_c_ = tid
+                    while i_c_ < n_conts_tile:
+                        for i_d_ in range(n_dofs_tile_col):
+                            jac_col[i_c_, i_d_] = constraint_state.jac[i_c_start + i_c_, i_d2_start + i_d_, i_b]
+                        i_c_ = i_c_ + BLOCK_DIM
+                    qd.simt.block.sync()
+
+                if is_diag_tile:
+                    n_lower_tri_tile = n_dofs_tile_row * (n_dofs_tile_row + 1) // 2
+                    pid = tid
+                    while pid < n_lower_tri_tile:
+                        i_d1_, i_d2_ = linear_to_lower_tri(pid)
+                        i_d1 = i_d1_ + i_d1_start
+                        i_d2 = i_d2_ + i_d2_start
+                        coef = gs.qd_float(0.0)
+                        if i_c_start == 0:
+                            coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+                        for j_c_ in range(n_conts_tile):
+                            coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_] * efc_D_sh[j_c_]
+                        if i_c_start == 0:
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = coef
+                        else:
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = (
+                                constraint_state.nt_H[i_b, i_d1, i_d2] + coef
+                            )
+                        pid = pid + BLOCK_DIM
+                else:
+                    numel = n_dofs_tile_row * n_dofs_tile_col
+                    pid = tid
+                    while pid < numel:
+                        i_d1_ = pid // n_dofs_tile_col
+                        i_d2_ = pid % n_dofs_tile_col
+                        i_d1 = i_d1_ + i_d1_start
+                        i_d2 = i_d2_ + i_d2_start
+                        coef = gs.qd_float(0.0)
+                        if i_c_start == 0:
+                            coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+                        for j_c_ in range(n_conts_tile):
+                            coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_] * efc_D_sh[j_c_]
+                        if i_c_start == 0:
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = coef
+                        else:
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = (
+                                constraint_state.nt_H[i_b, i_d1, i_d2] + coef
+                            )
+                        pid = pid + BLOCK_DIM
+
+                i_d2_start = i_d2_start + MAX_DOFS_PER_BLOCK
+                qd.simt.block.sync()
+
+            i_d1_start = i_d1_start + MAX_DOFS_PER_BLOCK
+
+        i_c_start = i_c_start + MAX_CONSTRAINTS_PER_BLOCK
+
+
+@qd.func
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -4189,6 +4303,11 @@ def func_solve_body_megakernel(
         L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
         v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
 
+        # Shmem for the tiled Hessian rebuild (matches func_hessian_direct_tiled_body's MAX_* statics).
+        jac_row_sh = qd.simt.block.SharedArray((32, 64), gs.qd_float)
+        jac_col_sh = qd.simt.block.SharedArray((32, 64), gs.qd_float)
+        efc_D_sh = qd.simt.block.SharedArray((32,), gs.qd_float)
+
         if constraint_state.n_constraints[i_b] > 0:
             # First iter must factor; subsequent iters may skip when active set is unchanged.
             local_iter = 0
@@ -4247,18 +4366,20 @@ def func_solve_body_megakernel(
                         # constraints flipped active state.
                         skip_factor = (local_iter > 1) and (constraint_state.incr_n_changed[i_b] == 0)
 
-                        # Phase 7: rebuild H from scratch on tid 0 (serial, slow but correct). Only runs when
+                        # Phase 7: rebuild H using the tiled algorithm (16-lane cooperative). Only runs when
                         # we don't skip the factor — if we skip, the L_sh from last iter is still valid w.r.t.
                         # the unchanged H (active set hasn't moved).
                         if not skip_factor:
-                            if tid == 0:
-                                func_hessian_direct_batch(
-                                    i_b,
-                                    entities_info=entities_info,
-                                    constraint_state=constraint_state,
-                                    rigid_global_info=rigid_global_info,
-                                    static_rigid_sim_config=static_rigid_sim_config,
-                                )
+                            func_hessian_direct_tiled_body(
+                                i_b,
+                                tid,
+                                qd.static(16),
+                                jac_row_sh,
+                                jac_col_sh,
+                                efc_D_sh,
+                                constraint_state,
+                                rigid_global_info,
+                            )
                             qd.simt.block.sync()
 
                         # Phase 8: compute grad = Ma - force - qfrc_constraint on tid 0.
