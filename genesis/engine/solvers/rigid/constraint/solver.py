@@ -2656,6 +2656,190 @@ def func_cholesky_solve_tiled(
 
 
 @qd.func
+def func_ls_init_and_eval_p0_coop(
+    i_b,
+    tid,
+    _T: qd.template(),
+    sh_snorm_sq,
+    sh_qg_grad,
+    sh_qg_hess,
+    sh_p0_cost,
+    sh_constraint_grad,
+    sh_constraint_hess,
+    dofs_info: array_class.DofsInfo,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Cooperative version of ``func_ls_init_and_eval_p0`` for the E5 megakernel.
+
+    Mirrors the body of ``solver_breakdown._func_decomp_linesearch_p0`` (per-env) but with the block size ``_T`` as a
+    template arg so it works for both block_dim=32 (decomposed) and block_dim=16 (megakernel). All reductions use
+    shmem tree reductions (not subgroup ops), so the only constraint on ``_T`` is that it be a power of two.
+
+    Caller is responsible for providing the 6 shared arrays of size ``_T`` (used both for the snorm/qg reduction and
+    re-used for the eq/p0/constraint reduction). Writes constraint_state.mv, jv, quad_gauss, eq_sum, ls_p0_cost,
+    ls_alpha, ls_alpha_newton, ls_gtol, ls_it. Sets improved=False if the search direction is too small.
+    """
+    if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+        n_dofs = constraint_state.search.shape[0]
+        n_con = constraint_state.n_constraints[i_b]
+
+        # Phase 0a: mv = M @ search (cooperative over DOFs)
+        i_d1 = tid
+        while i_d1 < n_dofs:
+            I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+            i_e = dofs_info.entity_idx[I_d1]
+            mv_val = gs.qd_float(0.0)
+            for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv_val = mv_val + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+            constraint_state.mv[i_d1, i_b] = mv_val
+            i_d1 = i_d1 + _T
+
+        # Phase 0b: jv = J @ search (cooperative over constraints)
+        i_c = tid
+        while i_c < n_con:
+            jv_val = gs.qd_float(0.0)
+            if qd.static(static_rigid_sim_config.sparse_solve):
+                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                    jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            else:
+                for i_d in range(n_dofs):
+                    jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            constraint_state.jv[i_c, i_b] = jv_val
+            i_c = i_c + _T
+
+        qd.simt.block.sync()
+
+        # Phase 1: snorm + quad_gauss reduction (parallel over n_dofs)
+        local_snorm_sq = gs.qd_float(0.0)
+        local_qg_grad = gs.qd_float(0.0)
+        local_qg_hess = gs.qd_float(0.0)
+        i_d = tid
+        while i_d < n_dofs:
+            s = constraint_state.search[i_d, i_b]
+            local_snorm_sq = local_snorm_sq + s * s
+            local_qg_grad = local_qg_grad + s * constraint_state.Ma[i_d, i_b] - s * dofs_state.force[i_d, i_b]
+            local_qg_hess = local_qg_hess + 0.5 * s * constraint_state.mv[i_d, i_b]
+            i_d = i_d + _T
+
+        sh_snorm_sq[tid] = local_snorm_sq
+        sh_qg_grad[tid] = local_qg_grad
+        sh_qg_hess[tid] = local_qg_hess
+        qd.simt.block.sync()
+
+        stride = _T // 2
+        while stride > 0:
+            if tid < stride:
+                sh_snorm_sq[tid] = sh_snorm_sq[tid] + sh_snorm_sq[tid + stride]
+                sh_qg_grad[tid] = sh_qg_grad[tid] + sh_qg_grad[tid + stride]
+                sh_qg_hess[tid] = sh_qg_hess[tid] + sh_qg_hess[tid + stride]
+            qd.simt.block.sync()
+            stride = stride // 2
+
+        snorm = qd.sqrt(sh_snorm_sq[0])
+
+        if snorm < rigid_global_info.EPS[None]:
+            if tid == 0:
+                constraint_state.ls_alpha[i_b] = 0.0
+                constraint_state.ls_p0_cost[i_b] = 0.0
+                constraint_state.improved[i_b] = False
+        else:
+            if tid == 0:
+                constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+                constraint_state.quad_gauss[1, i_b] = sh_qg_grad[0]
+                constraint_state.quad_gauss[2, i_b] = sh_qg_hess[0]
+
+            # Phase 2: eq_sum + p0_cost + constraint_grad/hess (parallel over n_constraints)
+            ne = constraint_state.n_constraints_equality[i_b]
+            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+            local_eq_cost = gs.qd_float(0.0)
+            local_eq_grad = gs.qd_float(0.0)
+            local_eq_hess = gs.qd_float(0.0)
+            local_p0_cost = gs.qd_float(0.0)
+            local_constraint_grad = gs.qd_float(0.0)
+            local_constraint_hess = gs.qd_float(0.0)
+            i_c2 = tid
+            while i_c2 < n_con:
+                Jaref_c = constraint_state.Jaref[i_c2, i_b]
+                jv_c = constraint_state.jv[i_c2, i_b]
+                D = constraint_state.efc_D[i_c2, i_b]
+                qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+                qf_1 = D * (jv_c * Jaref_c)
+                qf_2 = D * (0.5 * jv_c * jv_c)
+
+                if i_c2 < ne:
+                    local_eq_cost = local_eq_cost + qf_0
+                    local_eq_grad = local_eq_grad + qf_1
+                    local_eq_hess = local_eq_hess + qf_2
+                    local_p0_cost = local_p0_cost + qf_0
+                    local_constraint_grad = local_constraint_grad + qf_1
+                    local_constraint_hess = local_constraint_hess + qf_2
+                elif i_c2 < nef:
+                    f = constraint_state.efc_frictionloss[i_c2, i_b]
+                    r = constraint_state.diag[i_c2, i_b]
+                    rf = r * f
+                    linear_neg = Jaref_c <= -rf
+                    linear_pos = Jaref_c >= rf
+                    if linear_neg or linear_pos:
+                        qf_0 = linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
+                        qf_1 = linear_neg * (-f * jv_c) + linear_pos * (f * jv_c)
+                        qf_2 = 0.0
+                    local_p0_cost = local_p0_cost + qf_0
+                    local_constraint_grad = local_constraint_grad + qf_1
+                    local_constraint_hess = local_constraint_hess + qf_2
+                else:
+                    active = Jaref_c < 0
+                    local_p0_cost = local_p0_cost + qf_0 * active
+                    local_constraint_grad = local_constraint_grad + qf_1 * active
+                    local_constraint_hess = local_constraint_hess + qf_2 * active
+                i_c2 = i_c2 + _T
+
+            sh_snorm_sq[tid] = local_eq_cost
+            sh_qg_grad[tid] = local_eq_grad
+            sh_qg_hess[tid] = local_eq_hess
+            sh_p0_cost[tid] = local_p0_cost
+            sh_constraint_grad[tid] = local_constraint_grad
+            sh_constraint_hess[tid] = local_constraint_hess
+            qd.simt.block.sync()
+
+            stride2 = _T // 2
+            while stride2 > 0:
+                if tid < stride2:
+                    sh_snorm_sq[tid] = sh_snorm_sq[tid] + sh_snorm_sq[tid + stride2]
+                    sh_qg_grad[tid] = sh_qg_grad[tid] + sh_qg_grad[tid + stride2]
+                    sh_qg_hess[tid] = sh_qg_hess[tid] + sh_qg_hess[tid + stride2]
+                    sh_p0_cost[tid] = sh_p0_cost[tid] + sh_p0_cost[tid + stride2]
+                    sh_constraint_grad[tid] = sh_constraint_grad[tid] + sh_constraint_grad[tid + stride2]
+                    sh_constraint_hess[tid] = sh_constraint_hess[tid] + sh_constraint_hess[tid + stride2]
+                qd.simt.block.sync()
+                stride2 = stride2 // 2
+
+            if tid == 0:
+                constraint_state.eq_sum[0, i_b] = sh_snorm_sq[0]
+                constraint_state.eq_sum[1, i_b] = sh_qg_grad[0]
+                constraint_state.eq_sum[2, i_b] = sh_qg_hess[0]
+                constraint_state.ls_it[i_b] = 1
+                constraint_state.ls_p0_cost[i_b] = constraint_state.gauss[i_b] + sh_p0_cost[0]
+                constraint_state.ls_alpha[i_b] = 0.0
+
+                total_hess = 2.0 * (constraint_state.quad_gauss[2, i_b] + sh_constraint_hess[0])
+                if total_hess > 0.0:
+                    total_grad = constraint_state.quad_gauss[1, i_b] + sh_constraint_grad[0]
+                    constraint_state.ls_alpha_newton[i_b] = qd.abs(total_grad / total_hess)
+                else:
+                    constraint_state.ls_alpha_newton[i_b] = 0.0
+                n_dofs_val = constraint_state.search.shape[0]
+                scale = rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs_val)
+                constraint_state.ls_gtol[i_b] = (
+                    rigid_global_info.tolerance[None] * rigid_global_info.ls_tolerance[None] * snorm * scale
+                )
+
+
+@qd.func
 def func_ls_init_and_eval_p0(
     i_b,
     entities_info: array_class.EntitiesInfo,
@@ -4417,6 +4601,14 @@ def func_solve_body_megakernel(
         jac_col_sh = qd.simt.block.SharedArray((32, 64), gs.qd_float)
         efc_D_sh = qd.simt.block.SharedArray((32,), gs.qd_float)
 
+        # Shmem for the cooperative linesearch_p0 tree reductions (6 accumulators × 16 lanes).
+        sh_ls0 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        sh_ls1 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        sh_ls2 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        sh_ls3 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        sh_ls4 = qd.simt.block.SharedArray((16,), gs.qd_float)
+        sh_ls5 = qd.simt.block.SharedArray((16,), gs.qd_float)
+
         if constraint_state.n_constraints[i_b] > 0:
             # First iter must factor; subsequent iters may skip when active set is unchanged.
             local_iter = 0
@@ -4429,44 +4621,96 @@ def func_solve_body_megakernel(
                 else:
                     local_iter = local_iter + 1
 
-                    # Phase 1-5: linesearch + apply alpha + update_constraint + build_changed_list (serial on tid 0).
-                    # The apply-alpha loops and update_constraint inner loops are the next coop candidates but
-                    # require struct-field-analysis-aware refactoring; left as future work.
-                    if tid == 0:
-                        alpha = func_linesearch_batch(
+                    # Phase 1a: cooperative linesearch p0 (mv, jv, snorm, quad_gauss, eq_sum, p0_cost, alpha_newton).
+                    # This is the EXPENSIVE part of the linesearch — O(n_dofs^2 + n_dofs*n_constraints) — and is
+                    # the main reason serializing the linesearch was so costly. With block_dim=16 cooperation we
+                    # recover most of that cost.
+                    func_ls_init_and_eval_p0_coop(
+                        i_b,
+                        tid,
+                        qd.static(16),
+                        sh_ls0,
+                        sh_ls1,
+                        sh_ls2,
+                        sh_ls3,
+                        sh_ls4,
+                        sh_ls5,
+                        dofs_info,
+                        entities_info,
+                        dofs_state,
+                        constraint_state,
+                        rigid_global_info,
+                        static_rigid_sim_config,
+                    )
+                    qd.simt.block.sync()
+
+                    # Phase 1b: linesearch refinement (still serial on tid 0; ~3-5 Newton-step iters, each iter
+                    # does O(n_dofs + n_constraints) work — not the bottleneck).
+                    if tid == 0 and constraint_state.improved[i_b]:
+                        alpha_newton = constraint_state.ls_alpha_newton[i_b]
+                        p0_cost = constraint_state.ls_p0_cost[i_b]
+                        gtol = constraint_state.ls_gtol[i_b]
+
+                        alpha = gs.qd_float(0.0)
+                        if alpha_newton > 0.0:
+                            constraint_state.ls_alpha[i_b] = 0.0
+                            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
+                                i_b, 0, alpha_newton, constraint_state, rigid_global_info, coop=False
+                            )
+                            if p0_cost < p1_cost:
+                                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = _func_linesearch_eval_at_alpha(
+                                    i_b, 0, gs.qd_float(0.0), constraint_state, rigid_global_info, coop=False
+                                )
+                            if p1_cost < p0_cost:
+                                constraint_state.ls_alpha[i_b] = p1_alpha
+                            if qd.abs(p1_deriv_0) > gtol:
+                                res_alpha, ls_result = func_linesearch_refine(
+                                    i_b,
+                                    0,
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    p0_cost,
+                                    gtol,
+                                    constraint_state,
+                                    rigid_global_info,
+                                    coop=False,
+                                )
+                                # Skip status 7 (brackets stalled, midpoint non-improving)
+                                if qd.abs(res_alpha) > rigid_global_info.EPS[None] and ls_result != 7:
+                                    constraint_state.ls_alpha[i_b] = res_alpha
+                        alpha = constraint_state.ls_alpha[i_b]
+                        if qd.abs(alpha) < EPS_val:
+                            constraint_state.improved[i_b] = False
+                    qd.simt.block.sync()
+
+                    # Phase 2-5: apply alpha + update_constraint + build_changed_list (serial on tid 0; small).
+                    if tid == 0 and constraint_state.improved[i_b]:
+                        alpha = constraint_state.ls_alpha[i_b]
+                        for i_d in range(n_dofs_static):
+                            constraint_state.qacc[i_d, i_b] = (
+                                constraint_state.qacc[i_d, i_b]
+                                + constraint_state.search[i_d, i_b] * alpha
+                            )
+                            constraint_state.Ma[i_d, i_b] = (
+                                constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+                            )
+                        for i_c in range(constraint_state.n_constraints[i_b]):
+                            constraint_state.Jaref[i_c, i_b] = (
+                                constraint_state.Jaref[i_c, i_b]
+                                + constraint_state.jv[i_c, i_b] * alpha
+                            )
+                        func_update_constraint_batch(
                             i_b,
-                            entities_info=entities_info,
+                            qacc=constraint_state.qacc,
+                            Ma=constraint_state.Ma,
+                            cost=constraint_state.cost,
                             dofs_state=dofs_state,
-                            rigid_global_info=rigid_global_info,
                             constraint_state=constraint_state,
                             static_rigid_sim_config=static_rigid_sim_config,
                         )
-                        if qd.abs(alpha) < EPS_val:
-                            constraint_state.improved[i_b] = False
-                        else:
-                            for i_d in range(n_dofs_static):
-                                constraint_state.qacc[i_d, i_b] = (
-                                    constraint_state.qacc[i_d, i_b]
-                                    + constraint_state.search[i_d, i_b] * alpha
-                                )
-                                constraint_state.Ma[i_d, i_b] = (
-                                    constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
-                                )
-                            for i_c in range(constraint_state.n_constraints[i_b]):
-                                constraint_state.Jaref[i_c, i_b] = (
-                                    constraint_state.Jaref[i_c, i_b]
-                                    + constraint_state.jv[i_c, i_b] * alpha
-                                )
-                            func_update_constraint_batch(
-                                i_b,
-                                qacc=constraint_state.qacc,
-                                Ma=constraint_state.Ma,
-                                cost=constraint_state.cost,
-                                dofs_state=dofs_state,
-                                constraint_state=constraint_state,
-                                static_rigid_sim_config=static_rigid_sim_config,
-                            )
-                            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+                        func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
                     qd.simt.block.sync()
 
                     if constraint_state.improved[i_b]:
