@@ -1943,6 +1943,97 @@ def func_cholesky_factor_direct_tiled(
 
 
 @qd.func
+def func_cholesky_and_solve_body_skip(
+    i_b,
+    tid,
+    L_sh,
+    v_sh,
+    skip_factor,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Like ``func_cholesky_and_solve_body`` but with a runtime ``skip_factor`` gate.
+
+    When ``skip_factor`` is True the factor loop is bypassed entirely — the body trusts ``L_sh`` already contains a
+    valid Cholesky factor from a previous call (active set unchanged scenario). Only the forward/backward substitution
+    runs, reading the current ``grad`` and writing ``Mgrad``.
+
+    This is the core building block for E5: when consecutive Newton iters have unchanged active sets, the cost of
+    re-factoring is replaced by just a triangular solve, and L lives entirely in shared memory across iters.
+    """
+    if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+        EPS = rigid_global_info.EPS[None]
+        n_dofs = constraint_state.nt_H.shape[1]
+        N_BLOCKS = (n_dofs + 16 - 1) // 16
+
+        if not skip_factor:
+            for kb in range(N_BLOCKS):
+                k0 = kb * 16
+                k1 = qd.min(k0 + 16, n_dofs)
+                L_kk = Tile16x16Cholesky.eye(dtype=gs.qd_float)
+                L_kk._load3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
+                for jb in range(kb):
+                    j0 = jb * 16
+                    for t in range(16):
+                        v = L_kk._resolve_vec2d(L_sh, k0, k1, j0 + t)
+                        L_kk._ger_sub(v, v)
+                L_kk.cholesky_(EPS)
+                for ib in range(kb + 1, N_BLOCKS):
+                    i0 = ib * 16
+                    i1 = qd.min(i0 + 16, n_dofs)
+                    L_ik = Tile16x16Cholesky.zeros(dtype=gs.qd_float)
+                    L_ik._load3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
+                    for jb in range(kb):
+                        j0 = jb * 16
+                        for t in range(16):
+                            v_own = L_ik._resolve_vec2d(L_sh, i0, i1, j0 + t)
+                            v_diag = L_ik._resolve_vec2d(L_sh, k0, k1, j0 + t)
+                            L_ik._ger_sub(v_own, v_diag)
+                    L_kk.solve_triangular_(L_ik)
+                    L_ik._store(L_sh, i0, i1, k0, k1)
+                L_kk._store(L_sh, k0, k1, k0, k1)
+
+        # Load gradient into v_sh
+        k = tid
+        while k < n_dofs:
+            v_sh[k] = constraint_state.grad[k, i_b]
+            k = k + 16
+        qd.simt.block.sync()
+
+        # Forward substitution: solve L @ y = grad
+        for i_d in range(n_dofs):
+            dot = gs.qd_float(0.0)
+            j = tid
+            while j < i_d:
+                dot = dot + L_sh[i_d, j] * v_sh[j]
+                j = j + 16
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            if tid == 0:
+                v_sh[i_d] = (v_sh[i_d] - dot) / L_sh[i_d, i_d]
+            qd.simt.block.sync()
+
+        # Backward substitution: solve L^T @ x = y
+        for i_d_ in range(n_dofs):
+            i_d = n_dofs - 1 - i_d_
+            dot = gs.qd_float(0.0)
+            j = i_d + 1 + tid
+            while j < n_dofs:
+                dot = dot + L_sh[j, i_d] * v_sh[j]
+                j = j + 16
+            dot = qd.simt.subgroup.reduce_all_add_tiled(dot, 4)
+            if tid == 0:
+                v_sh[i_d] = (v_sh[i_d] - dot) / L_sh[i_d, i_d]
+            qd.simt.block.sync()
+
+        # Write Mgrad to global memory
+        k = tid
+        while k < n_dofs:
+            constraint_state.Mgrad[k, i_b] = v_sh[k]
+            k = k + 16
+
+
+@qd.func
 def func_cholesky_and_solve_body(
     i_b,
     tid,
@@ -4041,6 +4132,168 @@ def func_solve_body_monolith(
                     break
         else:
             constraint_state.improved[i_b] = False
+
+
+# ====================================================================================================================
+# === E5 megakernel: one-block-per-env, all phases inlined, L_sh persists across Newton iters ========================
+# ====================================================================================================================
+#
+# Replaces the multi-kernel decomposed solve path with a single kernel. Each env's block has 16 threads (the minimum
+# imposed by Tile16x16Cholesky's subgroup ops). Most per-env work runs serially on tid 0 (matching the monolith path's
+# block_dim=32 per-env serialisation); cholesky factor + solve use all 16 lanes via the existing tile primitives.
+#
+# Key win: L_sh lives in shared memory across all Newton iters within one env's block. When the constraint active set
+# is unchanged across iters (incr_n_changed == 0), the factor loop is bypassed entirely (func_cholesky_and_solve_body
+# _skip(skip_factor=True)) — only the triangular solve runs. This recovers the cache-write cost identified in
+# perso_hugh/doc/chol_skip_singleenv_2026may22.md as the dominant -3.9% on dex_hand for the existing skip-unchanged
+# implementations (E1/E2/E3) that had to write L to global memory.
+
+
+@func_solve_body.register(
+    is_compatible=lambda *args, **kwargs: (
+        not (cfg := _get_static_config(*args, **kwargs)).requires_grad
+        and cfg.prefer_decomposed_solver != 0
+        and cfg.solver_type == gs.constraint_solver.Newton
+        and cfg.enable_tiled_cholesky_hessian
+        and not cfg.sparse_solve
+    )
+)
+@qd.kernel(fastcache=True)
+def func_solve_body_megakernel(
+    entities_info: array_class.EntitiesInfo,
+    dofs_info: array_class.DofsInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    _n_iterations: int,
+):
+    EPS_val = rigid_global_info.EPS[None]
+    MAX_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
+    _B = constraint_state.grad.shape[1]
+    n_dofs_static = constraint_state.qacc.shape[0]
+
+    qd.loop_config(name="solve_megakernel", block_dim=16)
+    for i_flat in range(_B * 16):
+        tid = i_flat % 16
+        i_b = i_flat // 16
+        if i_b >= _B:
+            continue
+
+        # Persistent shared memory: L_sh holds the Cholesky factor across the inner iter loop so the skip-factor
+        # path can reuse it without re-running the tile cascade.
+        L_sh = qd.simt.block.SharedArray((MAX_DOFS, MAX_DOFS + 1), gs.qd_float)
+        v_sh = qd.simt.block.SharedArray((MAX_DOFS,), gs.qd_float)
+
+        if constraint_state.n_constraints[i_b] > 0:
+            # First iter must factor; subsequent iters may skip when active set is unchanged.
+            local_iter = 0
+            keep_iterating = True
+            while keep_iterating:
+                if local_iter >= rigid_global_info.iterations[None]:
+                    keep_iterating = False
+                elif not constraint_state.improved[i_b]:
+                    keep_iterating = False
+                else:
+                    local_iter = local_iter + 1
+
+                    # Phase 1-5: serial linesearch + apply alpha + update_constraint_batch.
+                    # Runs entirely on tid 0 (matches the monolith's per-env serialisation).
+                    if tid == 0:
+                        alpha = func_linesearch_batch(
+                            i_b,
+                            entities_info=entities_info,
+                            dofs_state=dofs_state,
+                            rigid_global_info=rigid_global_info,
+                            constraint_state=constraint_state,
+                            static_rigid_sim_config=static_rigid_sim_config,
+                        )
+                        if qd.abs(alpha) < EPS_val:
+                            constraint_state.improved[i_b] = False
+                        else:
+                            for i_d in range(n_dofs_static):
+                                constraint_state.qacc[i_d, i_b] = (
+                                    constraint_state.qacc[i_d, i_b]
+                                    + constraint_state.search[i_d, i_b] * alpha
+                                )
+                                constraint_state.Ma[i_d, i_b] = (
+                                    constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+                                )
+                            for i_c in range(constraint_state.n_constraints[i_b]):
+                                constraint_state.Jaref[i_c, i_b] = (
+                                    constraint_state.Jaref[i_c, i_b]
+                                    + constraint_state.jv[i_c, i_b] * alpha
+                                )
+                            func_update_constraint_batch(
+                                i_b,
+                                qacc=constraint_state.qacc,
+                                Ma=constraint_state.Ma,
+                                cost=constraint_state.cost,
+                                dofs_state=dofs_state,
+                                constraint_state=constraint_state,
+                                static_rigid_sim_config=static_rigid_sim_config,
+                            )
+                            # Phase 6: build changed constraint list (per-env serial).
+                            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+                    qd.simt.block.sync()
+
+                    if constraint_state.improved[i_b]:
+                        # Decide whether the active set is unchanged enough to skip the factor.
+                        # First iter must always factor (no valid L in L_sh yet). After that, skip when no
+                        # constraints flipped active state.
+                        skip_factor = (local_iter > 1) and (constraint_state.incr_n_changed[i_b] == 0)
+
+                        # Phase 7: rebuild H from scratch on tid 0 (serial, slow but correct). Only runs when
+                        # we don't skip the factor — if we skip, the L_sh from last iter is still valid w.r.t.
+                        # the unchanged H (active set hasn't moved).
+                        if not skip_factor:
+                            if tid == 0:
+                                func_hessian_direct_batch(
+                                    i_b,
+                                    entities_info=entities_info,
+                                    constraint_state=constraint_state,
+                                    rigid_global_info=rigid_global_info,
+                                    static_rigid_sim_config=static_rigid_sim_config,
+                                )
+                            qd.simt.block.sync()
+
+                        # Phase 8: compute grad = Ma - force - qfrc_constraint on tid 0.
+                        if tid == 0:
+                            for i_d in range(n_dofs_static):
+                                constraint_state.grad[i_d, i_b] = (
+                                    constraint_state.Ma[i_d, i_b]
+                                    - dofs_state.force[i_d, i_b]
+                                    - constraint_state.qfrc_constraint[i_d, i_b]
+                                )
+                        qd.simt.block.sync()
+
+                        # Phase 9-10: tiled cholesky factor (16 lanes) + solve, with optional factor skip.
+                        # L_sh persists across iters of this while loop — the whole point of E5.
+                        func_cholesky_and_solve_body_skip(
+                            i_b,
+                            tid,
+                            L_sh,
+                            v_sh,
+                            skip_factor,
+                            constraint_state,
+                            rigid_global_info,
+                            static_rigid_sim_config,
+                        )
+                        qd.simt.block.sync()
+
+                        # Phase 11: update search direction (per-env serial on tid 0). Sets ``improved`` based on
+                        # convergence; the next iter's `while` predicate reads it to decide whether to break.
+                        if tid == 0:
+                            func_terminate_or_update_descent_batch(
+                                i_b,
+                                constraint_state=constraint_state,
+                                rigid_global_info=rigid_global_info,
+                                static_rigid_sim_config=static_rigid_sim_config,
+                            )
+                        qd.simt.block.sync()
+        else:
+            if tid == 0:
+                constraint_state.improved[i_b] = False
 
 
 # =====================================================================================================================
