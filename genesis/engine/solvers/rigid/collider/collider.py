@@ -816,11 +816,16 @@ class Collider:
                 self._solver._errno,
             )
 
-        if (
+        # deskai6 opt 10: func_prune_contacts now fuses the spatial clamp+sort into its phase 3,
+        # so when dedup runs we skip the standalone clamp_and_sort kernel (one less launch + one
+        # less full permute pass).
+        ran_fused_dedup = (
             self._collider_static_config.link_pair_pruning_supported
             and self._solver._options.contact_pruning_tolerance is not None
             and not self._solver._static_rigid_sim_config.requires_grad
-        ):
+        )
+
+        if ran_fused_dedup:
             func_prune_contacts(
                 self._solver._options.contact_pruning_tolerance,
                 self._collider_state,
@@ -828,7 +833,7 @@ class Collider:
                 self._solver._static_rigid_sim_config,
             )
 
-        if self._use_split_narrowphase:
+        if self._use_split_narrowphase and not ran_fused_dedup:
             func_clamp_and_sort_contacts(
                 self._collider_state,
                 self._collider_info,
