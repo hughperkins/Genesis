@@ -88,18 +88,19 @@ class Collider:
         self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mpr_to_gjk_overlap_ratio = 0.25
-        # Link-pair post-pass dedup (kernel_link_pair_dedup). Default tol_mult=10
-        # is the safe point from deskai6's sweep: +6.5% on dex_hand@4096, no
-        # NaN on duck_in_box_easy/hard (which crashed at tol_mult=100), and
-        # all test_smooth_box_no_drift variants pass (small primitives are
-        # gated out by link_has_multi_geom). Cap stays off because the sweep
-        # showed it gives no FPS benefit. Override via env vars
-        # QD_LP_DEDUP_TOL_MULT (float, scales geom-pair tolerance; 0 disables
-        # spatial dedup) and QD_LP_DEDUP_MAX_PER_PAIR (int, cap on contacts
-        # per link pair; 0 disables the cap). See
-        # perso_hugh/doc/deskai6_link_pair_dedup_2026may24.md §6 for the
-        # sweep data and §7 for the gating/safety work.
-        self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "10.0"))
+        # Link-pair post-pass dedup (kernel_link_pair_dedup). Off by default.
+        # tol_mult=10 with the multi-geom-per-link gating from 59c2d0bb is
+        # enough to break test_mesh_repair[True-True] (convexified spoon on a
+        # table: coacd seam contacts that the dedup merges turn out to be
+        # legitimately distinct in the rest pose, so the spoon's settled
+        # angular velocity drifts past the 0.1 rad/s tolerance) and to push
+        # test_frictionloss_advanced just over its 0.05 m drift tolerance.
+        # tol_mult=100 NaNs duck_in_box. Opt in for now with the env var; a
+        # safer formulation (e.g. an absolute merge-tolerance cap on top of
+        # the AABB-relative one, or a per-link-pair allowlist) is left for a
+        # followup. See perso_hugh/doc/deskai6_link_pair_dedup_2026may24.md
+        # §6 for the FPS sweep and §7 for the gating/safety work.
+        self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "0.0"))
         self._lp_dedup_max_per_pair = int(os.environ.get("QD_LP_DEDUP_MAX_PER_PAIR", "0"))
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
