@@ -604,30 +604,41 @@ def kernel_link_pair_dedup(
             if i < n:
                 ci_a = collider_state.contact_data.link_a[i, i_b]
                 ci_b = collider_state.contact_data.link_b[i, i_b]
-                ci_ga = collider_state.contact_data.geom_a[i, i_b]
-                ci_gb = collider_state.contact_data.geom_b[i, i_b]
-                ci_pos = collider_state.contact_data.pos[i, i_b]
-                lp_lo = qd.min(ci_a, ci_b)
-                lp_hi = qd.max(ci_a, ci_b)
-                tol = tol_mult * func_compute_tolerance(
-                    ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB
+                # Skip contacts whose link pair has no cross-geom-pair fanout: if
+                # neither link has >= 2 geoms, per-geom-pair dedup in narrowphase
+                # already handled any duplicates and merging more can only delete
+                # legit distinct contacts (this is what was killing
+                # test_smooth_box_no_drift and NaN-ing duck_in_box at tol_mult=100).
+                eligible = (
+                    collider_info.link_has_multi_geom[ci_a] != 0
+                    or collider_info.link_has_multi_geom[ci_b] != 0
                 )
+                drop = False
+                if eligible:
+                    ci_ga = collider_state.contact_data.geom_a[i, i_b]
+                    ci_gb = collider_state.contact_data.geom_b[i, i_b]
+                    ci_pos = collider_state.contact_data.pos[i, i_b]
+                    lp_lo = qd.min(ci_a, ci_b)
+                    lp_hi = qd.max(ci_a, ci_b)
+                    tol = tol_mult * func_compute_tolerance(
+                        ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB
+                    )
 
-                is_dup = False
-                same_lp_count = gs.qd_int(0)
-                for j in range(i):
-                    if not is_dup:
-                        cj_a = collider_state.contact_data.link_a[j, i_b]
-                        cj_b = collider_state.contact_data.link_b[j, i_b]
-                        lj_lo = qd.min(cj_a, cj_b)
-                        lj_hi = qd.max(cj_a, cj_b)
-                        if lj_lo == lp_lo and lj_hi == lp_hi:
-                            same_lp_count = same_lp_count + 1
-                            cj_pos = collider_state.contact_data.pos[j, i_b]
-                            if (ci_pos - cj_pos).norm() < tol:
-                                is_dup = True
+                    is_dup = False
+                    same_lp_count = gs.qd_int(0)
+                    for j in range(i):
+                        if not is_dup:
+                            cj_a = collider_state.contact_data.link_a[j, i_b]
+                            cj_b = collider_state.contact_data.link_b[j, i_b]
+                            lj_lo = qd.min(cj_a, cj_b)
+                            lj_hi = qd.max(cj_a, cj_b)
+                            if lj_lo == lp_lo and lj_hi == lp_hi:
+                                same_lp_count = same_lp_count + 1
+                                cj_pos = collider_state.contact_data.pos[j, i_b]
+                                if (ci_pos - cj_pos).norm() < tol:
+                                    is_dup = True
 
-                drop = is_dup or (max_per_pair > 0 and same_lp_count >= max_per_pair)
+                    drop = is_dup or (max_per_pair > 0 and same_lp_count >= max_per_pair)
 
                 if drop:
                     last = n - 1

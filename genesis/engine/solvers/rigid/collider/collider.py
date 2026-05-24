@@ -212,6 +212,7 @@ class Collider:
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
         self._init_max_contact_pairs(self._n_possible_pairs)
         self._init_terrain_state()
+        self._init_link_multi_geom()
 
         # Initialize [state], which stores every data that are may be updated at every single simulation step
         n_possible_pairs_ = max(self._n_possible_pairs, 1)
@@ -555,6 +556,21 @@ class Collider:
         self._collider_info.max_collision_pairs_broad[None] = max_contact_pairs_broad
         self._collider_info.max_contact_pairs[None] = max_contact_pairs
 
+    def _init_link_multi_geom(self):
+        # Populate link_has_multi_geom: link i -> 1 if it has >= 2 collidable geoms,
+        # 0 otherwise. Used to gate kernel_link_pair_dedup so the back-walk only runs
+        # for contacts whose link pair can actually have cross-geom-pair duplicates.
+        # Also derive a python-side flag for the kernel-call gate.
+        n_links = self._solver.n_links
+        if n_links == 0:
+            self._has_any_multi_geom_link = False
+            return
+        geom_link_idx = np.array([g.link.idx for g in self._solver.geoms], dtype=np.int32)
+        n_geoms_per_link = np.bincount(geom_link_idx, minlength=n_links)
+        link_has_multi_geom = (n_geoms_per_link >= 2).astype(gs.np_int)
+        self._collider_info.link_has_multi_geom.from_numpy(link_has_multi_geom)
+        self._has_any_multi_geom_link = bool(link_has_multi_geom.any())
+
     def _init_terrain_state(self):
         if self._collider_static_config.has_terrain:
             solver = self._solver
@@ -826,7 +842,10 @@ class Collider:
             )
 
         if self._use_split_narrowphase:
-            if self._lp_dedup_tol_mult > 0.0 or self._lp_dedup_max_per_pair > 0:
+            if (
+                (self._lp_dedup_tol_mult > 0.0 or self._lp_dedup_max_per_pair > 0)
+                and self._has_any_multi_geom_link
+            ):
                 kernel_link_pair_dedup(
                     self._solver.geoms_info,
                     self._solver.geoms_init_AABB,

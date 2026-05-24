@@ -785,6 +785,11 @@ class ColliderInfo:
     # the number of contacts kept per (link_a, link_b) pair; 0 disables the cap.
     lp_dedup_tol_mult: qd.Tensor
     lp_dedup_max_per_pair: qd.Tensor
+    # Static per-link flag: 1 if link has >= 2 geoms that participate in collision
+    # pairs, 0 otherwise. Used by kernel_link_pair_dedup to skip the back-walk for
+    # contacts whose link pair has no cross-geom-pair fanout (the only way the
+    # post-pass dedup can find duplicates), see perso_hugh/doc/link_dedupe.md §3.
+    link_has_multi_geom: qd.Tensor
     # differentiable contact tolerance
     diff_pos_tolerance: qd.Tensor
     diff_normal_tolerance: qd.Tensor
@@ -818,6 +823,7 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         mpr_to_gjk_overlap_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio"]),
         lp_dedup_tol_mult=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs.get("lp_dedup_tol_mult", 0.0)),
         lp_dedup_max_per_pair=V_SCALAR_FROM(dtype=gs.qd_int, value=kwargs.get("lp_dedup_max_per_pair", 0)),
+        link_has_multi_geom=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
         diff_pos_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_pos_tolerance"]),
         diff_normal_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_normal_tolerance"]),
     )
