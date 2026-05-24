@@ -601,19 +601,101 @@ def kernel_link_pair_dedup(
 
     See perso_hugh/doc/link_dedupe.md.
     """
-    # DIAGNOSTIC v4-noop: launched but body is empty. Isolates per-kernel
-    # GPU dispatch / scheduling cost from per-env compute cost. If the
-    # cluster benchmark still regresses with this kernel, the cost is the
-    # kernel dispatch itself (fix: fuse into clamp_and_sort). If the
-    # regression vanishes, the cost is per-env work (fix: make work cheaper
-    # or skip work via a build-time or runtime gate).
     _B = collider_state.n_contacts.shape[0]
-    _ = collider_info.mc_tolerance[None]
-    _ = collider_info.lp_dedup_tol_mult[None]
-    _ = collider_info.lp_dedup_max_per_pair[None]
+    mc_tol = collider_info.mc_tolerance[None]
+    tol_mult = collider_info.lp_dedup_tol_mult[None]
+    max_per_pair = collider_info.lp_dedup_max_per_pair[None]
+
+    # Cell size for the bloom pre-pass. The exact per-contact tolerance is
+    # `tol_mult * 0.5 * mc_tol * min(aabb_a, aabb_b)` which varies per geom
+    # pair; here we use a single global value `tol_mult * mc_tol` as a
+    # cheap proxy. False positives (contacts mapped into the same bucket
+    # that aren't actually within tol) only cost the wasted full pass.
+    # False negatives (contacts within tol mapped to adjacent buckets)
+    # let an occasional dup slip through, which is acceptable for a
+    # best-effort post-pass.
+    cell_inv = gs.qd_float(0.0)
+    if tol_mult * mc_tol > 0.0:
+        cell_inv = gs.qd_float(1.0) / (tol_mult * mc_tol)
+
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        _ = collider_state.n_contacts[i_b]
+        original_n = collider_state.n_contacts[i_b]
+        if original_n < 2:
+            continue
+
+        # Pre-pass O(n): 32-bit bloom over (link_pair, spatial_bucket).
+        # If no bit collision is detected, no two contacts in this env share
+        # both a link pair and a spatial cell, so the O(n^2) dedup walk
+        # cannot find anything to drop. We can also skip the walk unless
+        # the per-link-pair cap might fire (original_n > cap).
+        bloom = gs.qd_int(0)
+        any_collision = False
+        for i in range(original_n):
+            la = collider_state.contact_data.link_a[i, i_b]
+            lb = collider_state.contact_data.link_b[i, i_b]
+            lp_lo = qd.min(la, lb)
+            lp_hi = qd.max(la, lb)
+            pos = collider_state.contact_data.pos[i, i_b]
+            sx = qd.cast(pos[0] * cell_inv, gs.qd_int)
+            sy = qd.cast(pos[1] * cell_inv, gs.qd_int)
+            sz = qd.cast(pos[2] * cell_inv, gs.qd_int)
+            h = lp_lo * 73856093
+            h = (h ^ lp_hi) * 19349663
+            h = (h ^ sx) * 83492791
+            h = (h ^ sy) * 1583429111
+            h = (h ^ sz) * 1597334677
+            h = h & 31
+            bit = gs.qd_int(1) << h
+            if (bloom & bit) != 0:
+                any_collision = True
+            bloom = bloom | bit
+
+        need_full = any_collision or (max_per_pair > 0 and original_n > max_per_pair)
+        if not need_full:
+            continue
+
+        # O(n^2) walk: full link-pair dedup + per-pair cap.
+        n = original_n
+        i = gs.qd_int(1)
+        for _step in range(original_n):
+            if i < n:
+                ci_a = collider_state.contact_data.link_a[i, i_b]
+                ci_b = collider_state.contact_data.link_b[i, i_b]
+                ci_ga = collider_state.contact_data.geom_a[i, i_b]
+                ci_gb = collider_state.contact_data.geom_b[i, i_b]
+                ci_pos = collider_state.contact_data.pos[i, i_b]
+                lp_lo = qd.min(ci_a, ci_b)
+                lp_hi = qd.max(ci_a, ci_b)
+                tol = tol_mult * func_compute_tolerance(
+                    ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB
+                )
+
+                is_dup = False
+                same_lp_count = gs.qd_int(0)
+                for j in range(i):
+                    if not is_dup:
+                        cj_a = collider_state.contact_data.link_a[j, i_b]
+                        cj_b = collider_state.contact_data.link_b[j, i_b]
+                        lj_lo = qd.min(cj_a, cj_b)
+                        lj_hi = qd.max(cj_a, cj_b)
+                        if lj_lo == lp_lo and lj_hi == lp_hi:
+                            same_lp_count = same_lp_count + 1
+                            cj_pos = collider_state.contact_data.pos[j, i_b]
+                            if (ci_pos - cj_pos).norm() < tol:
+                                is_dup = True
+
+                drop = is_dup or (max_per_pair > 0 and same_lp_count >= max_per_pair)
+
+                if drop:
+                    last = n - 1
+                    if i != last:
+                        _func_copy_contact_slot(last, i, i_b, collider_state)
+                    n = n - 1
+                else:
+                    i = i + 1
+
+        collider_state.n_contacts[i_b] = n
 
 
 @qd.kernel(fastcache=True)
