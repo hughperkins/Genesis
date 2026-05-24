@@ -695,6 +695,9 @@ class ColliderState:
     narrowphase_work_queues: NarrowphaseWorkQueues
     contact_sort_key: qd.Tensor
     contact_sort_idx: qd.Tensor
+    contact_proj_v: qd.Tensor
+    contact_keep: qd.Tensor
+    contact_hull_stack: qd.Tensor
 
 
 def get_collider_state(
@@ -724,6 +727,7 @@ def get_collider_state(
     box_axi_shape = maybe_shape((3, _B), static_rigid_sim_config.box_box_detection)
     box_ppts2_shape = maybe_shape((4, 2, _B), static_rigid_sim_config.box_box_detection)
     box_pu_shape = maybe_shape((4, _B), static_rigid_sim_config.box_box_detection)
+    prune_shape = maybe_shape((max(max_contact_pairs, 1), _B), collider_static_config.link_pair_pruning_supported)
 
     return ColliderState(
         sort_buffer=get_sort_buffer(solver),
@@ -753,6 +757,9 @@ def get_collider_state(
         ),
         contact_sort_key=V(dtype=gs.qd_float, shape=(max(max_contact_pairs, 1), _B)),
         contact_sort_idx=V(dtype=gs.qd_int, shape=(max(max_contact_pairs, 1), _B)),
+        contact_proj_v=V(dtype=gs.qd_float, shape=prune_shape),
+        contact_keep=V(dtype=gs.qd_int, shape=prune_shape),
+        contact_hull_stack=V(dtype=gs.qd_int, shape=prune_shape),
     )
 
 
@@ -826,6 +833,11 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     has_non_box_plane_convex_convex: bool
     has_convex_specialization: bool
     has_nonconvex_nonterrain: bool
+    # True when link-pair contact pruning can ever do useful work. False when every link has at most one convex geom
+    # and no terrain is present, because each (link_a, link_b) bucket then holds at most one geom-pair's contacts
+    # (capped at n_contacts_per_pair) and the 2D hull would be at best a marginal reduction. Lets us skip the pruning
+    # kernel call and its scratch buffers entirely.
+    link_pair_pruning_supported: bool
     # maximum number of contact pairs per collision pair
     n_contacts_per_pair: int
     # ccd algorithm
