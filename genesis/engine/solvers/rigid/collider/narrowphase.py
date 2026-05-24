@@ -1391,29 +1391,14 @@ def func_convex_convex_contact(
                 ):
                     penetration = penetration_0
 
-                # Discard contact point if repeated.
-                # We dedup against every contact already written this substep that shares the
-                # same (link_a, link_b) pair, not just this geom pair's contacts. This collapses
-                # the redundancy between adjacent coacd parts of the same link contacting the
-                # other link (e.g. two drill-body parts both resting on the same table part).
-                # See perso_hugh/doc/link_dedupe.md.
+                # Discard contact point is repeated
                 repeated = False
-                link_a_new = geoms_info.link_idx[i_ga]
-                link_b_new = geoms_info.link_idx[i_gb]
-                lp_lo_new = qd.min(link_a_new, link_b_new)
-                lp_hi_new = qd.max(link_a_new, link_b_new)
-                n_contacts_so_far = collider_state.n_contacts[i_b]
-                for j in range(n_contacts_so_far):
+                for i_c in range(n_con):
                     if not repeated:
-                        idx_prev = n_contacts_so_far - 1 - j
-                        cl_a = collider_state.contact_data.link_a[idx_prev, i_b]
-                        cl_b = collider_state.contact_data.link_b[idx_prev, i_b]
-                        cl_lo = qd.min(cl_a, cl_b)
-                        cl_hi = qd.max(cl_a, cl_b)
-                        if cl_lo == lp_lo_new and cl_hi == lp_hi_new:
-                            prev_contact = collider_state.contact_data.pos[idx_prev, i_b]
-                            if (contact_pos - prev_contact).norm() < tolerance:
-                                repeated = True
+                        idx_prev = collider_state.n_contacts[i_b] - 1 - i_c
+                        prev_contact = collider_state.contact_data.pos[idx_prev, i_b]
+                        if (contact_pos - prev_contact).norm() < tolerance:
+                            repeated = True
 
                 if not repeated:
                     if penetration > -tolerance:
