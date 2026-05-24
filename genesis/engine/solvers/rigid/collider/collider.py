@@ -88,17 +88,18 @@ class Collider:
         self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mpr_to_gjk_overlap_ratio = 0.25
-        # Link-pair post-pass dedup (kernel_link_pair_dedup). Disabled by
-        # default while a per-link-pair fanout gate + AABB-scaled merge-radius
-        # clamp are still being landed; without those, tol_mult=100 NaN-s
-        # duck_in_box (coacd seam merging across whole sub-geoms) and breaks
-        # test_smooth_box_no_drift on small primitives. Override via env vars
+        # Link-pair post-pass dedup (kernel_link_pair_dedup). Default tol_mult=10
+        # is the safe point from deskai6's sweep: +6.5% on dex_hand@4096, no
+        # NaN on duck_in_box_easy/hard (which crashed at tol_mult=100), and
+        # all test_smooth_box_no_drift variants pass (small primitives are
+        # gated out by link_has_multi_geom). Cap stays off because the sweep
+        # showed it gives no FPS benefit. Override via env vars
         # QD_LP_DEDUP_TOL_MULT (float, scales geom-pair tolerance; 0 disables
-        # spatial dedup) and QD_LP_DEDUP_MAX_PER_PAIR (int, cap on contacts per
-        # link pair; 0 disables the cap). See
+        # spatial dedup) and QD_LP_DEDUP_MAX_PER_PAIR (int, cap on contacts
+        # per link pair; 0 disables the cap). See
         # perso_hugh/doc/deskai6_link_pair_dedup_2026may24.md §6 for the
-        # speedup data and §7 (in progress) for the safety work.
-        self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "0.0"))
+        # sweep data and §7 for the gating/safety work.
+        self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "10.0"))
         self._lp_dedup_max_per_pair = int(os.environ.get("QD_LP_DEDUP_MAX_PER_PAIR", "0"))
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
