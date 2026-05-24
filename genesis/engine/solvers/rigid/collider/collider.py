@@ -93,12 +93,6 @@ class Collider:
         # QD_LP_DEDUP_MAX_PER_PAIR (int, cap on contacts per link pair, 0 = off).
         self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "0.0"))
         self._lp_dedup_max_per_pair = int(os.environ.get("QD_LP_DEDUP_MAX_PER_PAIR", "0"))
-        if self._lp_dedup_tol_mult > 0.0 or self._lp_dedup_max_per_pair > 0:
-            print(
-                f"[desk12 dedup] tol_mult={self._lp_dedup_tol_mult} "
-                f"max_per_pair={self._lp_dedup_max_per_pair}",
-                flush=True,
-            )
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
         self._diff_normal_tolerance = 1e-2
@@ -826,9 +820,6 @@ class Collider:
 
         if self._use_split_narrowphase:
             if self._lp_dedup_tol_mult > 0.0 or self._lp_dedup_max_per_pair > 0:
-                if not getattr(self, "_lp_dedup_call_counted", False):
-                    print("[desk12 dedup] kernel_link_pair_dedup called", flush=True)
-                    self._lp_dedup_call_counted = True
                 kernel_link_pair_dedup(
                     self._solver.geoms_info,
                     self._solver.geoms_init_AABB,
