@@ -7,6 +7,7 @@ terrain), and contact management.
 """
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -82,8 +83,12 @@ class Collider:
     def __init__(self, rigid_solver: "RigidSolver"):
         self._solver = rigid_solver
 
-        self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
-        self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
+        # Env-var override allows benchmarking different mc_perturbation values without rebuilding;
+        # the default behavior is unchanged when GS_MC_PERTURBATION / GS_MC_TOLERANCE are unset.
+        _mc_pert_default = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
+        _mc_tol_default = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
+        self._mc_perturbation = float(os.environ.get("GS_MC_PERTURBATION", _mc_pert_default))
+        self._mc_tolerance = float(os.environ.get("GS_MC_TOLERANCE", _mc_tol_default))
         self._mpr_to_gjk_overlap_ratio = 0.25
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
