@@ -558,17 +558,32 @@ class Collider:
         self._collider_info.max_contact_pairs[None] = max_contact_pairs
 
     def _init_link_multi_geom(self):
-        # Populate link_has_multi_geom: link i -> 1 if it has >= 2 collidable geoms,
-        # 0 otherwise. Used to gate kernel_link_pair_dedup so the back-walk only runs
-        # for contacts whose link pair can actually have cross-geom-pair duplicates.
-        # Also derive a python-side flag for the kernel-call gate.
+        # Populate link_has_multi_geom: link i -> 1 if any single env can see the link
+        # with >= 2 simultaneously-active collision geoms, 0 otherwise. Used to gate
+        # kernel_link_pair_dedup so the back-walk only runs for contacts whose link
+        # pair can actually have cross-geom-pair duplicates. Also derives a
+        # python-side flag for the full kernel-call gate.
+        #
+        # For homogeneous links the count is simply link.n_geoms. For heterogeneous
+        # links (morph=(M1, M2, ...) creates variant geom ranges via
+        # _load_heterogeneous_morphs; only ONE variant is active per env), we count
+        # the largest variant's geom range so the gate matches the worst case any
+        # env actually sees. Without this, test_smooth_box_no_drift on the capsule
+        # entity (two single-geom variants on the same link) wrongly fires the
+        # dedup back-walk and drifts past the 1mm tolerance.
         n_links = self._solver.n_links
         if n_links == 0:
             self._has_any_multi_geom_link = False
             return
-        geom_link_idx = np.array([g.link.idx for g in self._solver.geoms], dtype=np.int32)
-        n_geoms_per_link = np.bincount(geom_link_idx, minlength=n_links)
-        link_has_multi_geom = (n_geoms_per_link >= 2).astype(gs.np_int)
+        link_has_multi_geom = np.zeros(n_links, dtype=gs.np_int)
+        for link in self._solver.links:
+            ranges = getattr(link, "_variant_geom_ranges", None)
+            if ranges is None:
+                n_active = link.n_geoms
+            else:
+                n_active = max((end - start for start, end in ranges), default=0)
+            if n_active >= 2:
+                link_has_multi_geom[link.idx] = 1
         self._collider_info.link_has_multi_geom.from_numpy(link_has_multi_geom)
         self._has_any_multi_geom_link = bool(link_has_multi_geom.any())
 
