@@ -142,7 +142,7 @@ class Collider:
             else:
                 ccd_algorithm = CCD_ALGORITHM_CODE.MPR
 
-        n_contacts_per_pair = 20 if self._solver._static_rigid_sim_config.requires_grad else 5
+        n_contacts_per_pair = 20 if self._solver._static_rigid_sim_config.requires_grad else 4
         if (
             self._solver._options.box_box_detection
             and sum(geom.type == gs.GEOM_TYPE.BOX for geom in self._solver.geoms) > 1
