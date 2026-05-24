@@ -10,6 +10,8 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
+import os
+
 import torch
 import trimesh
 
@@ -86,6 +88,11 @@ class Collider:
         self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1e-2
         self._mpr_to_gjk_overlap_ratio = 0.25
+        # Link-pair post-pass dedup (kernel_link_pair_dedup). Off by default; set via
+        # env vars QD_LP_DEDUP_TOL_MULT (float, scales geom-pair tolerance) and
+        # QD_LP_DEDUP_MAX_PER_PAIR (int, cap on contacts per link pair, 0 = off).
+        self._lp_dedup_tol_mult = float(os.environ.get("QD_LP_DEDUP_TOL_MULT", "0.0"))
+        self._lp_dedup_max_per_pair = int(os.environ.get("QD_LP_DEDUP_MAX_PER_PAIR", "0"))
         self._box_MAXCONPAIR = 16
         self._diff_pos_tolerance = 1e-2
         self._diff_normal_tolerance = 1e-2
@@ -188,6 +195,8 @@ class Collider:
             mc_perturbation=self._mc_perturbation,
             mc_tolerance=self._mc_tolerance,
             mpr_to_gjk_overlap_ratio=self._mpr_to_gjk_overlap_ratio,
+            lp_dedup_tol_mult=self._lp_dedup_tol_mult,
+            lp_dedup_max_per_pair=self._lp_dedup_max_per_pair,
             diff_pos_tolerance=self._diff_pos_tolerance,
             diff_normal_tolerance=self._diff_normal_tolerance,
         )
@@ -810,13 +819,14 @@ class Collider:
             )
 
         if self._use_split_narrowphase:
-            kernel_link_pair_dedup(
-                self._solver.geoms_info,
-                self._solver.geoms_init_AABB,
-                self._collider_state,
-                self._collider_info,
-                self._solver._static_rigid_sim_config,
-            )
+            if self._lp_dedup_tol_mult > 0.0 or self._lp_dedup_max_per_pair > 0:
+                kernel_link_pair_dedup(
+                    self._solver.geoms_info,
+                    self._solver.geoms_init_AABB,
+                    self._collider_state,
+                    self._collider_info,
+                    self._solver._static_rigid_sim_config,
+                )
             func_clamp_and_sort_contacts(
                 self._collider_state,
                 self._collider_info,

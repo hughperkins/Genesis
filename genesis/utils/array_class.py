@@ -779,6 +779,12 @@ class ColliderInfo:
     mc_perturbation: qd.Tensor
     mc_tolerance: qd.Tensor
     mpr_to_gjk_overlap_ratio: qd.Tensor
+    # Link-pair post-pass dedup parameters (see kernel_link_pair_dedup in contact.py).
+    # lp_dedup_tol_mult scales the per-geom-pair tolerance for cross-geom-pair spatial
+    # dedup within a link pair; 0 keeps the old tolerance. lp_dedup_max_per_pair caps
+    # the number of contacts kept per (link_a, link_b) pair; 0 disables the cap.
+    lp_dedup_tol_mult: qd.Tensor
+    lp_dedup_max_per_pair: qd.Tensor
     # differentiable contact tolerance
     diff_pos_tolerance: qd.Tensor
     diff_normal_tolerance: qd.Tensor
@@ -810,6 +816,8 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         mc_perturbation=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mc_perturbation"]),
         mc_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mc_tolerance"]),
         mpr_to_gjk_overlap_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio"]),
+        lp_dedup_tol_mult=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs.get("lp_dedup_tol_mult", 0.0)),
+        lp_dedup_max_per_pair=V_SCALAR_FROM(dtype=gs.qd_int, value=kwargs.get("lp_dedup_max_per_pair", 0)),
         diff_pos_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_pos_tolerance"]),
         diff_normal_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_normal_tolerance"]),
     )

@@ -563,30 +563,43 @@ def kernel_link_pair_dedup(
     collider_info: array_class.ColliderInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Post-pass spatial dedup of contacts that share the same (link_a, link_b) pair.
+    """Post-pass dedup + cap on contacts that share the same (link_a, link_b) pair.
 
-    The narrowphase emits contacts on a per-geom-pair basis and dedups within each geom
-    pair's own write set. When a single link is decomposed into multiple convex sub-geoms
-    (e.g. coacd parts of a drill or table) and two of those sub-geoms collide with the
-    same other link, the seam between them produces near-duplicate contact points that
-    cannot be caught by per-geom-pair dedup.
+    Narrowphase emits contacts per (i_ga, i_gb) and only dedups within each geom pair.
+    When one link is decomposed into multiple convex sub-geoms (e.g. coacd parts of a
+    drill) and two of those sub-geoms collide with the same other link, the seam between
+    them produces near-duplicate contact points that cannot be caught by per-geom-pair
+    dedup. Additionally, each geom pair emits up to n_contacts_per_pair points from the
+    perturb-and-redetect multi-contact algorithm, so two geom pairs of the same link
+    pair can produce up to 2*n_contacts_per_pair points where MJW polygon clipping would
+    produce ~4.
 
-    This kernel runs after narrowphase has completed. For each env we walk the contact
-    buffer front-to-back; for each contact i we check whether any earlier kept contact
-    j shares the same (link_a, link_b) pair (order-insensitive) and lies within the
-    geom-pair tolerance of i. If so, i is dropped by overwriting it with the contact
-    at slot n-1 and decrementing n_contacts. See perso_hugh/doc/link_dedupe.md.
+    This kernel runs after narrowphase has completed and applies two reductions per env:
+
+    1. Spatial dedup using a tolerance multiplied by lp_dedup_tol_mult relative to the
+       per-geom-pair tolerance. With the multiplier set well above 1, contacts that are
+       physically the same patch (drill-part seams) collapse, while contacts at distinct
+       regions of the same link pair (the two ends of a long drill on the table) survive
+       because they are much farther apart than the loosened tolerance.
+
+    2. Per-link-pair count cap at lp_dedup_max_per_pair: once a (link_a, link_b) pair
+       has accumulated that many kept contacts, further contacts of the same pair are
+       dropped regardless of position. This caps the runaway from multi-coacd-part link
+       pairs and matches the manifold-vertex budget that polygon-clipping algorithms use.
+
+    Drops are performed by overwriting slot i with slot n-1 and decrementing n_contacts.
+    See perso_hugh/doc/link_dedupe.md.
     """
     _B = collider_state.n_contacts.shape[0]
     mc_tol = collider_info.mc_tolerance[None]
+    tol_mult = collider_info.lp_dedup_tol_mult[None]
+    max_per_pair = collider_info.lp_dedup_max_per_pair[None]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         original_n = collider_state.n_contacts[i_b]
         n = original_n
         i = gs.qd_int(1)
-        # Bounded outer iteration: at most original_n drops; each iteration either
-        # advances i or shrinks n.
         for _step in range(original_n):
             if i < n:
                 ci_a = collider_state.contact_data.link_a[i, i_b]
@@ -596,9 +609,12 @@ def kernel_link_pair_dedup(
                 ci_pos = collider_state.contact_data.pos[i, i_b]
                 lp_lo = qd.min(ci_a, ci_b)
                 lp_hi = qd.max(ci_a, ci_b)
-                tol = func_compute_tolerance(ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB)
+                tol = tol_mult * func_compute_tolerance(
+                    ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB
+                )
 
                 is_dup = False
+                same_lp_count = gs.qd_int(0)
                 for j in range(i):
                     if not is_dup:
                         cj_a = collider_state.contact_data.link_a[j, i_b]
@@ -606,11 +622,14 @@ def kernel_link_pair_dedup(
                         lj_lo = qd.min(cj_a, cj_b)
                         lj_hi = qd.max(cj_a, cj_b)
                         if lj_lo == lp_lo and lj_hi == lp_hi:
+                            same_lp_count = same_lp_count + 1
                             cj_pos = collider_state.contact_data.pos[j, i_b]
                             if (ci_pos - cj_pos).norm() < tol:
                                 is_dup = True
 
-                if is_dup:
+                drop = is_dup or (max_per_pair > 0 and same_lp_count >= max_per_pair)
+
+                if drop:
                     last = n - 1
                     if i != last:
                         _func_copy_contact_slot(last, i, i_b, collider_state)
