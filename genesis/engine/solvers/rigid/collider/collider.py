@@ -48,6 +48,7 @@ from .contact import (
     func_rotate_frame,
     func_set_upstream_grad,
     func_clamp_and_sort_contacts,
+    kernel_link_pair_dedup,
 )
 from . import narrowphase
 from .narrowphase import (
@@ -809,6 +810,13 @@ class Collider:
             )
 
         if self._use_split_narrowphase:
+            kernel_link_pair_dedup(
+                self._solver.geoms_info,
+                self._solver.geoms_init_AABB,
+                self._collider_state,
+                self._collider_info,
+                self._solver._static_rigid_sim_config,
+            )
             func_clamp_and_sort_contacts(
                 self._collider_state,
                 self._collider_info,

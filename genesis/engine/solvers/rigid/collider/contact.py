@@ -535,6 +535,92 @@ def func_rotate_frame(
     return new_pos, new_quat
 
 
+@qd.func
+def _func_copy_contact_slot(
+    i_src,
+    i_dst,
+    i_b,
+    collider_state: array_class.ColliderState,
+):
+    collider_state.contact_data.geom_a[i_dst, i_b] = collider_state.contact_data.geom_a[i_src, i_b]
+    collider_state.contact_data.geom_b[i_dst, i_b] = collider_state.contact_data.geom_b[i_src, i_b]
+    collider_state.contact_data.normal[i_dst, i_b] = collider_state.contact_data.normal[i_src, i_b]
+    collider_state.contact_data.pos[i_dst, i_b] = collider_state.contact_data.pos[i_src, i_b]
+    collider_state.contact_data.penetration[i_dst, i_b] = collider_state.contact_data.penetration[i_src, i_b]
+    collider_state.contact_data.friction[i_dst, i_b] = collider_state.contact_data.friction[i_src, i_b]
+    collider_state.contact_data.sol_params[i_dst, i_b] = collider_state.contact_data.sol_params[i_src, i_b]
+    collider_state.contact_data.force[i_dst, i_b] = collider_state.contact_data.force[i_src, i_b]
+    collider_state.contact_data.link_a[i_dst, i_b] = collider_state.contact_data.link_a[i_src, i_b]
+    collider_state.contact_data.link_b[i_dst, i_b] = collider_state.contact_data.link_b[i_src, i_b]
+    collider_state.contact_data.pair_idx[i_dst, i_b] = collider_state.contact_data.pair_idx[i_src, i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_link_pair_dedup(
+    geoms_info: array_class.GeomsInfo,
+    geoms_init_AABB: array_class.GeomsInitAABB,
+    collider_state: array_class.ColliderState,
+    collider_info: array_class.ColliderInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Post-pass spatial dedup of contacts that share the same (link_a, link_b) pair.
+
+    The narrowphase emits contacts on a per-geom-pair basis and dedups within each geom
+    pair's own write set. When a single link is decomposed into multiple convex sub-geoms
+    (e.g. coacd parts of a drill or table) and two of those sub-geoms collide with the
+    same other link, the seam between them produces near-duplicate contact points that
+    cannot be caught by per-geom-pair dedup.
+
+    This kernel runs after narrowphase has completed. For each env we walk the contact
+    buffer front-to-back; for each contact i we check whether any earlier kept contact
+    j shares the same (link_a, link_b) pair (order-insensitive) and lies within the
+    geom-pair tolerance of i. If so, i is dropped by overwriting it with the contact
+    at slot n-1 and decrementing n_contacts. See perso_hugh/doc/link_dedupe.md.
+    """
+    _B = collider_state.n_contacts.shape[0]
+    mc_tol = collider_info.mc_tolerance[None]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        original_n = collider_state.n_contacts[i_b]
+        n = original_n
+        i = gs.qd_int(1)
+        # Bounded outer iteration: at most original_n drops; each iteration either
+        # advances i or shrinks n.
+        for _step in range(original_n):
+            if i < n:
+                ci_a = collider_state.contact_data.link_a[i, i_b]
+                ci_b = collider_state.contact_data.link_b[i, i_b]
+                ci_ga = collider_state.contact_data.geom_a[i, i_b]
+                ci_gb = collider_state.contact_data.geom_b[i, i_b]
+                ci_pos = collider_state.contact_data.pos[i, i_b]
+                lp_lo = qd.min(ci_a, ci_b)
+                lp_hi = qd.max(ci_a, ci_b)
+                tol = func_compute_tolerance(ci_ga, ci_gb, i_b, mc_tol, geoms_info, geoms_init_AABB)
+
+                is_dup = False
+                for j in range(i):
+                    if not is_dup:
+                        cj_a = collider_state.contact_data.link_a[j, i_b]
+                        cj_b = collider_state.contact_data.link_b[j, i_b]
+                        lj_lo = qd.min(cj_a, cj_b)
+                        lj_hi = qd.max(cj_a, cj_b)
+                        if lj_lo == lp_lo and lj_hi == lp_hi:
+                            cj_pos = collider_state.contact_data.pos[j, i_b]
+                            if (ci_pos - cj_pos).norm() < tol:
+                                is_dup = True
+
+                if is_dup:
+                    last = n - 1
+                    if i != last:
+                        _func_copy_contact_slot(last, i, i_b, collider_state)
+                    n = n - 1
+                else:
+                    i = i + 1
+
+        collider_state.n_contacts[i_b] = n
+
+
 @qd.kernel(fastcache=True)
 def func_clamp_and_sort_contacts(
     collider_state: array_class.ColliderState,
