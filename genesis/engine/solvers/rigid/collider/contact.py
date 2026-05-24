@@ -588,6 +588,17 @@ def kernel_link_pair_dedup(
        pairs and matches the manifold-vertex budget that polygon-clipping algorithms use.
 
     Drops are performed by overwriting slot i with slot n-1 and decrementing n_contacts.
+
+    Per-env pre-pass: a 32-bit bloom filter over (link_pair, spatial_bucket) keys
+    detects in O(n) whether any two contacts share both a link pair and a
+    spatial cell. If not, the O(n^2) walk would do no work and is skipped.
+    This makes the kernel near-free on scenes whose contacts don't have any
+    link-pair-redundancy potential (e.g. quadruped feet ↔ plane, single duck
+    mesh ↔ box walls), so the dedup can be on-by-default without regressing
+    those scenes. False positives (hash collisions) only cost a wasted full
+    pass; false negatives (contacts within tol mapped to adjacent cells) let
+    an occasional dup through, acceptable for a best-effort post-pass.
+
     See perso_hugh/doc/link_dedupe.md.
     """
     _B = collider_state.n_contacts.shape[0]
@@ -595,9 +606,56 @@ def kernel_link_pair_dedup(
     tol_mult = collider_info.lp_dedup_tol_mult[None]
     max_per_pair = collider_info.lp_dedup_max_per_pair[None]
 
+    # Cell size for the bloom pre-pass. The exact per-contact tolerance is
+    # `tol_mult * 0.5 * mc_tol * min(aabb_a, aabb_b)` which varies per geom
+    # pair; here we use a single global value `tol_mult * mc_tol` as a
+    # cheap proxy. False positives (contacts mapped into the same bucket
+    # that aren't actually within tol) only cost the wasted full pass.
+    # False negatives (contacts within tol mapped to adjacent buckets)
+    # let an occasional dup slip through, which is acceptable for a
+    # best-effort post-pass.
+    cell_inv = gs.qd_float(0.0)
+    if tol_mult * mc_tol > 0.0:
+        cell_inv = gs.qd_float(1.0) / (tol_mult * mc_tol)
+
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         original_n = collider_state.n_contacts[i_b]
+        if original_n < 2:
+            continue
+
+        # Pre-pass O(n): 32-bit bloom over (link_pair, spatial_bucket).
+        # If no bit collision is detected, no two contacts in this env share
+        # both a link pair and a spatial cell, so the O(n^2) dedup walk
+        # cannot find anything to drop. We can also skip the walk unless
+        # the per-link-pair cap might fire (original_n > cap).
+        bloom = gs.qd_int(0)
+        any_collision = False
+        for i in range(original_n):
+            la = collider_state.contact_data.link_a[i, i_b]
+            lb = collider_state.contact_data.link_b[i, i_b]
+            lp_lo = qd.min(la, lb)
+            lp_hi = qd.max(la, lb)
+            pos = collider_state.contact_data.pos[i, i_b]
+            sx = qd.cast(pos[0] * cell_inv, gs.qd_int)
+            sy = qd.cast(pos[1] * cell_inv, gs.qd_int)
+            sz = qd.cast(pos[2] * cell_inv, gs.qd_int)
+            h = lp_lo * 73856093
+            h = (h ^ lp_hi) * 19349663
+            h = (h ^ sx) * 83492791
+            h = (h ^ sy) * 1583429111
+            h = (h ^ sz) * 1597334677
+            h = h & 31
+            bit = gs.qd_int(1) << h
+            if (bloom & bit) != 0:
+                any_collision = True
+            bloom = bloom | bit
+
+        need_full = any_collision or (max_per_pair > 0 and original_n > max_per_pair)
+        if not need_full:
+            continue
+
+        # O(n^2) walk: full link-pair dedup + per-pair cap.
         n = original_n
         i = gs.qd_int(1)
         for _step in range(original_n):
