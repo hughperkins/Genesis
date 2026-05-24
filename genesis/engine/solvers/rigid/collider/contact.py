@@ -683,35 +683,44 @@ def func_prune_contacts(
     cos_normal_tol = qd.sqrt(qd.max(gs.qd_float(1.0) - tol * tol, gs.qd_float(0.0)))
     EPS = gs.qd_float(1e-12)
 
-    # deskai6 opt 9b (warp-coop): 32 threads per env (block_dim=32). Whole body runs on lane 0;
-    # this is a baseline measurement before adding tid-stride parallelism on hot sections.
+    # deskai6 opt 9d (real warp-coop, stage 1): pull contact_keep init and phase-1a key+idx init
+    # OUT of `if tid == 0:` and parallelize them across the 32 lanes (stride-tid). Phase 1a
+    # sort, phase 2 bucket walk, and phase 3 (sort + cycle-permute) stay serial on lane 0.
+    # Subsequent stages add coop reductions (phase-2 mean / centroid) and parallel cycle-permute.
     _K = qd.static(32)
     qd.loop_config(name="prune_contacts_coop", block_dim=_K)
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
+        # All lanes compute n_con (cheap, no memory write on non-lane-0).
+        n_con = qd.min(collider_state.n_contacts[i_b], max_contact_pairs)
         if tid == 0:
-            n_con = qd.min(collider_state.n_contacts[i_b], max_contact_pairs)
             collider_state.n_contacts[i_b] = n_con
 
-            # Default: keep everything. Marked here unconditionally so the fused phase 3
-            # (compact + spatial sort) below produces a correct result for envs with n_con < 5
-            # (no dedup buckets, but still need spatial sort).
-            for i in range(n_con):
-                collider_state.contact_keep[i, i_b] = 1
+        # PARALLEL: contact_keep init. Default-keep marked here unconditionally so the fused
+        # phase 3 (compact + spatial sort) below produces a correct result for envs with n_con
+        # < 5 (no dedup buckets, but still need spatial sort). 32 lanes stride.
+        ii = tid
+        while ii < n_con:
+            collider_state.contact_keep[ii, i_b] = 1
+            ii += _K
 
-            if n_con >= 5:
-                # Phase 1a: insertion-sort indices by canonical (min_link, max_link) key.
-                for i in range(n_con):
-                    la = collider_state.contact_data.link_a[i, i_b]
-                    lb = collider_state.contact_data.link_b[i, i_b]
-                    la_min = qd.min(la, lb)
-                    la_max = qd.max(la, lb)
-                    collider_state.contact_sort_key[i, i_b] = qd.cast(la_min, gs.qd_float) * LP_KEY_STRIDE + qd.cast(
-                        la_max, gs.qd_float
-                    )
-                    collider_state.contact_sort_idx[i, i_b] = i
+        if n_con >= 5:
+            # PARALLEL: phase 1a key + idx init, 32 lanes stride.
+            ii = tid
+            while ii < n_con:
+                la = collider_state.contact_data.link_a[ii, i_b]
+                lb = collider_state.contact_data.link_b[ii, i_b]
+                la_min = qd.min(la, lb)
+                la_max = qd.max(la, lb)
+                collider_state.contact_sort_key[ii, i_b] = qd.cast(la_min, gs.qd_float) * LP_KEY_STRIDE + qd.cast(
+                    la_max, gs.qd_float
+                )
+                collider_state.contact_sort_idx[ii, i_b] = ii
+                ii += _K
 
+            if tid == 0:
+                # SERIAL on lane 0: phase 1a insertion sort + phase 2 bucket walk.
                 for i in range(1, n_con):
                     ck = collider_state.contact_sort_key[i, i_b]
                     if collider_state.contact_sort_key[i - 1, i_b] <= ck:
@@ -727,47 +736,63 @@ def func_prune_contacts(
                     collider_state.contact_sort_key[j + 1, i_b] = ck
                     collider_state.contact_sort_idx[j + 1, i_b] = ci
 
-                # Phase 2: walk link-pair buckets via contact_sort_idx (link-pair perm).
-                # deskai6 opt 5: the bucket-boundary walk previously did 2 indirect reads
-                # (contact_sort_idx, contact_data.{link_a,link_b}) + min/max per step. The link-pair
-                # key is *already cached* in contact_sort_key from phase 1a, so a single direct read
-                # suffices.
-                b_start = 0
-                while b_start < n_con:
-                    key0 = collider_state.contact_sort_key[b_start, i_b]
-                    b_end = b_start + 1
-                    while b_end < n_con:
-                        if collider_state.contact_sort_key[b_end, i_b] != key0:
-                            break
-                        b_end += 1
-                    b_size = b_end - b_start
 
-                    if b_size >= 5:
-                        # Mean normal (folded to the hemisphere of bucket-first contact) and centroid.
-                        ref_src = collider_state.contact_sort_idx[b_start, i_b]
-                        ref_n = collider_state.contact_data.normal[ref_src, i_b]
-                        rnx = ref_n[0]
-                        rny = ref_n[1]
-                        rnz = ref_n[2]
-                        mnx = gs.qd_float(0.0)
-                        mny = gs.qd_float(0.0)
-                        mnz = gs.qd_float(0.0)
-                        cx = gs.qd_float(0.0)
-                        cy = gs.qd_float(0.0)
-                        cz = gs.qd_float(0.0)
-                        for i in range(b_start, b_end):
-                            src_i = collider_state.contact_sort_idx[i, i_b]
-                            n_i = collider_state.contact_data.normal[src_i, i_b]
-                            s = gs.qd_float(1.0)
-                            if rnx * n_i[0] + rny * n_i[1] + rnz * n_i[2] < gs.qd_float(0.0):
-                                s = gs.qd_float(-1.0)
-                            mnx += s * n_i[0]
-                            mny += s * n_i[1]
-                            mnz += s * n_i[2]
-                            p_i = collider_state.contact_data.pos[src_i, i_b]
-                            cx += p_i[0]
-                            cy += p_i[1]
-                            cz += p_i[2]
+            qd.simt.subgroup.sync()
+
+            # Phase 2 (deskai6 opt 9d stage 2): bucket walk runs on ALL 32 lanes. The outer control
+            # flow (find b_end, iterate buckets) is duplicated across lanes since the inputs are
+            # all in DRAM (cache-friendly). Inside a bucket, the mean-normal / centroid sum is
+            # done coop via 6 reduce_all_add_tiled calls. The rest of the bucket processing
+            # (coplanarity check with early-exit, in-plane basis, projection, lex sort, hull
+            # build, mark survivors) stays serial on lane 0.
+            b_start = 0
+            while b_start < n_con:
+                key0 = collider_state.contact_sort_key[b_start, i_b]
+                b_end = b_start + 1
+                while b_end < n_con:
+                    if collider_state.contact_sort_key[b_end, i_b] != key0:
+                        break
+                    b_end += 1
+                b_size = b_end - b_start
+
+                if b_size >= 5:
+                    ref_src = collider_state.contact_sort_idx[b_start, i_b]
+                    ref_n = collider_state.contact_data.normal[ref_src, i_b]
+                    rnx = ref_n[0]
+                    rny = ref_n[1]
+                    rnz = ref_n[2]
+                    mnx_l = gs.qd_float(0.0)
+                    mny_l = gs.qd_float(0.0)
+                    mnz_l = gs.qd_float(0.0)
+                    cx_l = gs.qd_float(0.0)
+                    cy_l = gs.qd_float(0.0)
+                    cz_l = gs.qd_float(0.0)
+                    jj = b_start + tid
+                    while jj < b_end:
+                        src_i = collider_state.contact_sort_idx[jj, i_b]
+                        n_i = collider_state.contact_data.normal[src_i, i_b]
+                        s = gs.qd_float(1.0)
+                        if rnx * n_i[0] + rny * n_i[1] + rnz * n_i[2] < gs.qd_float(0.0):
+                            s = gs.qd_float(-1.0)
+                        mnx_l += s * n_i[0]
+                        mny_l += s * n_i[1]
+                        mnz_l += s * n_i[2]
+                        p_i = collider_state.contact_data.pos[src_i, i_b]
+                        cx_l += p_i[0]
+                        cy_l += p_i[1]
+                        cz_l += p_i[2]
+                        jj += _K
+
+                    mnx = qd.simt.subgroup.reduce_all_add_tiled(mnx_l, 5)
+                    mny = qd.simt.subgroup.reduce_all_add_tiled(mny_l, 5)
+                    mnz = qd.simt.subgroup.reduce_all_add_tiled(mnz_l, 5)
+                    cx = qd.simt.subgroup.reduce_all_add_tiled(cx_l, 5)
+                    cy = qd.simt.subgroup.reduce_all_add_tiled(cy_l, 5)
+                    cz = qd.simt.subgroup.reduce_all_add_tiled(cz_l, 5)
+
+                    if tid == 0:
+                        # POST-REDUCE: all serial bucket processing on lane 0. Uses the
+                        # broadcast-by-reduce values of mnx/mny/mnz/cx/cy/cz.
                         inv_n = gs.qd_float(1.0) / qd.cast(b_size, gs.qd_float)
                         cx *= inv_n
                         cy *= inv_n
@@ -832,24 +857,16 @@ def func_prune_contacts(
                             vy = mnz * ux - mnx * uz
                             vz = mnx * uy - mny * ux
 
-                            # Project bucket contacts to (u, v). Store u/v at sort-position i
-                            # (overwriting the now-consumed link-pair sort key). The original-position
-                            # is contact_sort_idx[i, i_b].
                             for i in range(b_start, b_end):
                                 src_i = collider_state.contact_sort_idx[i, i_b]
                                 p_i = collider_state.contact_data.pos[src_i, i_b]
                                 collider_state.contact_sort_key[i, i_b] = p_i[0] * ux + p_i[1] * uy + p_i[2] * uz
                                 collider_state.contact_proj_v[i, i_b] = p_i[0] * vx + p_i[1] * vy + p_i[2] * vz
 
-                            # Mark all bucket entries as drop *now*, while contact_sort_idx still holds
-                            # the link-pair perm (we'll selectively re-mark hull survivors below).
                             for i in range(b_start, b_end):
                                 orig = collider_state.contact_sort_idx[i, i_b]
                                 collider_state.contact_keep[orig, i_b] = 0
 
-                            # Lex sort: arrange bucket sort-positions into (u, v) lex order in
-                            # contact_lex_idx. contact_sort_idx is left untouched (next bucket walk
-                            # needs it intact at positions [b_end..]).
                             for i in range(b_start, b_end):
                                 collider_state.contact_lex_idx[i, i_b] = i
                             for i in range(b_start + 1, b_end):
@@ -867,14 +884,8 @@ def func_prune_contacts(
                                     j -= 1
                                 collider_state.contact_lex_idx[j + 1, i_b] = ci
 
-                            # Collinearity threshold for hull pops, scaled to the bucket extent. A
-                            # pure "cross <= 0" check fails on numerically-near-collinear edge points
-                            # (cross is a tiny positive epsilon from float roundoff), so genuine
-                            # midpoints survive as spurious hull vertices.
                             hull_collinear_tol = tol * max_in_plane_r2
 
-                            # Andrew's monotone chain. Stack holds *sort-positions*; we map them to
-                            # original positions only when flagging contact_keep at the end.
                             k = 0
                             for i in range(b_start, b_end):
                                 ci = collider_state.contact_lex_idx[i, i_b]
@@ -896,11 +907,9 @@ def func_prune_contacts(
                                 k += 1
 
                             upper_start = k
-                            # quadrants range supports 1 or 2 args only; iterate lex indices
-                            # backward over [b_start, b_end - 2] by reflecting the index.
                             for k_step in range(b_size - 1):
-                                ii = b_end - 2 - k_step
-                                ci = collider_state.contact_lex_idx[ii, i_b]
+                                ii_lex = b_end - 2 - k_step
+                                ci = collider_state.contact_lex_idx[ii_lex, i_b]
                                 cu = collider_state.contact_sort_key[ci, i_b]
                                 cv = collider_state.contact_proj_v[ci, i_b]
                                 while k >= upper_start + 1:
@@ -915,24 +924,18 @@ def func_prune_contacts(
                                         k -= 1
                                     else:
                                         break
-                                # The closing iteration of the upper hull visits the leftmost point,
-                                # which already sits at stack[b_start] from the lower hull. Skipping
-                                # that push bounds k to b_size and keeps the write index within
-                                # max_contact_pairs even when a single bucket consumes the whole budget.
                                 if ci != collider_state.contact_hull_stack[b_start, i_b] and k < b_size:
                                     collider_state.contact_hull_stack[b_start + k, i_b] = ci
                                     k += 1
 
-                            # Chain holds k unique hull-vertex *sort-positions*. Translate each to its
-                            # original position via the still-intact link-pair perm and flip
-                            # contact_keep at the original slot.
                             for hk in range(k):
                                 survivor_sort = collider_state.contact_hull_stack[b_start + hk, i_b]
                                 survivor_orig = collider_state.contact_sort_idx[survivor_sort, i_b]
                                 collider_state.contact_keep[survivor_orig, i_b] = 1
 
-                    b_start = b_end
+                b_start = b_end
 
+        if tid == 0:
             # Phase 3 (deskai6 opt 10): FUSED compact + spatial sort.
             # Replaces:
             #   - dedup phase 3 (compact based on contact_keep)
