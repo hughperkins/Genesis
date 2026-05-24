@@ -833,7 +833,15 @@ def _func_newton_only_nt_hessian(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
 ):
-    """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others)."""
+    """Full tiled Hessian rebuild for envs with use_full_hessian == 1 (skips others).
+
+    Split M-init: ``func_init_nt_H_from_mass_mat`` writes M into nt_H first, then the tiled JTDAJ pass
+    accumulates the constraint contributions.  Both kernels share the same ``check_full_hessian`` gate so
+    only the to-be-rebuilt envs are touched.
+    """
+    solver.func_init_nt_H_from_mass_mat(
+        constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
+    )
     solver.func_hessian_direct_tiled(
         constraint_state=constraint_state, rigid_global_info=rigid_global_info, check_full_hessian=True
     )
@@ -849,7 +857,11 @@ def _func_newton_only_nt_hessian_and_cholesky(
 
     Matches origin/main behavior: H is rebuilt from scratch every iteration, then Cholesky overwrites nt_H with L
     in-place.  H patching is not used because the subsequent Cholesky would destroy H anyway.
+
+    Split M-init: ``func_init_nt_H_from_mass_mat`` writes M into nt_H first, then the tiled JTDAJ pass
+    accumulates the constraint contributions.
     """
+    solver.func_init_nt_H_from_mass_mat(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     solver.func_hessian_direct_tiled(constraint_state=constraint_state, rigid_global_info=rigid_global_info)
     if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
         solver.func_cholesky_factor_direct_tiled(

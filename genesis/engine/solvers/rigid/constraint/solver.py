@@ -1679,24 +1679,70 @@ def func_hessian_direct_batch(
 
 
 @qd.func
+def func_init_nt_H_from_mass_mat(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    check_full_hessian: qd.template() = False,
+):
+    """Initialize ``nt_H[i_b, :, :]`` lower triangle with the mass matrix ``M``.
+
+    Pure memory-bound copy: per-env block of 128 threads, each thread strides through
+    ``n_lower_tri`` entries.  Runs once before ``func_hessian_direct_tiled`` so the latter
+    becomes a pure ``H += J^T D J`` accumulation kernel with no per-tile ``if i_c_start == 0``
+    branches and no ``if n_c == 0`` fallback.
+
+    Gates match ``func_hessian_direct_tiled``: ``n_constraints[i_b] > 0 and improved[i_b]``,
+    plus ``use_full_hessian[i_b] == 1`` when ``check_full_hessian`` is set.
+
+    This is the deferred direction #1 from ``hessian_sweep_summary_2026may22.md`` and resolves
+    the existing TODO in ``func_hessian_direct_tiled``: "Consider moving `H += M` in a
+    dedicated CUDA kernel.  It should be both simpler and faster."
+    """
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.nt_H.shape[1]
+    n_lower_tri = n_dofs * (n_dofs + 1) // 2
+    BLOCK_DIM = qd.static(128)
+
+    qd.loop_config(name="init_nt_H_from_mass_mat", block_dim=BLOCK_DIM)
+    for i in range(_B * BLOCK_DIM):
+        tid = i % BLOCK_DIM
+        i_b = i // BLOCK_DIM
+        if i_b >= _B:
+            continue
+        if constraint_state.n_constraints[i_b] == 0 or not constraint_state.improved[i_b]:
+            continue
+        if qd.static(check_full_hessian):
+            if constraint_state.use_full_hessian[i_b] == 0:
+                continue
+        pid = tid
+        while pid < n_lower_tri:
+            i_d1, i_d2 = linear_to_lower_tri(pid)
+            constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
+            pid = pid + BLOCK_DIM
+
+
+@qd.func
 def func_hessian_direct_tiled(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     check_full_hessian: qd.template() = False,
 ):
-    """Compute the Hessian matrix `H = M + J.T @ D @ J of the optimization problem for all environment at once.
+    """Accumulate ``H += J.T @ D @ J`` for all environments.
 
-    This implementation is specialized for GPU backend and highly optimized for it using shared memory and cooperative
-    threading.
+    Pre-condition: ``nt_H[i_b, :, :]`` lower triangle has been initialised with the mass
+    matrix ``M`` by ``func_init_nt_H_from_mass_mat`` (must be called immediately before this
+    function).  This kernel only accumulates the JTDAJ contribution; it does NOT load ``M``.
 
-    Under the hood, it implements a square-block matrix partitioned production algorithm to support arbitrary matrix
-    sizes because shared memory storage is limited to 48kB. It boils down to classical matrix production if the entire
-    optimization problem fits in a single block, i.e. n_constraints <= 32 and n_dofs <= 64.
+    GPU-specialised tiled implementation using shared memory and cooperative threading.
+    Square-block matrix partitioned production algorithm to support arbitrary matrix sizes
+    because shared memory storage is limited to 48kB.  Reduces to classical matrix production
+    if the entire optimization problem fits in a single block, i.e. n_constraints <= 32 and
+    n_dofs <= 64.
 
-    Note that only the lower triangular part will be updated for efficiency, because the Hessian matrix is symmetric.
+    Only the lower triangular part is updated (the Hessian is symmetric).
 
-    When check_full_hessian is True (used with H patching), skips envs where use_full_hessian == 0 (those get patched
-    instead of rebuilt).
+    When check_full_hessian is True (used with H patching), skips envs where
+    use_full_hessian == 0 (those get patched instead of rebuilt).
     """
     _B = constraint_state.grad.shape[1]
     n_dofs = constraint_state.nt_H.shape[1]
@@ -1710,10 +1756,7 @@ def func_hessian_direct_tiled(
     # performance on CPU, but worse on CUDA.
     MAX_CONSTRAINTS_PER_BLOCK = qd.static(32)
 
-    n_lower_tri = n_dofs * (n_dofs + 1) // 2
-
     # FIXME: Adding `serialize=False` is causing sync failing for some reason...
-    # TODO: Consider moving `H += M` in a dedicated CUDA kernel. It should be both simpler and faster.
     qd.loop_config(name="hessian_direct_tiled", block_dim=BLOCK_DIM)
     for i in range(_B * BLOCK_DIM):
         tid = i % BLOCK_DIM
@@ -1772,7 +1815,9 @@ def func_hessian_direct_tiled(
                             i_c_ = i_c_ + BLOCK_DIM
                         qd.simt.block.sync()
 
-                    # Compute `H += J.T @ D @ J` for a single Hessian block
+                    # Compute `H += J.T @ D @ J` for a single Hessian block.  M has already been written into
+                    # nt_H by `func_init_nt_H_from_mass_mat` (which must be called before this kernel), so all
+                    # constraint tiles -- including the first (i_c_start == 0) -- are pure accumulation.
                     if is_diag_tile:
                         n_lower_tri_tile = n_dofs_tile_row * (n_dofs_tile_row + 1) // 2
                         pid = tid
@@ -1781,14 +1826,9 @@ def func_hessian_direct_tiled(
                             i_d1 = i_d1_ + i_d1_start
                             i_d2 = i_d2_ + i_d2_start
                             coef = gs.qd_float(0.0)
-                            if i_c_start == 0:
-                                coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
                                 coef = coef + jac_row[j_c_, i_d1_] * jac_row[j_c_, i_d2_] * efc_D[j_c_]
-                            if i_c_start == 0:
-                                constraint_state.nt_H[i_b, i_d1, i_d2] = coef
-                            else:
-                                constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + coef
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + coef
                             pid = pid + BLOCK_DIM
                     else:
                         numel = n_dofs_tile_row * n_dofs_tile_col
@@ -1799,14 +1839,9 @@ def func_hessian_direct_tiled(
                             i_d1 = i_d1_ + i_d1_start
                             i_d2 = i_d2_ + i_d2_start
                             coef = gs.qd_float(0.0)
-                            if i_c_start == 0:
-                                coef = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
                             for j_c_ in range(n_conts_tile):
                                 coef = coef + jac_row[j_c_, i_d1_] * jac_col[j_c_, i_d2_] * efc_D[j_c_]
-                            if i_c_start == 0:
-                                constraint_state.nt_H[i_b, i_d1, i_d2] = coef
-                            else:
-                                constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + coef
+                            constraint_state.nt_H[i_b, i_d1, i_d2] = constraint_state.nt_H[i_b, i_d1, i_d2] + coef
                             pid = pid + BLOCK_DIM
                     qd.simt.block.sync()
 
@@ -1814,14 +1849,8 @@ def func_hessian_direct_tiled(
                 i_d1_start = i_d1_start + MAX_DOFS_PER_BLOCK
             i_c_start = i_c_start + MAX_CONSTRAINTS_PER_BLOCK
 
-        # If there is no constraint, the main loop will be completely skipped, which means that the Hessian matrix must
-        # be updated separately to store the lower triangular part  of the mass matrix M.
-        if n_c == 0:
-            i_pair = tid
-            while i_pair < n_lower_tri:
-                i_d1, i_d2 = linear_to_lower_tri(i_pair)
-                constraint_state.nt_H[i_b, i_d1, i_d2] = rigid_global_info.mass_mat[i_d1, i_d2, i_b]
-                i_pair = i_pair + BLOCK_DIM
+        # No `if n_c == 0` fallback needed: `func_init_nt_H_from_mass_mat` already populated nt_H with M for every
+        # improved env (with the same gates as this kernel), so the n_c == 0 case is already handled.
 
 
 @qd.func
@@ -2113,7 +2142,8 @@ def func_hessian_and_cholesky_factor_direct(
                 static_rigid_sim_config=static_rigid_sim_config,
             )
     else:
-        # GPU
+        # GPU. M-init is split out into a dedicated kernel so the tiled JTDAJ pass below is pure accumulation.
+        func_init_nt_H_from_mass_mat(constraint_state, rigid_global_info)
         func_hessian_direct_tiled(constraint_state, rigid_global_info)
 
         if qd.static(static_rigid_sim_config.enable_tiled_cholesky_hessian):
