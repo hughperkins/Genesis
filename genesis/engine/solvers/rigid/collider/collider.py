@@ -181,6 +181,7 @@ class Collider:
         # Initialize [info], which stores every data that must be considered mutable from Quadrants's perspective,
         # i.e. unknown at compile time, but IMMUTABLE from Genesis scene's perspective after build.
         link_pair_dedup = int(os.environ.get("GS_LINK_PAIR_DEDUP", "0"))
+        gs.logger.info(f"[link_pair_dedup] GS_LINK_PAIR_DEDUP={link_pair_dedup}")
         self._collider_info = array_class.get_collider_info(
             self._solver,
             n_vert_neighbors,
