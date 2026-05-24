@@ -7,6 +7,7 @@ terrain), and contact management.
 """
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -179,6 +180,7 @@ class Collider:
 
         # Initialize [info], which stores every data that must be considered mutable from Quadrants's perspective,
         # i.e. unknown at compile time, but IMMUTABLE from Genesis scene's perspective after build.
+        link_pair_dedup = int(os.environ.get("GS_LINK_PAIR_DEDUP", "0"))
         self._collider_info = array_class.get_collider_info(
             self._solver,
             n_vert_neighbors,
@@ -189,6 +191,7 @@ class Collider:
             mpr_to_gjk_overlap_ratio=self._mpr_to_gjk_overlap_ratio,
             diff_pos_tolerance=self._diff_pos_tolerance,
             diff_normal_tolerance=self._diff_normal_tolerance,
+            link_pair_dedup=link_pair_dedup,
         )
         self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()

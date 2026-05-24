@@ -436,6 +436,69 @@ def func_compute_tolerance(
 
 
 @qd.func
+def func_add_contact_with_link_pair_dedup(
+    i_ga,
+    i_gb,
+    normal: qd.types.vector(3),
+    contact_pos: qd.types.vector(3),
+    penetration,
+    i_b,
+    i_pair,
+    geoms_state: array_class.GeomsState,
+    geoms_info: array_class.GeomsInfo,
+    geoms_init_AABB: array_class.GeomsInitAABB,
+    collider_state: array_class.ColliderState,
+    collider_info: array_class.ColliderInfo,
+    errno: qd.Tensor,
+):
+    # Wrapper around func_add_contact that filters out contact points whose
+    # (link_a, link_b) and position-within-tolerance match a contact already
+    # written this substep for the same env. When the runtime flag
+    # collider_info.link_pair_dedup[None] is zero this reduces to a plain
+    # func_add_contact call. Background: perso_hugh/doc/link_dedupe.md
+    # (60% of dex_hand@128 contacts come from table↔drill across two coacd
+    # geom pairs that emit near-duplicate contacts at the seam, and the
+    # existing per-geom-pair dedup at narrowphase.py:1395-1402 cannot see
+    # across them).
+    is_dup = False
+    if collider_info.link_pair_dedup[None] != 0:
+        link_a_new = geoms_info.link_idx[i_ga]
+        link_b_new = geoms_info.link_idx[i_gb]
+        lp_lo_new = qd.min(link_a_new, link_b_new)
+        lp_hi_new = qd.max(link_a_new, link_b_new)
+        tol = func_compute_tolerance(
+            i_ga, i_gb, i_b, collider_info.mc_tolerance[None], geoms_info, geoms_init_AABB
+        )
+        n_so_far = collider_state.n_contacts[i_b]
+        for j in range(n_so_far):
+            if not is_dup:
+                idx_prev = n_so_far - 1 - j
+                cl_a = collider_state.contact_data.link_a[idx_prev, i_b]
+                cl_b = collider_state.contact_data.link_b[idx_prev, i_b]
+                cl_lo = qd.min(cl_a, cl_b)
+                cl_hi = qd.max(cl_a, cl_b)
+                if cl_lo == lp_lo_new and cl_hi == lp_hi_new:
+                    prev_pos = collider_state.contact_data.pos[idx_prev, i_b]
+                    if (contact_pos - prev_pos).norm() < tol:
+                        is_dup = True
+    if not is_dup:
+        func_add_contact(
+            i_ga,
+            i_gb,
+            normal,
+            contact_pos,
+            penetration,
+            i_b,
+            i_pair,
+            geoms_state,
+            geoms_info,
+            collider_state,
+            collider_info,
+            errno,
+        )
+
+
+@qd.func
 def func_compute_mj_tolerance(
     i_ga,
     i_gb,

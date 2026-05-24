@@ -16,6 +16,7 @@ from . import support_field
 
 from .contact import (
     func_add_contact,
+    func_add_contact_with_link_pair_dedup,
     func_compute_tolerance,
     rotaxis,
     rotmatx,
@@ -143,7 +144,7 @@ def func_plane_box_contact(
 
     if penetration > 0.0:
         contact_pos = v1 - 0.5 * penetration * normal
-        func_add_contact(
+        func_add_contact_with_link_pair_dedup(
             i_ga,
             i_gb,
             normal,
@@ -153,6 +154,7 @@ def func_plane_box_contact(
             i_pair,
             geoms_state,
             geoms_info,
+            geoms_init_AABB,
             collider_state,
             collider_info,
             errno,
@@ -171,7 +173,7 @@ def func_plane_box_contact(
                     if penetration > 0.0:
                         contact_pos = pos_corner - 0.5 * penetration * normal
                         if (contact_pos - contact_pos_0).norm() > tolerance:
-                            func_add_contact(
+                            func_add_contact_with_link_pair_dedup(
                                 i_ga,
                                 i_gb,
                                 normal,
@@ -181,6 +183,7 @@ def func_plane_box_contact(
                                 i_pair,
                                 geoms_state,
                                 geoms_info,
+                                geoms_init_AABB,
                                 collider_state,
                                 collider_info,
                                 errno,

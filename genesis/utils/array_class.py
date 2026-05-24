@@ -782,6 +782,11 @@ class ColliderInfo:
     # differentiable contact tolerance
     diff_pos_tolerance: qd.Tensor
     diff_normal_tolerance: qd.Tensor
+    # Runtime flag (0/1). When non-zero, func_add_contact_with_link_pair_dedup
+    # discards contacts whose (link_a, link_b) and position-within-tolerance match
+    # a contact already written this substep for the same env. See
+    # perso_hugh/doc/deskai6_link_pair_dedup_2026may24.md. Default 0.
+    link_pair_dedup: qd.Tensor
 
 
 def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_config, **kwargs):
@@ -812,6 +817,7 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         mpr_to_gjk_overlap_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio"]),
         diff_pos_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_pos_tolerance"]),
         diff_normal_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_normal_tolerance"]),
+        link_pair_dedup=V_SCALAR_FROM(dtype=gs.qd_int, value=kwargs.get("link_pair_dedup", 0)),
     )
 
 

@@ -22,6 +22,7 @@ from .box_contact import (
 )
 from .contact import (
     func_add_contact,
+    func_add_contact_with_link_pair_dedup,
     func_add_diff_contact_input,
     func_apply_smooth_refinement,
     func_compute_mj_tolerance,
@@ -258,7 +259,7 @@ def func_add_polytope_vertex_contacts_sdf(
                         geoms_info,
                         static_rigid_sim_config,
                     )
-                    func_add_contact(
+                    func_add_contact_with_link_pair_dedup(
                         i_ga,
                         i_gb,
                         normal_v,
@@ -268,6 +269,7 @@ def func_add_polytope_vertex_contacts_sdf(
                         i_pair,
                         geoms_state,
                         geoms_info,
+                        geoms_init_AABB,
                         collider_state,
                         collider_info,
                         errno,
@@ -869,7 +871,7 @@ def func_contact_mpr_terrain(
                                             i_pair = collider_info.collision_pair_idx[
                                                 (i_gb, i_ga) if i_ga > i_gb else (i_ga, i_gb)
                                             ]
-                                            func_add_contact(
+                                            func_add_contact_with_link_pair_dedup(
                                                 i_ga,
                                                 i_gb,
                                                 normal,
@@ -879,6 +881,7 @@ def func_contact_mpr_terrain(
                                                 i_pair,
                                                 geoms_state,
                                                 geoms_info,
+                                                geoms_init_AABB,
                                                 collider_state,
                                                 collider_info,
                                                 errno,
@@ -1226,7 +1229,7 @@ def func_convex_convex_contact(
                                             collider_state,
                                             collider_info,
                                         )
-                                        func_add_contact(
+                                        func_add_contact_with_link_pair_dedup(
                                             i_ga,
                                             i_gb,
                                             gjk_state.normal[i_b, i_c],
@@ -1236,6 +1239,7 @@ def func_convex_convex_contact(
                                             i_pair,
                                             geoms_state,
                                             geoms_info,
+                                            geoms_init_AABB,
                                             collider_state,
                                             collider_info,
                                             errno,
@@ -1263,7 +1267,7 @@ def func_convex_convex_contact(
                                                     geoms_info,
                                                     static_rigid_sim_config,
                                                 )
-                                                func_add_contact(
+                                                func_add_contact_with_link_pair_dedup(
                                                     i_ga,
                                                     i_gb,
                                                     normal,
@@ -1273,6 +1277,7 @@ def func_convex_convex_contact(
                                                     i_pair,
                                                     geoms_state,
                                                     geoms_info,
+                                                    geoms_init_AABB,
                                                     collider_state,
                                                     collider_info,
                                                     errno,
@@ -1301,7 +1306,7 @@ def func_convex_convex_contact(
             if i_detection == 0:
                 is_col_0, normal_0, penetration_0, contact_pos_0 = is_col, normal, penetration, contact_pos
                 if is_col_0:
-                    func_add_contact(
+                    func_add_contact_with_link_pair_dedup(
                         i_ga,
                         i_gb,
                         normal_0,
@@ -1311,6 +1316,7 @@ def func_convex_convex_contact(
                         i_pair,
                         geoms_state,
                         geoms_info,
+                        geoms_init_AABB,
                         collider_state,
                         collider_info,
                         errno,
@@ -1403,7 +1409,7 @@ def func_convex_convex_contact(
                 if not repeated:
                     if penetration > -tolerance:
                         penetration = qd.max(penetration, 0.0)
-                        func_add_contact(
+                        func_add_contact_with_link_pair_dedup(
                             i_ga,
                             i_gb,
                             normal,
@@ -1413,6 +1419,7 @@ def func_convex_convex_contact(
                             i_pair,
                             geoms_state,
                             geoms_info,
+                            geoms_init_AABB,
                             collider_state,
                             collider_info,
                             errno,
