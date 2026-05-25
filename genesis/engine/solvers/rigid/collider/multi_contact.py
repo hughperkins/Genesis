@@ -1288,26 +1288,26 @@ def func_polyclip_mpr_mesh_mesh(
         geoms_info, verts_info, faces_info, i_gb, quat_b, -contact_normal
     )
 
-    if face_a < 0 or face_b < 0:
-        return
+    # Note: avoid early-return inside non-static if (Quadrants pure mode rejects it). Wrap
+    # the rest of the function in a guard instead.
+    if face_a >= 0 and face_b >= 0:
+        # Populate face_a vertices (clipping polygon) into contact_faces.vert1[i_b, 0..2].
+        fa_idx = faces_info.verts_idx[face_a]
+        for i in qd.static(range(3)):
+            v_local = verts_info.init_pos[fa_idx[i]]
+            v_world = gu.qd_transform_by_trans_quat(v_local, pos_a, quat_a)
+            gjk_state.contact_faces.vert1[i_b, i] = v_world
 
-    # Populate face_a vertices (clipping polygon) into contact_faces.vert1[i_b, 0..2].
-    fa_idx = faces_info.verts_idx[face_a]
-    for i in qd.static(range(3)):
-        v_local = verts_info.init_pos[fa_idx[i]]
-        v_world = gu.qd_transform_by_trans_quat(v_local, pos_a, quat_a)
-        gjk_state.contact_faces.vert1[i_b, i] = v_world
+        # Populate face_b vertices (subject polygon) into contact_faces.vert2[i_b, 0..2].
+        fb_idx = faces_info.verts_idx[face_b]
+        for i in qd.static(range(3)):
+            v_local = verts_info.init_pos[fb_idx[i]]
+            v_world = gu.qd_transform_by_trans_quat(v_local, pos_b, quat_b)
+            gjk_state.contact_faces.vert2[i_b, i] = v_world
 
-    # Populate face_b vertices (subject polygon) into contact_faces.vert2[i_b, 0..2].
-    fb_idx = faces_info.verts_idx[face_b]
-    for i in qd.static(range(3)):
-        v_local = verts_info.init_pos[fb_idx[i]]
-        v_world = gu.qd_transform_by_trans_quat(v_local, pos_b, quat_b)
-        gjk_state.contact_faces.vert2[i_b, i] = v_world
+        # Use face A's outward normal as the clipping plane normal. approx_dir maps a clipped
+        # polygon vertex (which lies on face B in world space) back onto face A; this is the
+        # vector from a's surface to b's surface, i.e. penetration * contact_normal.
+        approx_dir = penetration * contact_normal
 
-    # Use face A's outward normal as the clipping plane normal. approx_dir maps a clipped
-    # polygon vertex (which lies on face B in world space) back onto face A; this is the
-    # vector from a's surface to b's surface, i.e. penetration * contact_normal.
-    approx_dir = penetration * contact_normal
-
-    func_clip_polygon(gjk_state, gjk_info, i_b, 3, 3, False, False, n_a_world, approx_dir)
+        func_clip_polygon(gjk_state, gjk_info, i_b, 3, 3, False, False, n_a_world, approx_dir)
