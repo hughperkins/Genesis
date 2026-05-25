@@ -1138,6 +1138,11 @@ def func_approximate_polygon_with_quad(
             i_v0[3] = (i_v[3] + 1) % nverts
         elif change_flag == 2:
             i_v0[2] = (i_v[2] + 1) % nverts
+        elif change_flag == 1:
+            # Without this branch the b-tweaking phase was a no-op: i_v0 was a copy of i_v,
+            # m_next == m, so we always fell into the "did not increase" path and flipped
+            # back to change_flag == 3 without ever advancing b.
+            i_v0[1] = (i_v[1] + 1) % nverts
 
         # Compute the area of the quadrilateral formed by the vertices
         m_next = func_quadrilateral_area(gjk_state, i_b, polygon_start, i_v0[0], i_v0[1], i_v0[2], i_v0[3])
