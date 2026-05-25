@@ -10,13 +10,6 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-
-# Tolerance used by polygon clipping when intersecting a clipping plane with a polygon edge.
-# Edges that are nearly tangent to the plane often produce t slightly outside [0, 1] from
-# floating-point error; without this slack the intersection point is dropped and the clipped
-# polygon collapses, giving fewer/no contacts on perfectly-aligned face contacts (e.g. boxes
-# resting on a flat surface). Matches mujoco_warp's INTERSECT_TOL after PR #1068.
-_POLYGON_INTERSECT_TOL = 3e-7
 import genesis.utils.array_class as array_class
 
 from .constants import RETURN_CODE
@@ -1004,7 +997,10 @@ def func_clip_polygon(
                 # holes in the clipped polygon and produces fewer (or zero) contacts on perfectly
                 # face-aligned contacts.
                 t, _ip = func_plane_intersect(gjk_info, n, d, P, Q)
-                if t > -_POLYGON_INTERSECT_TOL and t < gs.qd_float(1.0) + _POLYGON_INTERSECT_TOL:
+                # Tolerance 3e-7 matches mujoco_warp INTERSECT_TOL after PR #1058 / #1068.
+                # Inlined as literals because qd.func runs in pure mode and rejects module
+                # globals.
+                if t > gs.qd_float(-3e-7) and t < gs.qd_float(1.0 + 3e-7):
                     t_clamped = qd.max(gs.qd_float(0.0), qd.min(gs.qd_float(1.0), t))
                     ip = P + t_clamped * (Q - P)
                     gjk_state.contact_clipped_polygons[i_b, ci, nclipped[ci]] = ip
