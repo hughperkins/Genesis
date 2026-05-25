@@ -589,84 +589,112 @@ def func_clamp_prune_and_sort_contacts(
         # when contact_pruning_tolerance is 0.
         if qd.static(collider_static_config.link_pair_pruning_supported and not static_rigid_sim_config.requires_grad):
             if n_con >= 5 and tol > gs.qd_float(0.0):
-                # Phase 1a: insertion-sort indices by canonical (min_link, max_link) key.
-                for i in range(n_con):
+                # Phase 1a-init: write the canonical link-pair key + identity sort_idx for every contact, and along the
+                # way detect the "single link-pair" fast-path. When every contact carries the same canonical (min_link,
+                # max_link) (e.g. duck_in_box_hard's single decomposed-mesh × decomposed-mesh link-pair carrying
+                # ~100-200 contacts), the insertion sort (Phase 1a-sort) is an O(n²) no-op on identical keys and the
+                # cycle-permute (Phase 1b) is identity since every sort_idx[i]==i. Detecting single-LP here lets us
+                # skip both phases entirely on that workload — pure savings, output bit-identical to the slow path.
+                la0 = collider_state.contact_data.link_a[0, i_b]
+                lb0 = collider_state.contact_data.link_b[0, i_b]
+                la0_min = qd.min(la0, lb0)
+                la0_max = qd.max(la0, lb0)
+                key0 = qd.cast(la0_min, gs.qd_float) * LP_KEY_STRIDE + qd.cast(la0_max, gs.qd_float)
+                collider_state.contact_sort_key[0, i_b] = key0
+                collider_state.contact_sort_idx[0, i_b] = 0
+                single_lp = True
+                for i in range(1, n_con):
                     la = collider_state.contact_data.link_a[i, i_b]
                     lb = collider_state.contact_data.link_b[i, i_b]
                     la_min = qd.min(la, lb)
                     la_max = qd.max(la, lb)
-                    collider_state.contact_sort_key[i, i_b] = qd.cast(la_min, gs.qd_float) * LP_KEY_STRIDE + qd.cast(
-                        la_max, gs.qd_float
-                    )
+                    ki = qd.cast(la_min, gs.qd_float) * LP_KEY_STRIDE + qd.cast(la_max, gs.qd_float)
+                    collider_state.contact_sort_key[i, i_b] = ki
                     collider_state.contact_sort_idx[i, i_b] = i
+                    if ki != key0:
+                        single_lp = False
 
-                for i in range(1, n_con):
-                    ck = collider_state.contact_sort_key[i, i_b]
-                    if collider_state.contact_sort_key[i - 1, i_b] <= ck:
-                        continue
-                    ci = collider_state.contact_sort_idx[i, i_b]
-                    j = i - 1
-                    while j >= 0:
-                        if collider_state.contact_sort_key[j, i_b] <= ck:
-                            break
-                        collider_state.contact_sort_key[j + 1, i_b] = collider_state.contact_sort_key[j, i_b]
-                        collider_state.contact_sort_idx[j + 1, i_b] = collider_state.contact_sort_idx[j, i_b]
-                        j = j - 1
-                    collider_state.contact_sort_key[j + 1, i_b] = ck
-                    collider_state.contact_sort_idx[j + 1, i_b] = ci
+                if not single_lp:
+                    # Phase 1a-sort: insertion-sort indices by canonical (min_link, max_link) key.
+                    for i in range(1, n_con):
+                        ck = collider_state.contact_sort_key[i, i_b]
+                        if collider_state.contact_sort_key[i - 1, i_b] <= ck:
+                            continue
+                        ci = collider_state.contact_sort_idx[i, i_b]
+                        j = i - 1
+                        while j >= 0:
+                            if collider_state.contact_sort_key[j, i_b] <= ck:
+                                break
+                            collider_state.contact_sort_key[j + 1, i_b] = collider_state.contact_sort_key[j, i_b]
+                            collider_state.contact_sort_idx[j + 1, i_b] = collider_state.contact_sort_idx[j, i_b]
+                            j = j - 1
+                        collider_state.contact_sort_key[j + 1, i_b] = ck
+                        collider_state.contact_sort_idx[j + 1, i_b] = ci
 
-                # Phase 1b: apply permutation in-place via cycle decomposition (11 fields).
-                for i in range(n_con):
-                    if collider_state.contact_sort_idx[i, i_b] != i:
-                        tmp_geom_a = collider_state.contact_data.geom_a[i, i_b]
-                        tmp_geom_b = collider_state.contact_data.geom_b[i, i_b]
-                        tmp_penetration = collider_state.contact_data.penetration[i, i_b]
-                        tmp_normal = collider_state.contact_data.normal[i, i_b]
-                        tmp_pos = collider_state.contact_data.pos[i, i_b]
-                        tmp_friction = collider_state.contact_data.friction[i, i_b]
-                        tmp_sol_params = collider_state.contact_data.sol_params[i, i_b]
-                        tmp_force = collider_state.contact_data.force[i, i_b]
-                        tmp_link_a = collider_state.contact_data.link_a[i, i_b]
-                        tmp_link_b = collider_state.contact_data.link_b[i, i_b]
-                        tmp_pair_idx = collider_state.contact_data.pair_idx[i, i_b]
+                    # Phase 1b: apply permutation in-place via cycle decomposition (11 fields).
+                    for i in range(n_con):
+                        if collider_state.contact_sort_idx[i, i_b] != i:
+                            tmp_geom_a = collider_state.contact_data.geom_a[i, i_b]
+                            tmp_geom_b = collider_state.contact_data.geom_b[i, i_b]
+                            tmp_penetration = collider_state.contact_data.penetration[i, i_b]
+                            tmp_normal = collider_state.contact_data.normal[i, i_b]
+                            tmp_pos = collider_state.contact_data.pos[i, i_b]
+                            tmp_friction = collider_state.contact_data.friction[i, i_b]
+                            tmp_sol_params = collider_state.contact_data.sol_params[i, i_b]
+                            tmp_force = collider_state.contact_data.force[i, i_b]
+                            tmp_link_a = collider_state.contact_data.link_a[i, i_b]
+                            tmp_link_b = collider_state.contact_data.link_b[i, i_b]
+                            tmp_pair_idx = collider_state.contact_data.pair_idx[i, i_b]
 
-                        j = i
-                        while collider_state.contact_sort_idx[j, i_b] != i:
-                            src = collider_state.contact_sort_idx[j, i_b]
-                            collider_state.contact_data.geom_a[j, i_b] = collider_state.contact_data.geom_a[src, i_b]
-                            collider_state.contact_data.geom_b[j, i_b] = collider_state.contact_data.geom_b[src, i_b]
-                            collider_state.contact_data.penetration[j, i_b] = collider_state.contact_data.penetration[
-                                src, i_b
-                            ]
-                            collider_state.contact_data.normal[j, i_b] = collider_state.contact_data.normal[src, i_b]
-                            collider_state.contact_data.pos[j, i_b] = collider_state.contact_data.pos[src, i_b]
-                            collider_state.contact_data.friction[j, i_b] = collider_state.contact_data.friction[
-                                src, i_b
-                            ]
-                            collider_state.contact_data.sol_params[j, i_b] = collider_state.contact_data.sol_params[
-                                src, i_b
-                            ]
-                            collider_state.contact_data.force[j, i_b] = collider_state.contact_data.force[src, i_b]
-                            collider_state.contact_data.link_a[j, i_b] = collider_state.contact_data.link_a[src, i_b]
-                            collider_state.contact_data.link_b[j, i_b] = collider_state.contact_data.link_b[src, i_b]
-                            collider_state.contact_data.pair_idx[j, i_b] = collider_state.contact_data.pair_idx[
-                                src, i_b
-                            ]
+                            j = i
+                            while collider_state.contact_sort_idx[j, i_b] != i:
+                                src = collider_state.contact_sort_idx[j, i_b]
+                                collider_state.contact_data.geom_a[j, i_b] = collider_state.contact_data.geom_a[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.geom_b[j, i_b] = collider_state.contact_data.geom_b[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.penetration[j, i_b] = (
+                                    collider_state.contact_data.penetration[src, i_b]
+                                )
+                                collider_state.contact_data.normal[j, i_b] = collider_state.contact_data.normal[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.pos[j, i_b] = collider_state.contact_data.pos[src, i_b]
+                                collider_state.contact_data.friction[j, i_b] = collider_state.contact_data.friction[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.sol_params[j, i_b] = (
+                                    collider_state.contact_data.sol_params[src, i_b]
+                                )
+                                collider_state.contact_data.force[j, i_b] = collider_state.contact_data.force[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.link_a[j, i_b] = collider_state.contact_data.link_a[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.link_b[j, i_b] = collider_state.contact_data.link_b[
+                                    src, i_b
+                                ]
+                                collider_state.contact_data.pair_idx[j, i_b] = collider_state.contact_data.pair_idx[
+                                    src, i_b
+                                ]
+                                collider_state.contact_sort_idx[j, i_b] = j
+                                j = src
+
+                            collider_state.contact_data.geom_a[j, i_b] = tmp_geom_a
+                            collider_state.contact_data.geom_b[j, i_b] = tmp_geom_b
+                            collider_state.contact_data.penetration[j, i_b] = tmp_penetration
+                            collider_state.contact_data.normal[j, i_b] = tmp_normal
+                            collider_state.contact_data.pos[j, i_b] = tmp_pos
+                            collider_state.contact_data.friction[j, i_b] = tmp_friction
+                            collider_state.contact_data.sol_params[j, i_b] = tmp_sol_params
+                            collider_state.contact_data.force[j, i_b] = tmp_force
+                            collider_state.contact_data.link_a[j, i_b] = tmp_link_a
+                            collider_state.contact_data.link_b[j, i_b] = tmp_link_b
+                            collider_state.contact_data.pair_idx[j, i_b] = tmp_pair_idx
                             collider_state.contact_sort_idx[j, i_b] = j
-                            j = src
-
-                        collider_state.contact_data.geom_a[j, i_b] = tmp_geom_a
-                        collider_state.contact_data.geom_b[j, i_b] = tmp_geom_b
-                        collider_state.contact_data.penetration[j, i_b] = tmp_penetration
-                        collider_state.contact_data.normal[j, i_b] = tmp_normal
-                        collider_state.contact_data.pos[j, i_b] = tmp_pos
-                        collider_state.contact_data.friction[j, i_b] = tmp_friction
-                        collider_state.contact_data.sol_params[j, i_b] = tmp_sol_params
-                        collider_state.contact_data.force[j, i_b] = tmp_force
-                        collider_state.contact_data.link_a[j, i_b] = tmp_link_a
-                        collider_state.contact_data.link_b[j, i_b] = tmp_link_b
-                        collider_state.contact_data.pair_idx[j, i_b] = tmp_pair_idx
-                        collider_state.contact_sort_idx[j, i_b] = j
 
                 # Default: keep everything. Buckets that pass the gates flip their entries to drop and then mark only
                 # hull-vertex contacts as keep again.
@@ -1096,21 +1124,35 @@ def func_prune_contacts_coop(
                 ii += _K
 
             if tid == 0:
-                # SERIAL on lane 0: phase 1a insertion sort + phase 2 bucket walk.
+                # SERIAL on lane 0: phase 1a single-LP detect + insertion sort.
+                #
+                # Single-LP fast-path: scan keys once (O(n)); if all match key[0] the sort is an O(n²) no-op (every
+                # contact already keeps sort_idx[i]==i from the parallel init pass, and identical-key insertion sort
+                # would just walk the array touching nothing useful). Skipping it preserves output exactly because
+                # phase 2's bucket walk uses contact_sort_key[b_end] == key0 as its boundary predicate — all-equal
+                # keys yield one bucket [0, n_con), the same partition any sort would produce. Cost of the scan is
+                # n compares vs. up to n*(n-1)/2 for insertion sort, so for the n=200 single-LP bucket on
+                # duck_in_box_hard this is ~200x cheaper.
+                key0 = collider_state.contact_sort_key[0, i_b]
+                single_lp = True
                 for i in range(1, n_con):
-                    ck = collider_state.contact_sort_key[i, i_b]
-                    if collider_state.contact_sort_key[i - 1, i_b] <= ck:
-                        continue
-                    ci = collider_state.contact_sort_idx[i, i_b]
-                    j = i - 1
-                    while j >= 0:
-                        if collider_state.contact_sort_key[j, i_b] <= ck:
-                            break
-                        collider_state.contact_sort_key[j + 1, i_b] = collider_state.contact_sort_key[j, i_b]
-                        collider_state.contact_sort_idx[j + 1, i_b] = collider_state.contact_sort_idx[j, i_b]
-                        j = j - 1
-                    collider_state.contact_sort_key[j + 1, i_b] = ck
-                    collider_state.contact_sort_idx[j + 1, i_b] = ci
+                    if collider_state.contact_sort_key[i, i_b] != key0:
+                        single_lp = False
+                if not single_lp:
+                    for i in range(1, n_con):
+                        ck = collider_state.contact_sort_key[i, i_b]
+                        if collider_state.contact_sort_key[i - 1, i_b] <= ck:
+                            continue
+                        ci = collider_state.contact_sort_idx[i, i_b]
+                        j = i - 1
+                        while j >= 0:
+                            if collider_state.contact_sort_key[j, i_b] <= ck:
+                                break
+                            collider_state.contact_sort_key[j + 1, i_b] = collider_state.contact_sort_key[j, i_b]
+                            collider_state.contact_sort_idx[j + 1, i_b] = collider_state.contact_sort_idx[j, i_b]
+                            j = j - 1
+                        collider_state.contact_sort_key[j + 1, i_b] = ck
+                        collider_state.contact_sort_idx[j + 1, i_b] = ci
 
             qd.simt.subgroup.sync()
 
