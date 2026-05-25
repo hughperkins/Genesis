@@ -690,7 +690,83 @@ def func_clamp_prune_and_sort_contacts(
                     b_size = b_end - b_start
 
                     if b_size >= 5:
-                        # Mean normal (folded to the hemisphere of contact b_start) and centroid.
+                        # Option D: sample-based coplanarity pre-check. For buckets with b_size > SAMPLE_K, run the
+                        # mean+centroid+max_depth pipeline over an evenly-spaced K-sample first. If the sample fails
+                        # coplanarity (either mean normal vanishes or max_depth exceeds tol*r), skip the full O(n)
+                        # mean+centroid and O(n) max_depth iterations below. duck_in_box_hard's single big link-pair
+                        # bucket carries ~200 contacts spread over the convex-decomposed duck × tank surfaces; the
+                        # full coplanarity check rejects it (curved surface, max_depth >> tol*r) after ~400 reads
+                        # that find nothing to drop. The K=8 sample reaches the same reject decision in ~16 reads.
+                        #
+                        # Algorithm-preservation analysis: when the sample says "coplanar", we fall through to the
+                        # full computation and produce a bit-identical result to the slow path (same mean / hull /
+                        # survivors). When the sample says "non-coplanar" we skip the full bucket processing and
+                        # leave contact_keep[i]==1 for all bucket contacts — i.e., we keep contacts the algorithm
+                        # might have dropped. This only matters in the (rare) edge case where the K-sample is
+                        # unrepresentative: sampled normals diverge or sampled positions span depth while the rest
+                        # of the bucket is coplanar. In that case we trade a marginal-FPS contact-set reduction for
+                        # speed; physics is unaffected (kept contacts are valid wrenches, just non-minimal).
+                        SAMPLE_K = qd.static(8)
+                        do_full = True
+                        if b_size > SAMPLE_K:
+                            # Stride sampling: indices b_start + k * (b_size // K) for k in [0, K). Visits K distinct
+                            # rows across the full bucket; works whether or not contacts are pre-sorted by link-pair.
+                            sample_stride = b_size // SAMPLE_K
+                            ref_n_s = collider_state.contact_data.normal[b_start, i_b]
+                            rnx_s = ref_n_s[0]
+                            rny_s = ref_n_s[1]
+                            rnz_s = ref_n_s[2]
+                            mnx_s = gs.qd_float(0.0)
+                            mny_s = gs.qd_float(0.0)
+                            mnz_s = gs.qd_float(0.0)
+                            cx_s = gs.qd_float(0.0)
+                            cy_s = gs.qd_float(0.0)
+                            cz_s = gs.qd_float(0.0)
+                            for k in range(SAMPLE_K):
+                                i = b_start + k * sample_stride
+                                n_i = collider_state.contact_data.normal[i, i_b]
+                                s = gs.qd_float(1.0)
+                                if rnx_s * n_i[0] + rny_s * n_i[1] + rnz_s * n_i[2] < gs.qd_float(0.0):
+                                    s = gs.qd_float(-1.0)
+                                mnx_s += s * n_i[0]
+                                mny_s += s * n_i[1]
+                                mnz_s += s * n_i[2]
+                                p_i = collider_state.contact_data.pos[i, i_b]
+                                cx_s += p_i[0]
+                                cy_s += p_i[1]
+                                cz_s += p_i[2]
+                            inv_ks = gs.qd_float(1.0) / qd.cast(SAMPLE_K, gs.qd_float)
+                            cx_s *= inv_ks
+                            cy_s *= inv_ks
+                            cz_s *= inv_ks
+                            mnrm_s = qd.sqrt(mnx_s * mnx_s + mny_s * mny_s + mnz_s * mnz_s)
+                            if mnrm_s <= EPS:
+                                do_full = False
+                            else:
+                                mnx_s /= mnrm_s
+                                mny_s /= mnrm_s
+                                mnz_s /= mnrm_s
+                                max_depth_s = gs.qd_float(0.0)
+                                max_in_plane_r2_s = gs.qd_float(0.0)
+                                for k in range(SAMPLE_K):
+                                    i = b_start + k * sample_stride
+                                    p_i = collider_state.contact_data.pos[i, i_b]
+                                    dx = p_i[0] - cx_s
+                                    dy = p_i[1] - cy_s
+                                    dz = p_i[2] - cz_s
+                                    depth = qd.abs(dx * mnx_s + dy * mny_s + dz * mnz_s)
+                                    if depth > max_depth_s:
+                                        max_depth_s = depth
+                                    r2_s = dx * dx + dy * dy + dz * dz - depth * depth
+                                    if r2_s > max_in_plane_r2_s:
+                                        max_in_plane_r2_s = r2_s
+                                if max_depth_s > tol * qd.sqrt(max_in_plane_r2_s):
+                                    do_full = False
+
+                        # Mean normal (folded to the hemisphere of contact b_start) and centroid. Hoisted out so the
+                        # later hull-build branch can read mnx/mny/mnz/cx/cy/cz even when the sample-based pre-check
+                        # short-circuited do_full (in that case these stay at 0 and the hull-build branch is gated
+                        # by do_full + coplanar so it never reads them).
                         ref_n = collider_state.contact_data.normal[b_start, i_b]
                         rnx = ref_n[0]
                         rny = ref_n[1]
@@ -701,53 +777,54 @@ def func_clamp_prune_and_sort_contacts(
                         cx = gs.qd_float(0.0)
                         cy = gs.qd_float(0.0)
                         cz = gs.qd_float(0.0)
-                        for i in range(b_start, b_end):
-                            n_i = collider_state.contact_data.normal[i, i_b]
-                            s = gs.qd_float(1.0)
-                            if rnx * n_i[0] + rny * n_i[1] + rnz * n_i[2] < gs.qd_float(0.0):
-                                s = gs.qd_float(-1.0)
-                            mnx += s * n_i[0]
-                            mny += s * n_i[1]
-                            mnz += s * n_i[2]
-                            p_i = collider_state.contact_data.pos[i, i_b]
-                            cx += p_i[0]
-                            cy += p_i[1]
-                            cz += p_i[2]
-                        inv_n = gs.qd_float(1.0) / qd.cast(b_size, gs.qd_float)
-                        cx *= inv_n
-                        cy *= inv_n
-                        cz *= inv_n
-                        mnrm = qd.sqrt(mnx * mnx + mny * mny + mnz * mnz)
-
-                        # Hoisted out so the hull-build branch below can read it (quadrants scopes per if).
                         max_in_plane_r2 = gs.qd_float(0.0)
-
-                        coplanar = mnrm > EPS
-                        if coplanar:
-                            mnx /= mnrm
-                            mny /= mnrm
-                            mnz /= mnrm
-
-                            # Depth coplanarity: positions must lie in a single plane perpendicular to the mean normal. No
-                            # per-contact normal check: a contact whose normal is diagonal (e.g. an edge-vs-edge contact at a
-                            # corner of the contact patch) still participates in the 2D hull because its position is a vertex of
-                            # the patch; dropping a collinear-edge contact in the same bucket is justified by the positional
-                            # support polygon regardless of that contact's normal direction.
-                            max_depth = gs.qd_float(0.0)
+                        coplanar = False
+                        if do_full:
                             for i in range(b_start, b_end):
+                                n_i = collider_state.contact_data.normal[i, i_b]
+                                s = gs.qd_float(1.0)
+                                if rnx * n_i[0] + rny * n_i[1] + rnz * n_i[2] < gs.qd_float(0.0):
+                                    s = gs.qd_float(-1.0)
+                                mnx += s * n_i[0]
+                                mny += s * n_i[1]
+                                mnz += s * n_i[2]
                                 p_i = collider_state.contact_data.pos[i, i_b]
-                                dx = p_i[0] - cx
-                                dy = p_i[1] - cy
-                                dz = p_i[2] - cz
-                                depth = qd.abs(dx * mnx + dy * mny + dz * mnz)
-                                if depth > max_depth:
-                                    max_depth = depth
-                                r2 = dx * dx + dy * dy + dz * dz - depth * depth
-                                if r2 > max_in_plane_r2:
-                                    max_in_plane_r2 = r2
+                                cx += p_i[0]
+                                cy += p_i[1]
+                                cz += p_i[2]
+                            inv_n = gs.qd_float(1.0) / qd.cast(b_size, gs.qd_float)
+                            cx *= inv_n
+                            cy *= inv_n
+                            cz *= inv_n
+                            mnrm = qd.sqrt(mnx * mnx + mny * mny + mnz * mnz)
 
-                            if max_depth > tol * qd.sqrt(max_in_plane_r2):
-                                coplanar = False
+                            coplanar = mnrm > EPS
+                            if coplanar:
+                                mnx /= mnrm
+                                mny /= mnrm
+                                mnz /= mnrm
+
+                                # Depth coplanarity: positions must lie in a single plane perpendicular to the mean
+                                # normal. No per-contact normal check: a contact whose normal is diagonal (e.g. an
+                                # edge-vs-edge contact at a corner of the contact patch) still participates in the
+                                # 2D hull because its position is a vertex of the patch; dropping a collinear-edge
+                                # contact in the same bucket is justified by the positional support polygon
+                                # regardless of that contact's normal direction.
+                                max_depth = gs.qd_float(0.0)
+                                for i in range(b_start, b_end):
+                                    p_i = collider_state.contact_data.pos[i, i_b]
+                                    dx = p_i[0] - cx
+                                    dy = p_i[1] - cy
+                                    dz = p_i[2] - cz
+                                    depth = qd.abs(dx * mnx + dy * mny + dz * mnz)
+                                    if depth > max_depth:
+                                        max_depth = depth
+                                    r2 = dx * dx + dy * dy + dz * dz - depth * depth
+                                    if r2 > max_in_plane_r2:
+                                        max_in_plane_r2 = r2
+
+                                if max_depth > tol * qd.sqrt(max_in_plane_r2):
+                                    coplanar = False
 
                         if coplanar:
                             # In-plane basis (u, v): seed from the world axis least-aligned with mean normal.
