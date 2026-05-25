@@ -352,7 +352,10 @@ def func_gjk_contact(
                         # (1) [i_f] should be a valid face index in the polytope (>= 0),
                         # (2) Both of the geometries should be discrete,
                         # (3) [enable_mujoco_multi_contact] should be True. Default to False.
-                        if i_f >= 0 and func_is_discrete_geoms(geoms_info, i_ga, i_gb, i_b):
+                        # NB: func_is_discrete_geoms takes (geoms_info, i_ga, i_gb) - no i_b.
+                        # This call site was dead code while the static flag was always False;
+                        # flipping it True surfaced the stale extra argument.
+                        if i_f >= 0 and func_is_discrete_geoms(geoms_info, i_ga, i_gb):
                             func_multi_contact(
                                 geoms_info,
                                 verts_info,
