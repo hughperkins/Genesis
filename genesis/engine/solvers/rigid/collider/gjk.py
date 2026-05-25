@@ -49,7 +49,8 @@ class GJK:
         # MuJoCo's multi-contact detection algorithm is disabled by default, because it is often less stable than the
         # other multi-contact detection algorithm. However, we keep the code here for compatibility with MuJoCo and for
         # possible future use.
-        enable_mujoco_multi_contact = False
+        # Temporarily flipped to True to surface bugs in the GJK polygon-clip path.
+        enable_mujoco_multi_contact = True
         gjk_max_iterations = 50
         epa_max_iterations = 50
         # 6 * epa_max_iterations is the maximum number of faces in the polytope.
