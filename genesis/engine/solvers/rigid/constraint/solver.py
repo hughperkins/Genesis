@@ -3348,7 +3348,7 @@ def _func_update_qfrc_constraint_coop(
     n_dofs = constraint_state.qfrc_constraint.shape[0]
     _B = constraint_state.grad.shape[1]
     _K = qd.static(32)
-    MAX_CACHE_PER_LANE = qd.static(2)
+    MAX_CACHE_PER_LANE = qd.static(1)
 
     qd.loop_config(name="update_constraint_qfrc", block_dim=_K)
     for i_flat in range(_B * _K):
