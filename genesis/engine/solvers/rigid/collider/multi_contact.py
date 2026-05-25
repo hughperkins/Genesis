@@ -1245,6 +1245,156 @@ def _func_best_mesh_face_for_dir(
 
 
 @qd.func
+def _func_find_quad_partner(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    i_g,
+    best_face,
+    best_normal_world: qd.types.vector(3, dtype=gs.qd_float),
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+):
+    """
+    For a triangulated mesh face whose neighbor across an edge is coplanar (same outward
+    world normal within a tight tolerance), return that neighbor's face index along with the
+    two indices of [best_face]'s shared edge. This recovers the rectangular quad that a
+    primitive box gets triangulated into and avoids losing half the contact polygon.
+
+    Returns (partner_face, shared_a0, shared_a1) where shared_a0 / shared_a1 are positions
+    in [0..3) inside best_face.verts_idx referring to the two shared vertices, in best_face
+    CCW order. When no coplanar neighbor sharing an edge is found, partner_face = -1 and
+    the shared positions are -1.
+
+    O(nfaces) - same scan budget as the best-face lookup.
+    """
+    face_start = geoms_info.face_start[i_g]
+    face_end = geoms_info.face_end[i_g]
+
+    fa_idx = faces_info.verts_idx[best_face]
+
+    partner_face = -1
+    shared_a0 = -1
+    shared_a1 = -1
+
+    for i_f in range(face_start, face_end):
+        if i_f != best_face and partner_face < 0:
+            fb_idx = faces_info.verts_idx[i_f]
+
+            # Count shared vertices and remember their position in best_face.
+            shared_count = 0
+            local_a0 = -1
+            local_a1 = -1
+            for ai in qd.static(range(3)):
+                for bi in qd.static(range(3)):
+                    if fa_idx[ai] == fb_idx[bi]:
+                        if shared_count == 0:
+                            local_a0 = ai
+                        else:
+                            local_a1 = ai
+                        shared_count = shared_count + 1
+
+            if shared_count == 2:
+                v0 = verts_info.init_pos[fb_idx[0]]
+                v1 = verts_info.init_pos[fb_idx[1]]
+                v2 = verts_info.init_pos[fb_idx[2]]
+                n_local = (v1 - v0).cross(v2 - v0)
+                n_norm = n_local.norm()
+                if n_norm > gs.qd_float(1e-12):
+                    n_local = n_local / n_norm
+                    n_world = gu.qd_transform_by_quat(n_local, quat)
+                    if n_world.dot(best_normal_world) > gs.qd_float(0.999):
+                        partner_face = i_f
+                        shared_a0 = local_a0
+                        shared_a1 = local_a1
+
+    return partner_face, shared_a0, shared_a1
+
+
+@qd.func
+def _func_populate_face_polygon(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    i_g,
+    best_face,
+    best_normal_world: qd.types.vector(3, dtype=gs.qd_float),
+    pos: qd.types.vector(3, dtype=gs.qd_float),
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+    gjk_state: array_class.GJKState,
+    i_b,
+    write_to_vert1: qd.template(),
+):
+    """
+    Build the world-space contact polygon for the mesh face [best_face] and write it to
+    either contact_faces.vert1[i_b, ...] (write_to_vert1=True) or .vert2[i_b, ...]. When
+    [best_face] is part of a 2-triangle quad (typical for primitive-style box meshes), the
+    coplanar neighbor is detected and merged so the clip operates on the full 4-vertex face
+    rather than a 3-vertex half-face. Returns the polygon vertex count (3 or 4).
+    """
+    fa_idx = faces_info.verts_idx[best_face]
+
+    partner_face, shared_a0, shared_a1 = _func_find_quad_partner(
+        geoms_info, verts_info, faces_info, i_g, best_face, best_normal_world, quat
+    )
+
+    nverts = 3
+    if partner_face < 0:
+        for i in qd.static(range(3)):
+            v_local = verts_info.init_pos[fa_idx[i]]
+            v_world = gu.qd_transform_by_trans_quat(v_local, pos, quat)
+            if qd.static(write_to_vert1):
+                gjk_state.contact_faces.vert1[i_b, i] = v_world
+            else:
+                gjk_state.contact_faces.vert2[i_b, i] = v_world
+    else:
+        # Find best_face's non-shared vertex and the partner's non-shared vertex.
+        nonshared_a = 3 - shared_a0 - shared_a1
+        fb_idx = faces_info.verts_idx[partner_face]
+        # Determine which of fb_idx[0..2] is the non-shared vertex of the partner.
+        nonshared_b_idx = fb_idx[0]
+        for bi in qd.static(range(3)):
+            match = False
+            for ai in qd.static(range(3)):
+                if fa_idx[ai] == fb_idx[bi]:
+                    match = True
+            if not match:
+                nonshared_b_idx = fb_idx[bi]
+
+        # Walk best_face in its existing CCW order, replacing the shared edge with a detour
+        # through the partner's non-shared vertex. The shared edge is between the two A
+        # positions other than [nonshared_a]; in CCW order, the edge starts at A's
+        # (nonshared_a+1)%3 and ends at A's (nonshared_a+2)%3.
+        idx0 = fa_idx[nonshared_a]
+        idx1 = fa_idx[(nonshared_a + 1) % 3]
+        idx3 = fa_idx[(nonshared_a + 2) % 3]
+        # Quad order: nonshared_a, edge_start, partner_non_shared, edge_end.
+        v0_local = verts_info.init_pos[idx0]
+        v1_local = verts_info.init_pos[idx1]
+        v2_local = verts_info.init_pos[nonshared_b_idx]
+        v3_local = verts_info.init_pos[idx3]
+
+        v0_world = gu.qd_transform_by_trans_quat(v0_local, pos, quat)
+        v1_world = gu.qd_transform_by_trans_quat(v1_local, pos, quat)
+        v2_world = gu.qd_transform_by_trans_quat(v2_local, pos, quat)
+        v3_world = gu.qd_transform_by_trans_quat(v3_local, pos, quat)
+
+        if qd.static(write_to_vert1):
+            gjk_state.contact_faces.vert1[i_b, 0] = v0_world
+            gjk_state.contact_faces.vert1[i_b, 1] = v1_world
+            gjk_state.contact_faces.vert1[i_b, 2] = v2_world
+            gjk_state.contact_faces.vert1[i_b, 3] = v3_world
+        else:
+            gjk_state.contact_faces.vert2[i_b, 0] = v0_world
+            gjk_state.contact_faces.vert2[i_b, 1] = v1_world
+            gjk_state.contact_faces.vert2[i_b, 2] = v2_world
+            gjk_state.contact_faces.vert2[i_b, 3] = v3_world
+
+        nverts = 4
+
+    return nverts
+
+
+@qd.func
 def func_polyclip_mpr_mesh_mesh(
     geoms_info: array_class.GeomsInfo,
     verts_info: array_class.VertsInfo,
@@ -1291,23 +1441,42 @@ def func_polyclip_mpr_mesh_mesh(
     # Note: avoid early-return inside non-static if (Quadrants pure mode rejects it). Wrap
     # the rest of the function in a guard instead.
     if face_a >= 0 and face_b >= 0:
-        # Populate face_a vertices (clipping polygon) into contact_faces.vert1[i_b, 0..2].
-        fa_idx = faces_info.verts_idx[face_a]
-        for i in qd.static(range(3)):
-            v_local = verts_info.init_pos[fa_idx[i]]
-            v_world = gu.qd_transform_by_trans_quat(v_local, pos_a, quat_a)
-            gjk_state.contact_faces.vert1[i_b, i] = v_world
-
-        # Populate face_b vertices (subject polygon) into contact_faces.vert2[i_b, 0..2].
-        fb_idx = faces_info.verts_idx[face_b]
-        for i in qd.static(range(3)):
-            v_local = verts_info.init_pos[fb_idx[i]]
-            v_world = gu.qd_transform_by_trans_quat(v_local, pos_b, quat_b)
-            gjk_state.contact_faces.vert2[i_b, i] = v_world
+        # Populate the contact face polygons. When a triangle has a coplanar neighbor across
+        # an edge (the typical case for a primitive box mesh, which trimesh splits into two
+        # right triangles per face), recover the full quad so the clip sees the entire
+        # rectangular face rather than a triangular half-face.
+        nverts_a = _func_populate_face_polygon(
+            geoms_info,
+            verts_info,
+            faces_info,
+            i_ga,
+            face_a,
+            n_a_world,
+            pos_a,
+            quat_a,
+            gjk_state,
+            i_b,
+            True,
+        )
+        nverts_b = _func_populate_face_polygon(
+            geoms_info,
+            verts_info,
+            faces_info,
+            i_gb,
+            face_b,
+            _n_b_world,
+            pos_b,
+            quat_b,
+            gjk_state,
+            i_b,
+            False,
+        )
 
         # Use face A's outward normal as the clipping plane normal. approx_dir maps a clipped
         # polygon vertex (which lies on face B in world space) back onto face A; this is the
         # vector from a's surface to b's surface, i.e. penetration * contact_normal.
         approx_dir = penetration * contact_normal
 
-        func_clip_polygon(gjk_state, gjk_info, i_b, 3, 3, False, False, n_a_world, approx_dir)
+        func_clip_polygon(
+            gjk_state, gjk_info, i_b, nverts_a, nverts_b, False, False, n_a_world, approx_dir
+        )
