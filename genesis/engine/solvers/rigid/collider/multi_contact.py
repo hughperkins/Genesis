@@ -381,16 +381,11 @@ def func_potential_box_normals(
 
         elif dim == 2:
             if w:
-                if (i == 0) or (i == 1):
-                    gjk_state.contact_normals[i_b, c].normal = global_n
-                else:
-                    gjk_state.contact_normals[i_b, 1].normal = global_n
-
-                for j in range(3):
-                    if i == j:
-                        gjk_state.contact_normals[i_b, c].id = j * 2 if xyz[j] > 0 else j * 2 + 1
-                        break
-
+                # Write both normal and id at index `c`, matching mujoco_warp's structure. The
+                # previous version forked on `i` and wrote the i==2 normal to index 1
+                # unconditionally, which left index 0 unset when only the z-axis was matching.
+                gjk_state.contact_normals[i_b, c].normal = global_n
+                gjk_state.contact_normals[i_b, c].id = i * 2 if xyz[i] > 0 else i * 2 + 1
                 c += 1
 
         elif dim == 1:
@@ -402,15 +397,18 @@ def func_potential_box_normals(
                     break
             c += 1
 
-    # Check [c] for detecting degenerate cases
+    # Check [c] for detecting degenerate cases. Mirrors mujoco_warp _box_normals after PR #1068
+    # (post fix for the dim==2 / c==1 case where the EPA edge sits on a face diagonal).
     if dim == 3:
-        # [c] should be 1 in normal case, but if triangle does not lie on the box face, it could be other values.
+        # Triangle must lie on a single face to give one normal (c == 1). c != 1 -> degenerate.
         n_normals = 1
         is_degenerate_simplex = c != 1
     elif dim == 2:
-        # [c] should be 2 in normal case, but if edge does not lie on the box edge, it could be other values.
-        n_normals = 2
-        is_degenerate_simplex = c != 2
+        # c == 2: edge is an external box edge (two adjacent face normals).
+        # c == 1: edge is the diagonal of a single face (one face normal). Both are valid.
+        # c == 0 or c == 3: degenerate simplex - fall back to collision-normal scan.
+        n_normals = c
+        is_degenerate_simplex = c != 1 and c != 2
     elif dim == 1:
         n_normals = 3
         is_degenerate_simplex = False
