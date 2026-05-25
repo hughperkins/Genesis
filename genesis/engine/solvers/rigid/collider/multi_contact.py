@@ -1198,3 +1198,116 @@ def func_quadrilateral_area(
     e = (d - a).cross(b - d) + (c - b).cross(a - c)
 
     return 0.5 * e.norm()
+
+
+@qd.func
+def _func_best_mesh_face_for_dir(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    i_g,
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+    target_dir_world: qd.types.vector(3, dtype=gs.qd_float),
+):
+    """
+    Find the triangle on geom [i_g] (a triangulated mesh) whose world-space face normal is
+    most aligned with [target_dir_world]. Returns (best_face_idx, best_world_normal). If no
+    face has positive alignment, best_face_idx is -1.
+
+    Currently O(nfaces) per call - acceptable for the dex-hand scale meshes; can be replaced
+    with a vert->face adjacency lookup (or precomputed support-vertex hint) for much larger
+    meshes once we have the adjacency precompute.
+    """
+    face_start = geoms_info.face_start[i_g]
+    face_end = geoms_info.face_end[i_g]
+
+    best_face = -1
+    best_dot = gs.qd_float(-1.0)
+    best_normal = gs.qd_vec3(0.0, 0.0, 0.0)
+
+    for i_f in range(face_start, face_end):
+        face = faces_info.verts_idx[i_f]
+        v0 = verts_info.init_pos[face[0]]
+        v1 = verts_info.init_pos[face[1]]
+        v2 = verts_info.init_pos[face[2]]
+        n_local = (v1 - v0).cross(v2 - v0)
+        n_norm = n_local.norm()
+        if n_norm > gs.qd_float(1e-12):
+            n_local = n_local / n_norm
+            n_world = gu.qd_transform_by_quat(n_local, quat)
+            d = n_world.dot(target_dir_world)
+            if d > best_dot:
+                best_dot = d
+                best_face = i_f
+                best_normal = n_world
+
+    return best_face, best_normal
+
+
+@qd.func
+def func_polyclip_mpr_mesh_mesh(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    gjk_state: array_class.GJKState,
+    gjk_info: array_class.GJKInfo,
+    i_ga,
+    i_gb,
+    i_b,
+    pos_a: qd.types.vector(3, dtype=gs.qd_float),
+    quat_a: qd.types.vector(4, dtype=gs.qd_float),
+    pos_b: qd.types.vector(3, dtype=gs.qd_float),
+    quat_b: qd.types.vector(4, dtype=gs.qd_float),
+    contact_normal: qd.types.vector(3, dtype=gs.qd_float),
+    penetration,
+):
+    """
+    MPR-driven Sutherland-Hodgman polygon clip for mesh-mesh contacts.
+
+    Given the contact normal from MPR (pointing from geom A toward geom B, with geom A on
+    the -normal side and geom B on the +normal side - see _func_multicontact_mpr's
+    perturbation correction at narrowphase.py:1398-1411 for the convention), find the
+    triangle on each mesh whose world-space normal is most aligned with the contact, build
+    the two polygons, and clip face B (subject) against the half-planes of face A (clipping
+    polygon).
+
+    Writes contact pairs to ``gjk_state.witness.point_obj1/2`` and the count to
+    ``gjk_state.n_witness[i_b]``. Sets ``gjk_state.n_witness[i_b]`` to 0 if no aligned face
+    pair is found, signalling that the caller should fall back to the perturbation path.
+    """
+    # Initial state - empty until clip succeeds
+    gjk_state.n_witness[i_b] = 0
+
+    # Outward face normal of A's contact face roughly aligns with +contact_normal (A is on
+    # -normal side, surface faces toward B). Outward face normal of B's contact face roughly
+    # aligns with -contact_normal.
+    face_a, n_a_world = _func_best_mesh_face_for_dir(
+        geoms_info, verts_info, faces_info, i_ga, quat_a, contact_normal
+    )
+    face_b, _n_b_world = _func_best_mesh_face_for_dir(
+        geoms_info, verts_info, faces_info, i_gb, quat_b, -contact_normal
+    )
+
+    if face_a < 0 or face_b < 0:
+        return
+
+    # Populate face_a vertices (clipping polygon) into contact_faces.vert1[i_b, 0..2].
+    fa_idx = faces_info.verts_idx[face_a]
+    for i in qd.static(range(3)):
+        v_local = verts_info.init_pos[fa_idx[i]]
+        v_world = gu.qd_transform_by_trans_quat(v_local, pos_a, quat_a)
+        gjk_state.contact_faces.vert1[i_b, i] = v_world
+
+    # Populate face_b vertices (subject polygon) into contact_faces.vert2[i_b, 0..2].
+    fb_idx = faces_info.verts_idx[face_b]
+    for i in qd.static(range(3)):
+        v_local = verts_info.init_pos[fb_idx[i]]
+        v_world = gu.qd_transform_by_trans_quat(v_local, pos_b, quat_b)
+        gjk_state.contact_faces.vert2[i_b, i] = v_world
+
+    # Use face A's outward normal as the clipping plane normal. approx_dir maps a clipped
+    # polygon vertex (which lies on face B in world space) back onto face A; this is the
+    # vector from a's surface to b's surface, i.e. penetration * contact_normal.
+    approx_dir = penetration * contact_normal
+
+    func_clip_polygon(gjk_state, gjk_info, i_b, 3, 3, False, False, n_a_world, approx_dir)
