@@ -1483,3 +1483,31 @@ def func_polyclip_mpr_mesh_mesh(
         func_clip_polygon(
             gjk_state, gjk_info, i_b, nverts_a, nverts_b, False, False, n_a_world, approx_dir
         )
+
+        # Per-witness penetration: re-project each clipped witness onto face A's actual plane
+        # so spurious "touching" witnesses (those whose projection has zero or negative
+        # overlap) drop out, and the remaining ones get a true geometric penetration. Without
+        # this re-projection, every witness inherits the MPR-derived penetration, which makes
+        # the constraint solver see four (or five) symmetric contacts at the small box's
+        # bottom corners with identical normal+penetration. That degenerate system has many
+        # tilted equilibria; perturbation avoids the degeneracy by giving each contact a
+        # slightly different normal/penetration, which is what we recover here for free.
+        n_w = gjk_state.n_witness[i_b]
+        if n_w > 0:
+            # Reference point on face A's plane (any face A vertex works).
+            p_a = gjk_state.contact_faces.vert1[i_b, 0]
+            n_w_kept = 0
+            for i_w in range(n_w):
+                w2 = gjk_state.witness.point_obj2[i_b, i_w]
+                # Signed distance from face A's plane to w2 along face A's outward normal.
+                # Positive = above plane (no penetration), negative = below (penetrating).
+                delta = (w2 - p_a).dot(n_a_world)
+                if delta < gs.qd_float(0.0):
+                    # w1 lives on face A's plane, w2 stays on face B's surface. wn = w2 - w1
+                    # = delta * n_a_world; for penetrating witnesses delta < 0 so wn points
+                    # opposite to n_a_world (i.e. from A toward B), matching MPR's convention.
+                    w1_proj = w2 - delta * n_a_world
+                    gjk_state.witness.point_obj1[i_b, n_w_kept] = w1_proj
+                    gjk_state.witness.point_obj2[i_b, n_w_kept] = w2
+                    n_w_kept += 1
+            gjk_state.n_witness[i_b] = n_w_kept
