@@ -962,7 +962,9 @@ def func_prune_contacts_coop(
     # cycle-permute) stay serial on lane 0. Subsequent stages add coop reductions (phase-2 mean / centroid) and parallel
     # cycle-permute.
     _K = qd.static(32)
-    qd.loop_config(name="prune_contacts_coop", block_dim=_K)
+    # block_dim=2*_K packs 2 envs per block (one per 32-lane warp). Halves block-scheduling overhead vs block_dim=_K
+    # while keeping each env's subgroup primitives local to its warp (tile_log2=5, partner=tid^j within [0,32)).
+    qd.loop_config(name="prune_contacts_coop", block_dim=2 * _K)
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
