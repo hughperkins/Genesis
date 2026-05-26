@@ -159,19 +159,43 @@ def test_diag_polyclip_mode4(asset_tmp_path, show_viewer):
 
     summary = _summarize(steps)
 
-    out_dir = os.environ.get("DIAG_OUT_DIR", "/tmp")
-    branch_tag = os.environ.get("DIAG_BRANCH_TAG", "unknown")
-    out_path = os.path.join(out_dir, f"diag_polyclip_mode4_{branch_tag}.json")
-    with open(out_path, "w") as f:
-        json.dump({"steps": steps, "summary": summary, "qpos_0": qpos_0.tolist()}, f)
-    print(f"[diag] wrote {out_path}")
-
-    print("[diag] summary:")
+    # Print summary to stdout so unit_tests_cluster.py captures it for offline diff.
+    # Use a stable [DIAG] prefix so we can grep it out of pytest output.
+    print(f"[DIAG] qpos_0 = {qpos_0.tolist()}")
+    print("[DIAG] summary:")
     for k, v in summary.items():
         if k in ("final_contacts",):
             continue
-        print(f"  {k}: {v}")
+        print(f"[DIAG]   {k} = {v}")
 
-    print("[diag] final contacts (each row: pos, normal, penetration, force):")
-    for c in summary["final_contacts"]:
-        print(f"  pos={c['pos']} normal={c['normal']} pen={c['penetration']:.3e} force={c['force']}")
+    print("[DIAG] final contacts:")
+    for i, c in enumerate(summary["final_contacts"]):
+        print(
+            f"[DIAG]   contact {i}: pos={c['pos']} normal={c['normal']} "
+            f"pen={c['penetration']:.3e} force={c['force']}"
+        )
+
+    # Also dump per-step n_contacts and the rotational quaternion components to
+    # see settling dynamics. qpos[3:7] are quat (wxyz); we just print qx,qy,qz.
+    print("[DIAG] per-step n_contacts and free-joint orientation drift:")
+    for k_step, s in enumerate(steps):
+        if k_step % 10 == 0 or k_step in (0, 1, 2, 3, 4, 5, 49, 99, 199):
+            qpos = s["qpos"]
+            quat_xyz = qpos[4:7] if len(qpos) >= 7 else qpos
+            qvel = s["qvel"]
+            print(
+                f"[DIAG]   step {k_step:3d}: n_contacts={s['n_contacts']} "
+                f"qx,qy,qz={quat_xyz} qvel_norm={float(np.linalg.norm(qvel)):.3e}"
+            )
+
+    # Also write json for offline inspection. Use the host-mounted worktree dir as
+    # the default; cluster mounts $HOME so /mnt/data/hugh/... is fine.
+    out_dir = os.environ.get("DIAG_OUT_DIR", os.getcwd())
+    branch_tag = os.environ.get("DIAG_BRANCH_TAG", "unknown")
+    out_path = os.path.join(out_dir, f"diag_polyclip_mode4_{branch_tag}.json")
+    try:
+        with open(out_path, "w") as f:
+            json.dump({"steps": steps, "summary": summary, "qpos_0": qpos_0.tolist()}, f)
+        print(f"[DIAG] wrote {out_path}")
+    except OSError as e:
+        print(f"[DIAG] could not write json: {e}")
