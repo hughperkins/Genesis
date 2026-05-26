@@ -1034,8 +1034,84 @@ def func_prune_contacts_coop(
                 if tid < n_con:
                     collider_state.contact_sort_key[tid, i_b] = my_key
                     collider_state.contact_sort_idx[tid, i_b] = my_idx
+            elif n_con <= 2 * _K:
+                # Chunked 64-element bitonic: each lane holds 2 elements (a at logical pos 2*tid, b at pos 2*tid+1).
+                # 21 compare-exchange stages (k=2..64, j=k/2..1). For j=1: in-lane a<->b. For j>=2: cross-lane shuffle
+                # with partner = tid XOR (j/2), applied to both a and b independently (a and b on same lane share
+                # the same "ascending" parity because bit k_log2 of 2t and 2t+1 are equal for k_log2 >= 1).
+                SENTINEL = qd.cast(gs.qd_float(1.0e30), gs.qd_float)
+                a_key = SENTINEL
+                a_idx = qd.i32(-1)
+                b_key = SENTINEL
+                b_idx = qd.i32(-1)
+                ia = 2 * tid
+                ib = 2 * tid + 1
+                if ia < n_con:
+                    a_key = collider_state.contact_sort_key[ia, i_b]
+                    a_idx = collider_state.contact_sort_idx[ia, i_b]
+                if ib < n_con:
+                    b_key = collider_state.contact_sort_key[ib, i_b]
+                    b_idx = collider_state.contact_sort_idx[ib, i_b]
+
+                for k_log2 in qd.static(range(1, 7)):
+                    k_mask = qd.static(1 << k_log2)
+                    for j_log2 in qd.static(range(k_log2 - 1, -1, -1)):
+                        j = qd.static(1 << j_log2)
+                        asc = (ia & k_mask) == 0
+                        if qd.static(j == 1):
+                            a_lt_b = (a_key < b_key) or (a_key == b_key and a_idx < b_idx)
+                            if asc:
+                                if not a_lt_b and (a_key != b_key or a_idx != b_idx):
+                                    t_key = a_key
+                                    t_idx = a_idx
+                                    a_key = b_key
+                                    a_idx = b_idx
+                                    b_key = t_key
+                                    b_idx = t_idx
+                            else:
+                                if a_lt_b:
+                                    t_key = a_key
+                                    t_idx = a_idx
+                                    a_key = b_key
+                                    a_idx = b_idx
+                                    b_key = t_key
+                                    b_idx = t_idx
+                        else:
+                            j_lane = qd.static(j >> 1)
+                            partner = qd.u32(tid ^ j_lane)
+                            their_a_key = qd.simt.subgroup.shuffle(a_key, partner)
+                            their_a_idx = qd.simt.subgroup.shuffle(a_idx, partner)
+                            their_b_key = qd.simt.subgroup.shuffle(b_key, partner)
+                            their_b_idx = qd.simt.subgroup.shuffle(b_idx, partner)
+                            i_am_low = (tid & j_lane) == 0
+                            take_min = i_am_low == asc
+                            their_lt_a = (their_a_key < a_key) or (their_a_key == a_key and their_a_idx < a_idx)
+                            if take_min:
+                                if their_lt_a:
+                                    a_key = their_a_key
+                                    a_idx = their_a_idx
+                            else:
+                                if not their_lt_a and (their_a_key != a_key or their_a_idx != a_idx):
+                                    a_key = their_a_key
+                                    a_idx = their_a_idx
+                            their_lt_b = (their_b_key < b_key) or (their_b_key == b_key and their_b_idx < b_idx)
+                            if take_min:
+                                if their_lt_b:
+                                    b_key = their_b_key
+                                    b_idx = their_b_idx
+                            else:
+                                if not their_lt_b and (their_b_key != b_key or their_b_idx != b_idx):
+                                    b_key = their_b_key
+                                    b_idx = their_b_idx
+
+                if ia < n_con:
+                    collider_state.contact_sort_key[ia, i_b] = a_key
+                    collider_state.contact_sort_idx[ia, i_b] = a_idx
+                if ib < n_con:
+                    collider_state.contact_sort_key[ib, i_b] = b_key
+                    collider_state.contact_sort_idx[ib, i_b] = b_idx
             elif tid == 0:
-                # Serial fallback: insertion sort on lane 0 for n_con > 32.
+                # Serial fallback: insertion sort on lane 0 for n_con > 64.
                 for i in range(1, n_con):
                     ck = collider_state.contact_sort_key[i, i_b]
                     if collider_state.contact_sort_key[i - 1, i_b] <= ck:
@@ -1393,8 +1469,9 @@ def func_prune_contacts_coop(
         # Sync between lane-0 phase-3 init and the parallel sort below.
         qd.simt.subgroup.sync()
 
-        # Phase 3 sort (exp F): parallel bitonic across 32 lanes when n_con <= 32; fallback serial insertion sort on
-        # lane 0 otherwise. Sorts (sort_key, sort_idx) together; sentinel-keyed dropped slots end at the tail.
+        # Phase 3 sort (exp F + NN3): parallel bitonic across 32 lanes when n_con <= 32, chunked 64-element bitonic
+        # (2 elements per lane) for n_con in (32, 64], fallback serial insertion sort on lane 0 otherwise.
+        # Sorts (sort_key, sort_idx) together; sentinel-keyed dropped slots end at the tail.
         if n_con <= _K:
             my_key = qd.cast(gs.qd_float(1.0e30), gs.qd_float)
             my_idx = qd.i32(-1)
@@ -1426,6 +1503,79 @@ def func_prune_contacts_coop(
             if tid < n_con:
                 collider_state.contact_sort_key[tid, i_b] = my_key
                 collider_state.contact_sort_idx[tid, i_b] = my_idx
+        elif n_con <= 2 * _K:
+            # Chunked 64-element bitonic: each lane holds 2 elements (a at logical pos 2*tid, b at pos 2*tid+1).
+            SENTINEL = qd.cast(gs.qd_float(1.0e30), gs.qd_float)
+            a_key = SENTINEL
+            a_idx = qd.i32(-1)
+            b_key = SENTINEL
+            b_idx = qd.i32(-1)
+            ia = 2 * tid
+            ib = 2 * tid + 1
+            if ia < n_con:
+                a_key = collider_state.contact_sort_key[ia, i_b]
+                a_idx = collider_state.contact_sort_idx[ia, i_b]
+            if ib < n_con:
+                b_key = collider_state.contact_sort_key[ib, i_b]
+                b_idx = collider_state.contact_sort_idx[ib, i_b]
+
+            for k_log2 in qd.static(range(1, 7)):
+                k_mask = qd.static(1 << k_log2)
+                for j_log2 in qd.static(range(k_log2 - 1, -1, -1)):
+                    j = qd.static(1 << j_log2)
+                    asc = (ia & k_mask) == 0
+                    if qd.static(j == 1):
+                        a_lt_b = (a_key < b_key) or (a_key == b_key and a_idx < b_idx)
+                        if asc:
+                            if not a_lt_b and (a_key != b_key or a_idx != b_idx):
+                                t_key = a_key
+                                t_idx = a_idx
+                                a_key = b_key
+                                a_idx = b_idx
+                                b_key = t_key
+                                b_idx = t_idx
+                        else:
+                            if a_lt_b:
+                                t_key = a_key
+                                t_idx = a_idx
+                                a_key = b_key
+                                a_idx = b_idx
+                                b_key = t_key
+                                b_idx = t_idx
+                    else:
+                        j_lane = qd.static(j >> 1)
+                        partner = qd.u32(tid ^ j_lane)
+                        their_a_key = qd.simt.subgroup.shuffle(a_key, partner)
+                        their_a_idx = qd.simt.subgroup.shuffle(a_idx, partner)
+                        their_b_key = qd.simt.subgroup.shuffle(b_key, partner)
+                        their_b_idx = qd.simt.subgroup.shuffle(b_idx, partner)
+                        i_am_low = (tid & j_lane) == 0
+                        take_min = i_am_low == asc
+                        their_lt_a = (their_a_key < a_key) or (their_a_key == a_key and their_a_idx < a_idx)
+                        if take_min:
+                            if their_lt_a:
+                                a_key = their_a_key
+                                a_idx = their_a_idx
+                        else:
+                            if not their_lt_a and (their_a_key != a_key or their_a_idx != a_idx):
+                                a_key = their_a_key
+                                a_idx = their_a_idx
+                        their_lt_b = (their_b_key < b_key) or (their_b_key == b_key and their_b_idx < b_idx)
+                        if take_min:
+                            if their_lt_b:
+                                b_key = their_b_key
+                                b_idx = their_b_idx
+                        else:
+                            if not their_lt_b and (their_b_key != b_key or their_b_idx != b_idx):
+                                b_key = their_b_key
+                                b_idx = their_b_idx
+
+            if ia < n_con:
+                collider_state.contact_sort_key[ia, i_b] = a_key
+                collider_state.contact_sort_idx[ia, i_b] = a_idx
+            if ib < n_con:
+                collider_state.contact_sort_key[ib, i_b] = b_key
+                collider_state.contact_sort_idx[ib, i_b] = b_idx
         elif tid == 0:
             for i in range(1, n_con):
                 ck = collider_state.contact_sort_key[i, i_b]
