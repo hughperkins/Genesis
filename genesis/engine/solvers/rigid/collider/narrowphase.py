@@ -14,7 +14,7 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
 
-from . import capsule_contact, diff_gjk, gjk, mpr
+from . import capsule_contact, diff_gjk, gjk, mpr, multi_contact as mc_polyclip
 from .box_contact import (
     func_box_box_contact,
     func_plane_box_contact,
@@ -1362,7 +1362,76 @@ def func_convex_convex_contact(
                         errno,
                     )
 
-                    if multi_contact:
+                    # MPR-driven Sutherland-Hodgman polygon clip for mesh-mesh: replaces
+                    # the 5x perturbation loop with a single clip + multi-witness emission.
+                    # Falls back to perturbation when no aligned face pair is found.
+                    polyclip_done = False
+                    if multi_contact and qd.static(
+                        collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MPR
+                    ):
+                        if (
+                            geoms_info.type[i_ga] == gs.GEOM_TYPE.MESH
+                            and geoms_info.type[i_gb] == gs.GEOM_TYPE.MESH
+                        ):
+                            mc_polyclip.func_polyclip_mpr_mesh_mesh(
+                                geoms_info,
+                                verts_info,
+                                faces_info,
+                                gjk_state,
+                                gjk_info,
+                                i_ga,
+                                i_gb,
+                                i_b,
+                                ga_pos_current,
+                                ga_quat_current,
+                                gb_pos_current,
+                                gb_quat_current,
+                                normal_0,
+                                penetration_0,
+                            )
+                            n_w = gjk_state.n_witness[i_b]
+                            if n_w > 0:
+                                polyclip_done = True
+                                for i_w in range(n_w):
+                                    if i_w < qd.static(collider_static_config.n_contacts_per_pair - 1):
+                                        w1 = gjk_state.witness.point_obj1[i_b, i_w]
+                                        w2 = gjk_state.witness.point_obj2[i_b, i_w]
+                                        wn = w2 - w1
+                                        wn_len = wn.norm()
+                                        if wn_len > rigid_global_info.EPS[None]:
+                                            wn_unit = wn / wn_len
+                                            cp_clip = 0.5 * (w1 + w2)
+                                            # Skip near-duplicates of the i==0 contact.
+                                            if (cp_clip - contact_pos_0).norm() >= tolerance:
+                                                cp_clip = func_apply_smooth_refinement(
+                                                    i_ga,
+                                                    i_gb,
+                                                    wn_unit,
+                                                    wn_len,
+                                                    cp_clip,
+                                                    ga_pos_current,
+                                                    ga_quat_current,
+                                                    gb_pos_current,
+                                                    gb_quat_current,
+                                                    geoms_info,
+                                                    static_rigid_sim_config,
+                                                )
+                                                func_add_contact(
+                                                    i_ga,
+                                                    i_gb,
+                                                    wn_unit,
+                                                    cp_clip,
+                                                    wn_len,
+                                                    i_b,
+                                                    i_pair,
+                                                    geoms_state,
+                                                    geoms_info,
+                                                    collider_state,
+                                                    collider_info,
+                                                    errno,
+                                                )
+
+                    if multi_contact and not polyclip_done:
                         # Perturb geom_a around two orthogonal axes to find multiple contacts
                         axis_0, axis_1 = func_contact_orthogonals(
                             i_ga,
@@ -1378,6 +1447,15 @@ def func_convex_convex_contact(
                             static_rigid_sim_config,
                         )
                         n_con = 1
+
+                    if polyclip_done:
+                        # Polygon clip emitted all extra contacts; cache normal then exit
+                        # the i_detection loop without running perturbations.
+                        if qd.static(
+                            collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MPR, CCD_ALGORITHM_CODE.GJK)
+                        ):
+                            collider_state.contact_cache.normal[i_pair, i_b] = normal
+                        break
 
                     if qd.static(
                         collider_static_config.ccd_algorithm in (CCD_ALGORITHM_CODE.MPR, CCD_ALGORITHM_CODE.GJK)
