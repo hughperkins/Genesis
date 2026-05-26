@@ -118,6 +118,7 @@ def _summarize(steps: list[dict]) -> dict:
     }
 
 
+@pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_diag_polyclip_mode4(asset_tmp_path, show_viewer):
     xml_path = _build_mode4_xml(asset_tmp_path)
