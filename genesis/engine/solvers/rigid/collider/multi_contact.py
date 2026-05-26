@@ -12,6 +12,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.array_class as array_class
 
+from . import support_field
 from .constants import RETURN_CODE
 from .utils import (
     func_is_equal_vec,
@@ -1214,9 +1215,9 @@ def _func_best_mesh_face_for_dir(
     most aligned with [target_dir_world]. Returns (best_face_idx, best_world_normal). If no
     face has positive alignment, best_face_idx is -1.
 
-    Currently O(nfaces) per call - acceptable for the dex-hand scale meshes; can be replaced
-    with a vert->face adjacency lookup (or precomputed support-vertex hint) for much larger
-    meshes once we have the adjacency precompute.
+    O(nfaces) per call - acceptable for small meshes / the perturbation fallback path. The
+    polyclip path uses ``_func_best_mesh_face_for_dir_via_vid`` instead, which localises
+    the search to the few faces incident to the MPR support vertex.
     """
     face_start = geoms_info.face_start[i_g]
     face_end = geoms_info.face_end[i_g]
@@ -1240,6 +1241,74 @@ def _func_best_mesh_face_for_dir(
                 best_dot = d
                 best_face = i_f
                 best_normal = n_world
+
+    return best_face, best_normal
+
+
+@qd.func
+def _func_best_mesh_face_for_dir_via_vid(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    collider_info: array_class.ColliderInfo,
+    i_g,
+    support_vid,
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+    target_dir_world: qd.types.vector(3, dtype=gs.qd_float),
+):
+    """
+    Localised version of ``_func_best_mesh_face_for_dir`` driven by the MPR support
+    vertex. The support of [i_g] in [target_dir_world] must lie on the face whose outward
+    normal is most aligned with [target_dir_world] (a property of convex polyhedra), so the
+    incident-face list of [support_vid] is a strict superset of the candidates the full
+    O(nfaces) scan considers.
+
+    For dex-hand scale meshes this turns a 200-500-face scan into a 4-8-face scan.
+
+    When [support_vid < 0] (e.g. the support function couldn't be queried for this geom
+    type), falls back to the full O(nfaces) scan.
+    """
+    best_face = -1
+    best_dot = gs.qd_float(-1.0)
+    best_normal = gs.qd_vec3(0.0, 0.0, 0.0)
+
+    if support_vid >= 0:
+        f_start = collider_info.vert_face_neighbor_start[support_vid]
+        f_n = collider_info.vert_n_face_neighbors[support_vid]
+        for k in range(f_n):
+            i_f = collider_info.vert_face_neighbors[f_start + k]
+            face = faces_info.verts_idx[i_f]
+            v0 = verts_info.init_pos[face[0]]
+            v1 = verts_info.init_pos[face[1]]
+            v2 = verts_info.init_pos[face[2]]
+            n_local = (v1 - v0).cross(v2 - v0)
+            n_norm = n_local.norm()
+            if n_norm > gs.qd_float(1e-12):
+                n_local = n_local / n_norm
+                n_world = gu.qd_transform_by_quat(n_local, quat)
+                d = n_world.dot(target_dir_world)
+                if d > best_dot:
+                    best_dot = d
+                    best_face = i_f
+                    best_normal = n_world
+    else:
+        face_start = geoms_info.face_start[i_g]
+        face_end = geoms_info.face_end[i_g]
+        for i_f in range(face_start, face_end):
+            face = faces_info.verts_idx[i_f]
+            v0 = verts_info.init_pos[face[0]]
+            v1 = verts_info.init_pos[face[1]]
+            v2 = verts_info.init_pos[face[2]]
+            n_local = (v1 - v0).cross(v2 - v0)
+            n_norm = n_local.norm()
+            if n_norm > gs.qd_float(1e-12):
+                n_local = n_local / n_norm
+                n_world = gu.qd_transform_by_quat(n_local, quat)
+                d = n_world.dot(target_dir_world)
+                if d > best_dot:
+                    best_dot = d
+                    best_face = i_f
+                    best_normal = n_world
 
     return best_face, best_normal
 
@@ -1399,6 +1468,8 @@ def func_polyclip_mpr_mesh_mesh(
     geoms_info: array_class.GeomsInfo,
     verts_info: array_class.VertsInfo,
     faces_info: array_class.FacesInfo,
+    collider_info: array_class.ColliderInfo,
+    support_field_info: array_class.SupportFieldInfo,
     gjk_state: array_class.GJKState,
     gjk_info: array_class.GJKInfo,
     i_ga,
@@ -1434,11 +1505,26 @@ def func_polyclip_mpr_mesh_mesh(
     # Initial state - empty until clip succeeds
     gjk_state.n_witness[i_b] = 0
 
-    face_a, n_a_world = _func_best_mesh_face_for_dir(
-        geoms_info, verts_info, faces_info, i_ga, quat_a, -contact_normal
+    # Query the precomputed support field with the contact direction to get the support
+    # vertex on each side. This vertex must lie on the contact face (a property of convex
+    # polyhedra), so the incident-face list is a strict superset of the candidates the
+    # full face scan considers - O(4-8) vs O(nfaces). Note that ``_func_support_world``
+    # returns the geom-local vertex index, so we offset by ``vert_start`` to get the
+    # global index ``collider_info.vert_face_neighbor_start`` expects.
+    _va, _va_local, vid_a_local = support_field._func_support_world(
+        support_field_info, -contact_normal, i_ga, pos_a, quat_a
     )
-    face_b, _n_b_world = _func_best_mesh_face_for_dir(
-        geoms_info, verts_info, faces_info, i_gb, quat_b, contact_normal
+    _vb, _vb_local, vid_b_local = support_field._func_support_world(
+        support_field_info, contact_normal, i_gb, pos_b, quat_b
+    )
+    vid_a = vid_a_local + geoms_info.vert_start[i_ga]
+    vid_b = vid_b_local + geoms_info.vert_start[i_gb]
+
+    face_a, n_a_world = _func_best_mesh_face_for_dir_via_vid(
+        geoms_info, verts_info, faces_info, collider_info, i_ga, vid_a, quat_a, -contact_normal
+    )
+    face_b, _n_b_world = _func_best_mesh_face_for_dir_via_vid(
+        geoms_info, verts_info, faces_info, collider_info, i_gb, vid_b, quat_b, contact_normal
     )
 
     # Note: avoid early-return inside non-static if (Quadrants pure mode rejects it). Wrap

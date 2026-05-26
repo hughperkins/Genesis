@@ -1377,6 +1377,8 @@ def func_convex_convex_contact(
                                 geoms_info,
                                 verts_info,
                                 faces_info,
+                                collider_info,
+                                support_field_info,
                                 gjk_state,
                                 gjk_info,
                                 i_ga,

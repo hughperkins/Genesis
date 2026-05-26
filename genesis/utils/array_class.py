@@ -761,6 +761,9 @@ class ColliderInfo:
     vert_neighbors: qd.Tensor
     vert_neighbor_start: qd.Tensor
     vert_n_neighbors: qd.Tensor
+    vert_face_neighbors: qd.Tensor
+    vert_face_neighbor_start: qd.Tensor
+    vert_n_face_neighbors: qd.Tensor
     # (i_ga, i_gb) -> dense pair index, or -1 if invalid. Used by SAP broadphase, narrowphase, and contact cache.
     collision_pair_idx: qd.Tensor
     max_possible_pairs: qd.Tensor
@@ -792,10 +795,15 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
     else:
         terrain_hf_shape = 1
 
+    n_vert_face_neighbors = kwargs.get("n_vert_face_neighbors", 0)
+
     return ColliderInfo(
         vert_neighbors=V(dtype=gs.qd_int, shape=(max(n_vert_neighbors, 1),)),
         vert_neighbor_start=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
         vert_n_neighbors=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        vert_face_neighbors=V(dtype=gs.qd_int, shape=(max(n_vert_face_neighbors, 1),)),
+        vert_face_neighbor_start=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        vert_n_face_neighbors=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
         collision_pair_idx=V(dtype=gs.qd_int, shape=(solver.n_geoms_, solver.n_geoms_)),
         max_possible_pairs=V(dtype=gs.qd_int, shape=()),
         max_collision_pairs=V(dtype=gs.qd_int, shape=()),

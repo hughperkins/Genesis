@@ -127,6 +127,23 @@ class RigidGeom(RBC):
         self.vert_n_neighbors = np.array(tuple(map(len, all_vert_neighbors_list)), dtype=gs.np_int)
         self.vert_neighbor_start = np.array((0, *np.cumsum(self.vert_n_neighbors)[:-1]), dtype=gs.np_int)
 
+        # Per-vertex incident-face list, used by polyclip multicontact to localise the
+        # "best contact face" search to the few faces touching the MPR support vertex
+        # (instead of the O(nfaces) scan).
+        all_vert_face_neighbors_list = [[] for _ in range(self.n_verts)]
+        for i_f, face in enumerate(self._init_faces):
+            for v_idx in face:
+                all_vert_face_neighbors_list[v_idx].append(i_f)
+        self.vert_face_neighbors = np.array(
+            tuple(chain.from_iterable(all_vert_face_neighbors_list)), dtype=gs.np_int
+        )
+        self.vert_n_face_neighbors = np.array(
+            tuple(map(len, all_vert_face_neighbors_list)), dtype=gs.np_int
+        )
+        self.vert_face_neighbor_start = np.array(
+            (0, *np.cumsum(self.vert_n_face_neighbors)[:-1]), dtype=gs.np_int
+        )
+
         # NOTE: sdf size is from the center of the lower voxel cell to the center of the upper voxel cell. Add
         # padding. The cell size is anisotropic - each axis is sized independently to its own extent - so a thin
         # slab gets fine resolution perpendicular to its surface without bloating the cell count along the long axes

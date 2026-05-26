@@ -175,6 +175,10 @@ class Collider:
         # Pre-compute fields, as they are needed to initialize the collider state and info.
         vert_neighbors, vert_neighbor_start, vert_n_neighbors = self._compute_verts_connectivity()
         n_vert_neighbors = len(vert_neighbors)
+        vert_face_neighbors, vert_face_neighbor_start, vert_n_face_neighbors = (
+            self._compute_vert_faces_connectivity()
+        )
+        n_vert_face_neighbors = len(vert_face_neighbors)
         n_valid_pairs = len(self._valid_collision_pairs)
 
         # Initialize [info], which stores every data that must be considered mutable from Quadrants's perspective,
@@ -184,6 +188,7 @@ class Collider:
             n_vert_neighbors,
             n_valid_pairs,
             self._collider_static_config,
+            n_vert_face_neighbors=n_vert_face_neighbors,
             mc_perturbation=self._mc_perturbation,
             mc_tolerance=self._mc_tolerance,
             mpr_to_gjk_overlap_ratio=self._mpr_to_gjk_overlap_ratio,
@@ -193,6 +198,9 @@ class Collider:
         self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
+        self._init_vert_faces_connectivity(
+            vert_face_neighbors, vert_face_neighbor_start, vert_n_face_neighbors
+        )
         self._init_max_contact_pairs(self._n_possible_pairs)
         self._init_terrain_state()
 
@@ -512,6 +520,29 @@ class Collider:
 
         return vert_neighbors, vert_neighbor_start, vert_n_neighbors
 
+    def _compute_vert_faces_connectivity(self):
+        """
+        Compute the per-vertex incident-face connectivity. Used by polyclip multicontact
+        to localise the "best contact face" search to the few faces touching the MPR
+        support vertex (instead of an O(nfaces) scan over the whole geom).
+        """
+        vert_face_neighbors = []
+        vert_face_neighbor_start = []
+        vert_n_face_neighbors = []
+        offset = 0
+        for geom in self._solver.geoms:
+            vert_face_neighbors.append(geom.vert_face_neighbors + geom.face_start)
+            vert_face_neighbor_start.append(geom.vert_face_neighbor_start + offset)
+            vert_n_face_neighbors.append(geom.vert_n_face_neighbors)
+            offset = offset + len(geom.vert_face_neighbors)
+
+        if self._solver.n_verts > 0:
+            vert_face_neighbors = np.concatenate(vert_face_neighbors, dtype=gs.np_int)
+            vert_face_neighbor_start = np.concatenate(vert_face_neighbor_start, dtype=gs.np_int)
+            vert_n_face_neighbors = np.concatenate(vert_n_face_neighbors, dtype=gs.np_int)
+
+        return vert_face_neighbors, vert_face_neighbor_start, vert_n_face_neighbors
+
     def _init_collision_pair_idx(self, collision_pair_idx):
         if self._n_possible_pairs == 0:
             self._collider_info.collision_pair_idx.fill(-1)
@@ -527,6 +558,14 @@ class Collider:
             self._collider_info.vert_neighbors.from_numpy(vert_neighbors)
             self._collider_info.vert_neighbor_start.from_numpy(vert_neighbor_start)
             self._collider_info.vert_n_neighbors.from_numpy(vert_n_neighbors)
+
+    def _init_vert_faces_connectivity(
+        self, vert_face_neighbors, vert_face_neighbor_start, vert_n_face_neighbors
+    ):
+        if self._solver.n_verts > 0:
+            self._collider_info.vert_face_neighbors.from_numpy(vert_face_neighbors)
+            self._collider_info.vert_face_neighbor_start.from_numpy(vert_face_neighbor_start)
+            self._collider_info.vert_n_face_neighbors.from_numpy(vert_n_face_neighbors)
 
     def _init_max_contact_pairs(self, n_possible_pairs):
         max_collision_pairs = min(self._solver.max_collision_pairs, n_possible_pairs)
