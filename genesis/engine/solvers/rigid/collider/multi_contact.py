@@ -1414,12 +1414,18 @@ def func_polyclip_mpr_mesh_mesh(
     """
     MPR-driven Sutherland-Hodgman polygon clip for mesh-mesh contacts.
 
-    Given the contact normal from MPR (pointing from geom A toward geom B, with geom A on
-    the -normal side and geom B on the +normal side - see _func_multicontact_mpr's
-    perturbation correction at narrowphase.py:1398-1411 for the convention), find the
-    triangle on each mesh whose world-space normal is most aligned with the contact, build
-    the two polygons, and clip face B (subject) against the half-planes of face A (clipping
-    polygon).
+    Convention (verified empirically via tests/test_diag_polyclip.py mode 4): the contact
+    normal Genesis stores in ``contact_data.normal`` (and which we receive here as
+    ``contact_normal``) points **from geom B toward geom A**. So geom A sits on the
+    +contact_normal side and geom B on the -contact_normal side. The contact face on each
+    geom is the one whose outward normal points across the gap toward the other geom:
+
+    - face A's outward normal points toward B = ``-contact_normal``.
+    - face B's outward normal points toward A = ``+contact_normal``.
+
+    Find the triangle on each mesh whose world-space outward normal is most aligned with the
+    expected direction, build the two polygons, and clip face B (subject) against the
+    half-planes of face A (clipping polygon).
 
     Writes contact pairs to ``gjk_state.witness.point_obj1/2`` and the count to
     ``gjk_state.n_witness[i_b]``. Sets ``gjk_state.n_witness[i_b]`` to 0 if no aligned face
@@ -1428,14 +1434,11 @@ def func_polyclip_mpr_mesh_mesh(
     # Initial state - empty until clip succeeds
     gjk_state.n_witness[i_b] = 0
 
-    # Outward face normal of A's contact face roughly aligns with +contact_normal (A is on
-    # -normal side, surface faces toward B). Outward face normal of B's contact face roughly
-    # aligns with -contact_normal.
     face_a, n_a_world = _func_best_mesh_face_for_dir(
-        geoms_info, verts_info, faces_info, i_ga, quat_a, contact_normal
+        geoms_info, verts_info, faces_info, i_ga, quat_a, -contact_normal
     )
     face_b, _n_b_world = _func_best_mesh_face_for_dir(
-        geoms_info, verts_info, faces_info, i_gb, quat_b, -contact_normal
+        geoms_info, verts_info, faces_info, i_gb, quat_b, contact_normal
     )
 
     # Note: avoid early-return inside non-static if (Quadrants pure mode rejects it). Wrap
