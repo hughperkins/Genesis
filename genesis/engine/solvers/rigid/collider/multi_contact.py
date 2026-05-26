@@ -1402,9 +1402,20 @@ def _func_populate_face_polygon(
     """
     fa_idx = faces_info.verts_idx[best_face]
 
-    partner_face, shared_a0, shared_a1 = _func_find_quad_partner(
-        geoms_info, verts_info, faces_info, i_g, best_face, best_normal_world, quat
-    )
+    # Quad-partner merging only matters for primitive-style box meshes (which are
+    # triangulated as 6 quads -> 12 triangles, with each pair of coplanar triangles
+    # sharing an edge). Anything larger is either a coacd convex piece or a smooth mesh
+    # where coplanar same-edge neighbors don't exist anyway, so skip the O(nfaces) scan
+    # and use the raw triangle. Threshold is conservative: trimesh boxes are exactly 12
+    # triangles; primitive-style cylinder caps and similar fixtures stay under 16 too.
+    nfaces = geoms_info.face_end[i_g] - geoms_info.face_start[i_g]
+    partner_face = -1
+    shared_a0 = -1
+    shared_a1 = -1
+    if nfaces <= 16:
+        partner_face, shared_a0, shared_a1 = _func_find_quad_partner(
+            geoms_info, verts_info, faces_info, i_g, best_face, best_normal_world, quat
+        )
 
     nverts = 3
     if partner_face < 0:
