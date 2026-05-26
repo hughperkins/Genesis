@@ -1225,16 +1225,19 @@ def func_prune_contacts_coop(
                                     j -= 1
                                 collider_state.contact_lex_idx[j + 1, i_b] = ci
 
+                    # Hull build is inherently sequential (stack-walking with data-dependent pops), so it stays on
+                    # lane 0. We compute `k` on lane 0, broadcast it to all lanes, and then parallelise the
+                    # mark-survivors / hull-pen-max / deep-pen restore that follow.
+                    k = qd.i32(0)
                     if tid == 0 and coplanar:
-                        # SERIAL on lane 0: Andrew monotone-chain hull build + mark survivors. These walk a stack
-                        # and have data-dependent inner loops that don't decompose across warp lanes.
+                        # SERIAL on lane 0: Andrew monotone-chain hull build. Walks a stack with data-dependent
+                        # inner loops that don't decompose across warp lanes.
 
                         # Collinearity threshold for hull pops, scaled to the bucket extent. A pure "cross <= 0" check
                         # fails on numerically-near-collinear edge points (cross is a tiny positive epsilon from float
                         # roundoff), so genuine midpoints would survive as spurious hull vertices.
                         hull_collinear_tol = tol * max_in_plane_r2
 
-                        k = 0
                         for i in range(b_start, b_end):
                             ci = collider_state.contact_lex_idx[i, i_b]
                             cu = collider_state.contact_sort_key[ci, i_b]
@@ -1284,36 +1287,43 @@ def func_prune_contacts_coop(
                                 collider_state.contact_hull_stack[b_start + k, i_b] = ci
                                 k += 1
 
-                        for hk in range(k):
+                    # Broadcast k from lane 0 to all lanes for the parallel finish below.
+                    k = qd.simt.subgroup.broadcast(k, qd.u32(0))
+
+                    if coplanar and k > 0:
+                        # COOP mark survivors: each lane handles a stride of the hull stack.
+                        hk = tid
+                        while hk < k:
                             survivor_sort = collider_state.contact_hull_stack[b_start + hk, i_b]
                             survivor_orig = collider_state.contact_sort_idx[survivor_sort, i_b]
                             collider_state.contact_keep[survivor_orig, i_b] = 1
+                            hk += _K
 
-                        # Restore non-hull contacts whose penetration is much deeper than the hull boundary's max
-                        # (PR #2831 switched from avg to max). Rationale: a contact whose penetration substantially
-                        # exceeds the hull's deepest vertex represents a distinct physical support (deep body of a
-                        # fork beyond its tines, deep middle of a long body) that the support-polygon argument
-                        # doesn't actually authorize dropping (the argument only holds when all contacts share
-                        # normal AND penetration). The 3x factor over the hull max is well above the typical ~1.x
-                        # penetration spread on transient/rocking faces but well below the deep interior penetrations
-                        # seen when a non-flat body rests inside its convex envelope. Indices here live in orig-space
-                        # (because the cycle-permute is fused into the phase 3 below in opt 10 -- contact_data is
-                        # still in pre-sort order, so we translate sort-space hull/bucket indices through
-                        # contact_sort_idx).
-                        hull_pen_max = gs.qd_float(0.0)
-                        for hk in range(k):
+                        # COOP hull_pen_max reduce: each lane scans its stride of survivors, then reduce_max across
+                        # all 32 lanes.
+                        hpm_l = gs.qd_float(0.0)
+                        hk = tid
+                        while hk < k:
                             survivor_sort = collider_state.contact_hull_stack[b_start + hk, i_b]
                             survivor_orig = collider_state.contact_sort_idx[survivor_sort, i_b]
                             p = collider_state.contact_data.penetration[survivor_orig, i_b]
-                            if p > hull_pen_max:
-                                hull_pen_max = p
+                            if p > hpm_l:
+                                hpm_l = p
+                            hk += _K
+                        hull_pen_max = qd.simt.subgroup.reduce_all_max_tiled(hpm_l, 5)
                         deep_keep_threshold = prune_deep_penetration_ratio * hull_pen_max
-                        for jj_idx in range(b_start, b_end):
+
+                        # COOP deep-pen restore: each lane handles a stride of the bucket.
+                        jj_idx = b_start + tid
+                        while jj_idx < b_end:
                             orig = collider_state.contact_sort_idx[jj_idx, i_b]
                             if collider_state.contact_keep[orig, i_b] == 0:
                                 if collider_state.contact_data.penetration[orig, i_b] > deep_keep_threshold:
                                     collider_state.contact_keep[orig, i_b] = 1
+                            jj_idx += _K
 
+                # Sync between coop bucket finish and next bucket's reads (or phase 3).
+                qd.simt.subgroup.sync()
                 b_start = b_end
 
         if tid == 0:
