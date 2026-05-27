@@ -41,22 +41,21 @@ def test_diag_polyclip_pairs_dex_hand(show_viewer):
                 pair_counter[key] += 1
                 n_pairs_total += 1
 
-    print(f"[DIAG] n_collision_pairs_eligible = {n_pairs_total}")
+    lines = [f"[DIAG] n_geoms = {len(types)}"]
+    for k, v in sorted(geom_counter.items(), key=lambda kv: -kv[1]):
+        lines.append(f"[DIAG]   geom {k}: {v}")
+    lines.append(f"[DIAG] n_collision_pairs_eligible = {n_pairs_total}")
     for k, v in sorted(pair_counter.items(), key=lambda kv: -kv[1]):
         ta, tb = k
-        is_mesh_mesh = ta == "MESH" and tb == "MESH"
-        polyclip_today = " (polyclip fires today)" if is_mesh_mesh else ""
-        polyclip_box_mesh = (
-            " (would fire if polyclip extended to box-mesh)"
-            if {ta, tb} == {"BOX", "MESH"}
-            else ""
-        )
-        polyclip_cyl_mesh = (
-            " (would fire if polyclip extended to cylinder-mesh)"
-            if {ta, tb} == {"CYLINDER", "MESH"}
-            else ""
-        )
-        print(
-            f"[DIAG]   pair {ta:<10s} x {tb:<10s}: {v}"
-            f"{polyclip_today}{polyclip_box_mesh}{polyclip_cyl_mesh}"
-        )
+        tag = ""
+        if ta == "MESH" and tb == "MESH":
+            tag = " (polyclip fires today)"
+        elif {ta, tb} == {"BOX", "MESH"}:
+            tag = " (would fire if polyclip extended to box-mesh)"
+        elif {ta, tb} == {"CYLINDER", "MESH"}:
+            tag = " (would fire if polyclip extended to cylinder-mesh)"
+        lines.append(f"[DIAG]   pair {ta:<10s} x {tb:<10s}: {v}{tag}")
+
+    msg = "\n".join(lines)
+    print(msg)
+    raise AssertionError(f"[DIAG-OUTPUT-MARKER]\n{msg}")
