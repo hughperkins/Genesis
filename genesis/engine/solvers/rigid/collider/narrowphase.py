@@ -1362,17 +1362,23 @@ def func_convex_convex_contact(
                         errno,
                     )
 
-                    # MPR-driven Sutherland-Hodgman polygon clip for mesh-mesh: replaces
-                    # the 5x perturbation loop with a single clip + multi-witness emission.
-                    # Falls back to perturbation when no aligned face pair is found.
+                    # MPR-driven Sutherland-Hodgman polygon clip: replaces the 5x
+                    # perturbation loop with a single clip + multi-witness emission.
+                    # Covers MESH-MESH plus BOX-MESH / MESH-BOX. Falls back to perturbation
+                    # when no aligned face pair is found, which also catches the
+                    # not-yet-supported pair types (cylinder-mesh, sphere-mesh, etc.).
                     polyclip_done = False
                     if multi_contact and qd.static(
                         collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MPR
                     ):
-                        if (
-                            geoms_info.type[i_ga] == gs.GEOM_TYPE.MESH
-                            and geoms_info.type[i_gb] == gs.GEOM_TYPE.MESH
-                        ):
+                        ta = geoms_info.type[i_ga]
+                        tb = geoms_info.type[i_gb]
+                        a_supported = ta == gs.GEOM_TYPE.MESH or ta == gs.GEOM_TYPE.BOX
+                        b_supported = tb == gs.GEOM_TYPE.MESH or tb == gs.GEOM_TYPE.BOX
+                        # Skip pure BOX-BOX: it has its own specialised contact routine
+                        # (func_box_box_contact) that runs earlier and won't reach here.
+                        not_box_box = not (ta == gs.GEOM_TYPE.BOX and tb == gs.GEOM_TYPE.BOX)
+                        if a_supported and b_supported and not_box_box:
                             mc_polyclip.func_polyclip_mpr_mesh_mesh(
                                 geoms_info,
                                 verts_info,

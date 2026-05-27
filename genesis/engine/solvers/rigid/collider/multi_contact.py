@@ -1475,6 +1475,152 @@ def _func_populate_face_polygon(
 
 
 @qd.func
+def _func_populate_box_face_polygon(
+    geoms_info: array_class.GeomsInfo,
+    i_g,
+    target_dir_world: qd.types.vector(3, dtype=gs.qd_float),
+    pos: qd.types.vector(3, dtype=gs.qd_float),
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+    gjk_state: array_class.GJKState,
+    i_b,
+    write_to_vert1: qd.template(),
+):
+    """
+    Build the world-space contact polygon for the box face whose outward normal is most
+    aligned with [target_dir_world]. Mirrors ``_func_populate_face_polygon`` for boxes.
+
+    Returns ``(4, n_world)`` where [n_world] is the chosen face's outward normal in world
+    frame. Always returns 4 (box faces are quads); polyclip's nverts contract is unchanged.
+
+    The face encoding matches ``func_box_face``: face_idx = 2*axis + (1 if side<0 else 0),
+    with axis ∈ {0,1,2} = {x,y,z}, side ∈ {+1,-1}. Vertex ordering is CCW seen from
+    outside (cross product of consecutive edges = +outward normal), required by
+    Sutherland-Hodgman in ``func_clip_polygon``.
+    """
+    # Inverse-rotate the target direction into the box's local frame so the face pick is
+    # a cheap argmax over (±x, ±y, ±z). One quat-inv-transform vs six in world frame.
+    n_local = gu.qd_inv_transform_by_quat(target_dir_world, quat)
+    abs0 = qd.abs(n_local[0])
+    abs1 = qd.abs(n_local[1])
+    abs2 = qd.abs(n_local[2])
+
+    i_axis = gs.qd_int(0)
+    if abs1 > abs0 and abs1 >= abs2:
+        i_axis = gs.qd_int(1)
+    elif abs2 > abs0 and abs2 > abs1:
+        i_axis = gs.qd_int(2)
+
+    sign = gs.qd_float(1.0)
+    if n_local[i_axis] < gs.qd_float(0.0):
+        sign = gs.qd_float(-1.0)
+
+    hx = geoms_info.data[i_g][0] * 0.5
+    hy = geoms_info.data[i_g][1] * 0.5
+    hz = geoms_info.data[i_g][2] * 0.5
+
+    # Tangent convention: tangent_a = +e_{axis+1}, tangent_b = sign * e_{axis+2}.
+    # This guarantees (tangent_a × tangent_b) = sign * e_{axis} = +outward, so
+    # listing corners as (-,-),(+,-),(+,+),(-,+) walks CCW from outside.
+    c0 = qd.Vector.zero(gs.qd_float, 3)
+    c1 = qd.Vector.zero(gs.qd_float, 3)
+    c2 = qd.Vector.zero(gs.qd_float, 3)
+    c3 = qd.Vector.zero(gs.qd_float, 3)
+
+    if i_axis == 0:
+        c0 = qd.Vector([sign * hx, -hy, -sign * hz], dt=gs.qd_float)
+        c1 = qd.Vector([sign * hx, hy, -sign * hz], dt=gs.qd_float)
+        c2 = qd.Vector([sign * hx, hy, sign * hz], dt=gs.qd_float)
+        c3 = qd.Vector([sign * hx, -hy, sign * hz], dt=gs.qd_float)
+    elif i_axis == 1:
+        c0 = qd.Vector([-sign * hx, sign * hy, -hz], dt=gs.qd_float)
+        c1 = qd.Vector([-sign * hx, sign * hy, hz], dt=gs.qd_float)
+        c2 = qd.Vector([sign * hx, sign * hy, hz], dt=gs.qd_float)
+        c3 = qd.Vector([sign * hx, sign * hy, -hz], dt=gs.qd_float)
+    else:
+        c0 = qd.Vector([-hx, -sign * hy, sign * hz], dt=gs.qd_float)
+        c1 = qd.Vector([hx, -sign * hy, sign * hz], dt=gs.qd_float)
+        c2 = qd.Vector([hx, sign * hy, sign * hz], dt=gs.qd_float)
+        c3 = qd.Vector([-hx, sign * hy, sign * hz], dt=gs.qd_float)
+
+    c0_w = gu.qd_transform_by_trans_quat(c0, pos, quat)
+    c1_w = gu.qd_transform_by_trans_quat(c1, pos, quat)
+    c2_w = gu.qd_transform_by_trans_quat(c2, pos, quat)
+    c3_w = gu.qd_transform_by_trans_quat(c3, pos, quat)
+
+    if qd.static(write_to_vert1):
+        gjk_state.contact_faces.vert1[i_b, 0] = c0_w
+        gjk_state.contact_faces.vert1[i_b, 1] = c1_w
+        gjk_state.contact_faces.vert1[i_b, 2] = c2_w
+        gjk_state.contact_faces.vert1[i_b, 3] = c3_w
+    else:
+        gjk_state.contact_faces.vert2[i_b, 0] = c0_w
+        gjk_state.contact_faces.vert2[i_b, 1] = c1_w
+        gjk_state.contact_faces.vert2[i_b, 2] = c2_w
+        gjk_state.contact_faces.vert2[i_b, 3] = c3_w
+
+    n_local_axis = qd.Vector.zero(gs.qd_float, 3)
+    if i_axis == 0:
+        n_local_axis = qd.Vector([sign, gs.qd_float(0.0), gs.qd_float(0.0)], dt=gs.qd_float)
+    elif i_axis == 1:
+        n_local_axis = qd.Vector([gs.qd_float(0.0), sign, gs.qd_float(0.0)], dt=gs.qd_float)
+    else:
+        n_local_axis = qd.Vector([gs.qd_float(0.0), gs.qd_float(0.0), sign], dt=gs.qd_float)
+    n_world = gu.qd_transform_by_quat(n_local_axis, quat)
+
+    return gs.qd_int(4), n_world
+
+
+@qd.func
+def _func_populate_contact_polygon(
+    geoms_info: array_class.GeomsInfo,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    collider_info: array_class.ColliderInfo,
+    support_field_info: array_class.SupportFieldInfo,
+    i_g,
+    target_dir_world: qd.types.vector(3, dtype=gs.qd_float),
+    pos: qd.types.vector(3, dtype=gs.qd_float),
+    quat: qd.types.vector(4, dtype=gs.qd_float),
+    gjk_state: array_class.GJKState,
+    i_b,
+    write_to_vert1: qd.template(),
+):
+    """
+    Dispatch helper: build the contact-face polygon for [i_g] (mesh or box) in the
+    direction of [target_dir_world] and return ``(nverts, n_world_outward)``. Returns
+    ``(0, zero)`` when the geom type isn't supported by polyclip yet, signalling the
+    caller to fall back.
+    """
+    nverts = gs.qd_int(0)
+    n_world = qd.Vector.zero(gs.qd_float, 3)
+
+    if geoms_info.type[i_g] == gs.GEOM_TYPE.MESH:
+        # Support vertex of i_g in the target direction must lie on the contact face
+        # (convex polyhedra property); the incident-face list is a strict superset of
+        # the full-scan candidates. ``_func_support_world`` returns the geom-local vid;
+        # ``vert_start`` offsets to the global index ``vert_face_neighbor_start`` expects.
+        _v, _v_local, vid_local = support_field._func_support_world(
+            support_field_info, target_dir_world, i_g, pos, quat
+        )
+        vid = vid_local + geoms_info.vert_start[i_g]
+        face, n_mesh = _func_best_mesh_face_for_dir_via_vid(
+            geoms_info, verts_info, faces_info, collider_info, i_g, vid, quat, target_dir_world
+        )
+        if face >= 0:
+            nverts = _func_populate_face_polygon(
+                geoms_info, verts_info, faces_info, i_g, face, n_mesh,
+                pos, quat, gjk_state, i_b, write_to_vert1,
+            )
+            n_world = n_mesh
+    elif geoms_info.type[i_g] == gs.GEOM_TYPE.BOX:
+        nverts, n_world = _func_populate_box_face_polygon(
+            geoms_info, i_g, target_dir_world, pos, quat, gjk_state, i_b, write_to_vert1,
+        )
+
+    return nverts, n_world
+
+
+@qd.func
 def func_polyclip_mpr_mesh_mesh(
     geoms_info: array_class.GeomsInfo,
     verts_info: array_class.VertsInfo,
@@ -1494,7 +1640,9 @@ def func_polyclip_mpr_mesh_mesh(
     penetration,
 ):
     """
-    MPR-driven Sutherland-Hodgman polygon clip for mesh-mesh contacts.
+    MPR-driven Sutherland-Hodgman polygon clip. Despite the historical name, this now
+    handles MESH-MESH, BOX-MESH and MESH-BOX (and BOX-BOX, but BOX-BOX has its own
+    specialised contact routine that supersedes this path).
 
     Convention (verified empirically via tests/test_diag_polyclip.py mode 4): the contact
     normal Genesis stores in ``contact_data.normal`` (and which we receive here as
@@ -1505,72 +1653,26 @@ def func_polyclip_mpr_mesh_mesh(
     - face A's outward normal points toward B = ``-contact_normal``.
     - face B's outward normal points toward A = ``+contact_normal``.
 
-    Find the triangle on each mesh whose world-space outward normal is most aligned with the
-    expected direction, build the two polygons, and clip face B (subject) against the
-    half-planes of face A (clipping polygon).
+    Pick the contact face on each side (either via mesh face-pick or box face-pick), build
+    the two polygons, and clip face B (subject) against the half-planes of face A
+    (clipping polygon).
 
     Writes contact pairs to ``gjk_state.witness.point_obj1/2`` and the count to
     ``gjk_state.n_witness[i_b]``. Sets ``gjk_state.n_witness[i_b]`` to 0 if no aligned face
     pair is found, signalling that the caller should fall back to the perturbation path.
     """
-    # Initial state - empty until clip succeeds
     gjk_state.n_witness[i_b] = 0
 
-    # Query the precomputed support field with the contact direction to get the support
-    # vertex on each side. This vertex must lie on the contact face (a property of convex
-    # polyhedra), so the incident-face list is a strict superset of the candidates the
-    # full face scan considers - O(4-8) vs O(nfaces). Note that ``_func_support_world``
-    # returns the geom-local vertex index, so we offset by ``vert_start`` to get the
-    # global index ``collider_info.vert_face_neighbor_start`` expects.
-    _va, _va_local, vid_a_local = support_field._func_support_world(
-        support_field_info, -contact_normal, i_ga, pos_a, quat_a
+    nverts_a, n_a_world = _func_populate_contact_polygon(
+        geoms_info, verts_info, faces_info, collider_info, support_field_info,
+        i_ga, -contact_normal, pos_a, quat_a, gjk_state, i_b, True,
     )
-    _vb, _vb_local, vid_b_local = support_field._func_support_world(
-        support_field_info, contact_normal, i_gb, pos_b, quat_b
-    )
-    vid_a = vid_a_local + geoms_info.vert_start[i_ga]
-    vid_b = vid_b_local + geoms_info.vert_start[i_gb]
-
-    face_a, n_a_world = _func_best_mesh_face_for_dir_via_vid(
-        geoms_info, verts_info, faces_info, collider_info, i_ga, vid_a, quat_a, -contact_normal
-    )
-    face_b, _n_b_world = _func_best_mesh_face_for_dir_via_vid(
-        geoms_info, verts_info, faces_info, collider_info, i_gb, vid_b, quat_b, contact_normal
+    nverts_b, _n_b_world = _func_populate_contact_polygon(
+        geoms_info, verts_info, faces_info, collider_info, support_field_info,
+        i_gb, contact_normal, pos_b, quat_b, gjk_state, i_b, False,
     )
 
-    # Note: avoid early-return inside non-static if (Quadrants pure mode rejects it). Wrap
-    # the rest of the function in a guard instead.
-    if face_a >= 0 and face_b >= 0:
-        # Populate the contact face polygons. When a triangle has a coplanar neighbor across
-        # an edge (the typical case for a primitive box mesh, which trimesh splits into two
-        # right triangles per face), recover the full quad so the clip sees the entire
-        # rectangular face rather than a triangular half-face.
-        nverts_a = _func_populate_face_polygon(
-            geoms_info,
-            verts_info,
-            faces_info,
-            i_ga,
-            face_a,
-            n_a_world,
-            pos_a,
-            quat_a,
-            gjk_state,
-            i_b,
-            True,
-        )
-        nverts_b = _func_populate_face_polygon(
-            geoms_info,
-            verts_info,
-            faces_info,
-            i_gb,
-            face_b,
-            _n_b_world,
-            pos_b,
-            quat_b,
-            gjk_state,
-            i_b,
-            False,
-        )
+    if nverts_a > 0 and nverts_b > 0:
 
         # Use face A's outward normal as the clipping plane normal. approx_dir maps a clipped
         # polygon vertex (which lies on face B in world space) back onto face A; this is the
