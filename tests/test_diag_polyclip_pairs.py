@@ -58,4 +58,3 @@ def test_diag_polyclip_pairs_dex_hand(show_viewer):
 
     msg = "\n".join(lines)
     print(msg)
-    raise AssertionError(f"[DIAG-OUTPUT-MARKER]\n{msg}")
