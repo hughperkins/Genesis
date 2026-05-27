@@ -15,23 +15,26 @@ if TYPE_CHECKING:
 class SupportField:
     def __init__(self, rigid_solver: "RigidSolver") -> None:
         self.solver = rigid_solver
-        self._support_res = 180
+        # Cylindrical equal-area (Lambert) sampling on the unit sphere: uniform in
+        # (theta, z = cos(phi)). Each cell covers a constant solid angle 4*pi / support_res**2.
+        # Equal-area gives ~6.4x more solid angle per cell at 90x90 vs the old 180x180 equirect
+        # average, but cells are uniformly sized so there is no pole degeneracy.
+        self._support_res = 90
         self._support_field_info = array_class.get_support_field_info(0, 0, self._support_res)
         self._is_active = False
 
     def _get_direction_grid(self):
         support_res = self._support_res
+        # theta sampled at left cell edges (cyclic, no degeneracy).
         theta = np.arange(support_res) / support_res * 2 * math.pi - math.pi
-        phi = np.arange(support_res) / support_res * math.pi
+        # z sampled at cell centres so no sample lies exactly at a pole (sin_phi > 0 everywhere).
+        z = (np.arange(support_res) + 0.5) / support_res * 2.0 - 1.0
+        sin_phi = np.sqrt(np.maximum(1.0 - z * z, 0.0))
 
-        spherical_coords = np.zeros([support_res, support_res, 2])
-        spherical_coords[:, :, 0] = theta[:, None]
-        spherical_coords[:, :, 1] = phi[None]
-
-        x = np.sin(spherical_coords[:, :, 1]) * np.cos(spherical_coords[:, :, 0])
-        y = np.sin(spherical_coords[:, :, 1]) * np.sin(spherical_coords[:, :, 0])
-        z = np.cos(spherical_coords[:, :, 1])
-        v = np.stack((x, y, z), axis=-1)
+        x = sin_phi[None, :] * np.cos(theta[:, None])
+        y = sin_phi[None, :] * np.sin(theta[:, None])
+        z_grid = np.broadcast_to(z[None, :], (support_res, support_res))
+        v = np.stack((x, y, z_grid), axis=-1)
         return v
 
     def activate(self) -> None:
@@ -139,17 +142,21 @@ def _func_support_world(
 def _func_support_mesh(support_field_info: array_class.SupportFieldInfo, d_mesh, i_g):
     """
     support point at mesh frame coordinate.
+
+    The grid is cylindrical equal-area: uniform in (theta, z) where z = cos(phi). This
+    avoids the acos at query time and removes pole degeneracy of the equirect grid.
     """
     theta = qd.atan2(d_mesh[1], d_mesh[0])  # [-pi, pi]
-    phi = qd.acos(d_mesh[2])  # [0, pi]
+    z = d_mesh[2]  # [-1, 1] for unit directions
 
     support_res = support_field_info.support_res[None]
     dot_max = gs.qd_float(-1e20)
     v = qd.Vector([0.0, 0.0, 0.0], dt=gs.qd_float)
     vid = 0
 
+    # theta sampled at left edges (cyclic), z sampled at cell centres (offset by 0.5).
     ii = (theta + math.pi) / math.pi / 2 * support_res
-    jj = phi / math.pi * support_res
+    jj = (z + 1.0) * 0.5 * support_res - 0.5
 
     for i4 in range(4):
         i, j = gs.qd_int(0), gs.qd_int(0)
@@ -160,12 +167,8 @@ def _func_support_mesh(support_field_info: array_class.SupportFieldInfo, d_mesh,
 
         if i4 // 2 > 0:
             j = gs.qd_int(qd.math.clamp(qd.math.ceil(jj), 0, support_res - 1))
-            if j == support_res - 1:
-                j = support_res - 2
         else:
             j = gs.qd_int(qd.math.clamp(qd.math.floor(jj), 0, support_res - 1))
-            if j == 0:
-                j = 1
 
         support_idx = gs.qd_int(support_field_info.support_cell_start[i_g] + i * support_res + j)
         _vid = support_field_info.support_vid[support_idx]
@@ -333,20 +336,20 @@ def _func_count_supports_mesh(
     """
     Count the number of distinct support vertices tied for the maximum dot product in the given direction.
 
-    The support field is a spherical grid indexed by (theta, phi). We look up 4 neighboring cells using
-    floor/ceil of the continuous grid coordinates (ii, jj). When ii or jj is an integer (common for
-    axis-aligned directions), floor == ceil and multiple iterations map to the same cell. Without
-    deduplication the same vertex is counted multiple times, inflating the count and triggering
-    unnecessary perturbation in safe_gjk_support.
+    The support field is a spherical grid indexed by (theta, z) (cylindrical equal-area). We look up 4
+    neighboring cells using floor/ceil of the continuous grid coordinates (ii, jj). When ii or jj is an
+    integer (e.g. axis-aligned directions where theta lands exactly on a grid line), floor == ceil and
+    multiple iterations map to the same cell. Without deduplication the same vertex is counted multiple
+    times, inflating the count and triggering unnecessary perturbation in safe_gjk_support.
     """
     theta = qd.atan2(d_mesh[1], d_mesh[0])  # [-pi, pi]
-    phi = qd.acos(d_mesh[2])  # [0, pi]
+    z = d_mesh[2]  # [-1, 1] for unit directions
 
     support_res = support_field_info.support_res[None]
     dot_max = gs.qd_float(-1e20)
 
     ii = (theta + math.pi) / math.pi / 2 * support_res
-    jj = phi / math.pi * support_res
+    jj = (z + 1.0) * 0.5 * support_res - 0.5
 
     # Collect unique cells, deduplicating floor == ceil collisions
     cell_idx = qd.Vector([-1, -1, -1, -1], dt=gs.qd_int)
@@ -362,12 +365,8 @@ def _func_count_supports_mesh(
 
         if i4 // 2 > 0:
             j = gs.qd_int(qd.math.clamp(qd.math.ceil(jj), 0, support_res - 1))
-            if j == support_res - 1:
-                j = support_res - 2
         else:
             j = gs.qd_int(qd.math.clamp(qd.math.floor(jj), 0, support_res - 1))
-            if j == 0:
-                j = 1
 
         support_idx = gs.qd_int(support_field_info.support_cell_start[i_g] + i * support_res + j)
 
