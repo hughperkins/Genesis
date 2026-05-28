@@ -17,10 +17,8 @@ class SupportField:
         self.solver = rigid_solver
         # Cylindrical equal-area (Lambert) sampling on the unit sphere: uniform in
         # (theta, z = cos(phi)). Each cell covers a constant solid angle 4*pi / support_res**2.
-        # 120x120 = 14400 cells with mean arc ~1.69 deg, vs the old equirect 180x180 worst case
-        # of ~1.4 deg at the equator (cells are uniformly sized here, so there is no pole
-        # degeneracy).
-        self._support_res = 120
+        # Cells are uniformly sized, so there is no pole degeneracy.
+        self._support_res = 180
         self._support_field_info = array_class.get_support_field_info(0, 0, self._support_res)
         self._is_active = False
 
