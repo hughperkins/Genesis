@@ -2294,11 +2294,16 @@ def test_stickman(gs_sim, mj_sim, tol):
         gs_sim.scene.step()
         assert_allclose(gs_robot.get_dofs_velocity(), dofs_vel, tol=0.0)
 
-    # Run the simulation for a while
+    # Run the simulation for a while, then check that the humanoid has settled. It never comes fully to rest (it keeps
+    # having brief high-velocity contact events), so the check uses the *median* inf-norm DOF velocity over a long
+    # trailing window rather than a short one. A short window is placement-sensitive: a small trajectory perturbation
+    # (a different Cholesky path, GPU vs CPU, a different arch) shifts a high-velocity burst into/out of the window and
+    # flips the result, which made this test flaky. Over the last ~2000 of 4000 steps the median is stable at ~0.04 on
+    # both CPU and GPU, comfortably below the 0.1 threshold.
     qvel_norminf_all = []
-    for i in range(750):
+    for i in range(4000):
         gs_sim.scene.step()
-        if i > 700:
+        if i > 2000:
             (gs_robot,) = gs_sim.entities
             qvel = gs_robot.get_dofs_velocity()
             qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
