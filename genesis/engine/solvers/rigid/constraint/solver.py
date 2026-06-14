@@ -3382,10 +3382,35 @@ def func_save_prev_grad(
 
 
 @qd.func
+def _func_cg_block_reduce_add(sh_warp, tid: qd.i32, val, block_dim: qd.template()):
+    """Sum ``val`` across all ``block_dim`` lanes of the env's block, returning the total to every lane.
+
+    At ``block_dim == 32`` this is exactly ``reduce_all_add_tiled`` (single warp, no shared memory, numerically identical
+    to the legacy warp-tiled path). For wider blocks it warp-shuffles within each 32-lane warp, then combines across the
+    ``block_dim // 32`` warps via the per-block ``sh_warp`` SharedArray (length ``block_dim // 32``). The leading and
+    trailing block syncs make back-to-back calls safe."""
+    n_warps = qd.static(block_dim // 32)
+    warp_sum = qd.simt.subgroup.reduce_all_add_tiled(val, 5)
+    total = warp_sum
+    if qd.static(n_warps > 1):
+        w = tid // 32
+        lane = tid % 32
+        if lane == 0:
+            sh_warp[w] = warp_sum
+        qd.simt.block.sync()
+        total = gs.qd_float(0.0)
+        for i in qd.static(range(n_warps)):
+            total += sh_warp[i]
+        qd.simt.block.sync()
+    return total
+
+
+@qd.func
 def func_save_prev_grad_coop(
     tid: qd.i32,
     i_b,
     constraint_state: array_class.ConstraintState,
+    block_dim: qd.template(),
 ):
     """Warp-per-env cooperative ``func_save_prev_grad`` (approach B): lane-strided copy over dofs. Bit-identical."""
     n_dofs = constraint_state.qacc.shape[0]
@@ -3393,7 +3418,7 @@ def func_save_prev_grad_coop(
     while i_d < n_dofs:
         constraint_state.cg_prev_grad[i_d, i_b] = constraint_state.grad[i_d, i_b]
         constraint_state.cg_prev_Mgrad[i_d, i_b] = constraint_state.Mgrad[i_d, i_b]
-        i_d += 32
+        i_d += block_dim
 
 
 @qd.func
@@ -3738,11 +3763,12 @@ def func_update_gradient_batch_coop(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    block_dim: qd.template(),
 ):
     """Warp-per-env cooperative version of ``func_update_gradient_batch`` for the CG path (approach A in
     ``perso_hugh/doc/cg_solve_coop.md``).
 
-    The 32 lanes split the per-dof ``grad = Ma - force - qfrc`` write, then split the block-diagonal
+    The ``block_dim`` lanes split the per-dof ``grad = Ma - force - qfrc`` write, then split the block-diagonal
     ``Mgrad = M^-1 grad`` LDL solve *across entities* (each entity is an independent diagonal block, so lanes that own
     different entities never touch the same dofs). This is the key over a redundant solve: the per-entity LDL
     substitution is itself sequential, so the only parallelism available is over the independent entity blocks."""
@@ -3753,7 +3779,7 @@ def func_update_gradient_batch_coop(
         constraint_state.grad[i_d, i_b] = (
             constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b] - constraint_state.qfrc_constraint[i_d, i_b]
         )
-        i_d += 32
+        i_d += block_dim
 
     # All lanes must see every grad entry before the per-entity solves read their dof slices.
     qd.simt.block.sync()
@@ -3773,7 +3799,7 @@ def func_update_gradient_batch_coop(
                 static_rigid_sim_config,
                 False,
             )
-            i_0 += 32
+            i_0 += block_dim
     else:
         i_e = tid
         while i_e < entities_info.n_links.shape[0]:
@@ -3788,7 +3814,7 @@ def func_update_gradient_batch_coop(
                 static_rigid_sim_config,
                 False,
             )
-            i_e += 32
+            i_e += block_dim
 
 
 @qd.func
@@ -3945,13 +3971,15 @@ def func_terminate_or_update_descent_batch_coop(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
+    sh_warp,
+    block_dim: qd.template(),
 ):
     """Warp-per-env cooperative version of ``func_terminate_or_update_descent_batch`` (approach C).
 
-    The per-dof reductions (grad-norm, and the two CG-beta dot products) are split across the 32 lanes via
-    ``reduce_all_add_tiled``; the ``search`` update is lane-strided. ``improved`` is uniform across the warp (all lanes
-    reduce the same grad-norm), so the reductions and the conditional search update are reached by all lanes together.
-    Not bit-identical (the reductions reorder fp adds), but converges to the same CG fixed point."""
+    The per-dof reductions (grad-norm, and the two CG-beta dot products) are split across the ``block_dim`` lanes via
+    ``_func_cg_block_reduce_add``; the ``search`` update is lane-strided. ``improved`` is uniform across the block (all
+    lanes reduce the same grad-norm), so the reductions and the conditional search update are reached by all lanes
+    together. Not bit-identical (the reductions reorder fp adds), but converges to the same CG fixed point."""
     n_dofs = constraint_state.jac.shape[1]
 
     tol_scaled = (rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs)) * rigid_global_info.tolerance[None]
@@ -3961,8 +3989,8 @@ def func_terminate_or_update_descent_batch_coop(
     i_d = tid
     while i_d < n_dofs:
         gn_partial += constraint_state.grad[i_d, i_b] * constraint_state.grad[i_d, i_b]
-        i_d += 32
-    grad_norm = qd.sqrt(qd.simt.subgroup.reduce_all_add_tiled(gn_partial, 5))
+        i_d += block_dim
+    grad_norm = qd.sqrt(_func_cg_block_reduce_add(sh_warp, tid, gn_partial, block_dim))
 
     improved = grad_norm > tol_scaled and improvement > tol_scaled
     constraint_state.improved[i_b] = improved
@@ -3972,7 +4000,7 @@ def func_terminate_or_update_descent_batch_coop(
             i_d = tid
             while i_d < n_dofs:
                 constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
-                i_d += 32
+                i_d += block_dim
         else:
             beta_partial = gs.qd_float(0.0)
             pg_partial = gs.qd_float(0.0)
@@ -3982,9 +4010,9 @@ def func_terminate_or_update_descent_batch_coop(
                     constraint_state.Mgrad[i_d, i_b] - constraint_state.cg_prev_Mgrad[i_d, i_b]
                 )
                 pg_partial += constraint_state.cg_prev_Mgrad[i_d, i_b] * constraint_state.cg_prev_grad[i_d, i_b]
-                i_d += 32
-            cg_beta_num = qd.simt.subgroup.reduce_all_add_tiled(beta_partial, 5)
-            cg_pg_dot_pMg = qd.simt.subgroup.reduce_all_add_tiled(pg_partial, 5)
+                i_d += block_dim
+            cg_beta_num = _func_cg_block_reduce_add(sh_warp, tid, beta_partial, block_dim)
+            cg_pg_dot_pMg = _func_cg_block_reduce_add(sh_warp, tid, pg_partial, block_dim)
             cg_beta = qd.max(cg_beta_num / qd.max(rigid_global_info.EPS[None], cg_pg_dot_pMg), 0.0)
 
             constraint_state.cg_pg_dot_pMg[i_b] = cg_pg_dot_pMg
@@ -3995,7 +4023,7 @@ def func_terminate_or_update_descent_batch_coop(
                 constraint_state.search[i_d, i_b] = (
                     -constraint_state.Mgrad[i_d, i_b] + cg_beta * constraint_state.search[i_d, i_b]
                 )
-                i_d += 32
+                i_d += block_dim
 
 
 @qd.func

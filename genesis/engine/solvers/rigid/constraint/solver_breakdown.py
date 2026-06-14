@@ -513,7 +513,7 @@ def _func_cg_only_save_prev_grad(
             tid = i_flat % 32
             i_b = i_flat // 32
             if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-                solver.func_save_prev_grad_coop(tid, i_b, constraint_state=constraint_state)
+                solver.func_save_prev_grad_coop(tid, i_b, constraint_state=constraint_state, block_dim=qd.static(32))
     else:
         qd.loop_config(
             name="cg_only_save_prev_grag",
@@ -617,11 +617,14 @@ def _func_update_constraint_cost_body_coop(
     dofs_state: array_class.DofsState,
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
+    sh_warp,
+    block_dim: qd.template(),
 ):
     """Per-(lane, env) body of the warp-per-env cost reduction. Extracted (E34) so it can be called either as its own
-    kernel (``_func_update_constraint_cost_coop``) or fused as a phase of another warp-per-env kernel. Assumes a 32-lane
-    block (``reduce_all_add_tiled(_, 5)``). Caller guards on ``n_constraints>0 and improved``."""
-    _K = qd.static(32)
+    kernel (``_func_update_constraint_cost_coop``) or fused as a phase of another warp-per-env kernel. Reduces over the
+    block's ``block_dim`` lanes via ``solver._func_cg_block_reduce_add`` (``block_dim == 32`` is the legacy warp-tiled
+    path). Caller guards on ``n_constraints>0 and improved``."""
+    _K = qd.static(block_dim)
     n_dofs = constraint_state.qfrc_constraint.shape[0]
     ne = constraint_state.n_constraints_equality[i_b]
     nef = ne + constraint_state.n_constraints_frictionloss[i_b]
@@ -659,8 +662,8 @@ def _func_update_constraint_cost_body_coop(
             cost_i += linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
         i_c = i_c + _K
 
-    cost_i = qd.simt.subgroup.reduce_all_add_tiled(cost_i, 5)
-    gauss_i = qd.simt.subgroup.reduce_all_add_tiled(gauss_i, 5)
+    cost_i = solver._func_cg_block_reduce_add(sh_warp, tid, cost_i, block_dim)
+    gauss_i = solver._func_cg_block_reduce_add(sh_warp, tid, gauss_i, block_dim)
 
     if tid == 0:
         constraint_state.gauss[i_b] = gauss_i
@@ -684,8 +687,11 @@ def _func_update_constraint_cost_coop(
     for i_flat in range(_B * _K):
         tid = i_flat % _K
         i_b = i_flat // _K
+        sh_warp = qd.simt.block.SharedArray((1,), gs.qd_float)
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            _func_update_constraint_cost_body_coop(tid, i_b, dofs_state, constraint_state, static_rigid_sim_config)
+            _func_update_constraint_cost_body_coop(
+                tid, i_b, dofs_state, constraint_state, static_rigid_sim_config, sh_warp, qd.static(32)
+            )
 
 
 @qd.func
@@ -920,6 +926,7 @@ def _func_update_gradient(
                     rigid_global_info=rigid_global_info,
                     constraint_state=constraint_state,
                     static_rigid_sim_config=static_rigid_sim_config,
+                    block_dim=qd.static(32),
                 )
     else:
         qd.loop_config(
@@ -989,6 +996,7 @@ def _func_update_search_direction(
         for i_flat in range(_B * 32):
             tid = i_flat % 32
             i_b = i_flat // 32
+            sh_warp = qd.simt.block.SharedArray((1,), gs.qd_float)
             if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
                 solver.func_terminate_or_update_descent_batch_coop(
                     tid,
@@ -996,6 +1004,8 @@ def _func_update_search_direction(
                     rigid_global_info=rigid_global_info,
                     constraint_state=constraint_state,
                     static_rigid_sim_config=static_rigid_sim_config,
+                    sh_warp=sh_warp,
+                    block_dim=qd.static(32),
                 )
     else:
         qd.loop_config(
@@ -1060,16 +1070,20 @@ def _func_cg_cost_save_gradient_searchdir(
     """
     if qd.static(static_rigid_sim_config.enable_cooperative_constraint_kernels):
         _B = constraint_state.grad.shape[1]
-        qd.loop_config(name="cg_cost_save_gradient_searchdir", block_dim=32)
-        for i_flat in range(_B * 32):
-            tid = i_flat % 32
-            i_b = i_flat // 32
+        _BLOCK = qd.static(static_rigid_sim_config.cg_coop_block_dim)
+        qd.loop_config(name="cg_cost_save_gradient_searchdir", block_dim=_BLOCK)
+        for i_flat in range(_B * _BLOCK):
+            tid = i_flat % _BLOCK
+            i_b = i_flat // _BLOCK
+            # Per-block scratch for the cross-warp combine of the block-level reductions (cost/gauss in the cost phase,
+            # grad-norm + 2 CG-beta dots in the search-direction phase). Length = warps/block; unused at _BLOCK==32.
+            sh_warp = qd.simt.block.SharedArray((static_rigid_sim_config.cg_coop_block_dim // 32,), gs.qd_float)
             if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
                 _func_update_constraint_cost_body_coop(
-                    tid, i_b, dofs_state, constraint_state, static_rigid_sim_config
+                    tid, i_b, dofs_state, constraint_state, static_rigid_sim_config, sh_warp, _BLOCK
                 )
                 qd.simt.block.sync()
-                solver.func_save_prev_grad_coop(tid, i_b, constraint_state=constraint_state)
+                solver.func_save_prev_grad_coop(tid, i_b, constraint_state=constraint_state, block_dim=_BLOCK)
                 qd.simt.block.sync()
                 solver.func_update_gradient_batch_coop(
                     tid,
@@ -1079,6 +1093,7 @@ def _func_cg_cost_save_gradient_searchdir(
                     rigid_global_info=rigid_global_info,
                     constraint_state=constraint_state,
                     static_rigid_sim_config=static_rigid_sim_config,
+                    block_dim=_BLOCK,
                 )
                 qd.simt.block.sync()
                 solver.func_terminate_or_update_descent_batch_coop(
@@ -1087,6 +1102,8 @@ def _func_cg_cost_save_gradient_searchdir(
                     rigid_global_info=rigid_global_info,
                     constraint_state=constraint_state,
                     static_rigid_sim_config=static_rigid_sim_config,
+                    sh_warp=sh_warp,
+                    block_dim=_BLOCK,
                 )
     else:
         _func_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)

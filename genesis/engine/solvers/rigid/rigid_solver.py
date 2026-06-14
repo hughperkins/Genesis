@@ -504,6 +504,12 @@ class RigidSolver(KinematicSolver):
             # off-by-default flag.
             static_rigid_sim_config["n_entities"] = self._n_entities
 
+        # Experiment knob: lanes/env for the fused CG cost+save+gradient+search-direction kernel. Default 32 (legacy
+        # warp-tiled). Widening (64/128) hides memory latency in that latency-bound kernel. Must be a multiple of 32.
+        _cg_block = os.environ.get("GS_CG_BLOCK")
+        if _cg_block is not None:
+            static_rigid_sim_config["cg_coop_block_dim"] = int(_cg_block)
+
         # Experiment knob: at bs=1 (PARA_LEVEL.PARTIAL) parallelize the big embarrassingly-parallel constraint-build /
         # init loops (collision-jac assembly + Jaref + efc_force) over constraints instead of serializing them onto one
         # thread. Bit-identical to serial (disjoint per-constraint writes). 0 = off (default).

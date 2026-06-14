@@ -2200,6 +2200,14 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # then combine across the noslip_coop_block_dim // 32 warps. Baked into the kernel from this static struct (a plain
     # module constant would not be fastcache-pure).
     noslip_coop_block_dim: int = 128
+    # Lanes per env for the fused CG cost+save+gradient+search-direction kernel (`_func_cg_cost_save_gradient_searchdir`,
+    # the single biggest bs=1 kernel at ~16% of GPU time). That kernel is memory-latency-bound (dense per-iteration reads
+    # of grad/Mgrad/Jaref/jac/Ma over ~230 constraints + ~120 dofs), NOT compute-bound (the largest per-entity M^-1 LDL is
+    # only 18 dofs). At the legacy 32 lanes it runs as a single warp -> only one warp of outstanding loads -> poor latency
+    # hiding. Widening to 64/128 keeps more loads in flight on the (single, at bs=1) SM. Must be a multiple of 32 and a
+    # power of two; the per-iteration reductions warp-shuffle within each warp then combine across cg_coop_block_dim // 32
+    # warps via shared memory (`_func_cg_block_reduce_add`). 32 = legacy warp-tiled behavior. Overridable via GS_CG_BLOCK.
+    cg_coop_block_dim: int = 32
     # Experiment (E47): when nonzero, the cooperative no-slip sweep processes the independent connected components of the
     # constraint graph in parallel across BLOCKS (one block per independent component; each block runs the proven
     # block-cooperative projected Gauss-Seidel over its own contacts with the block-scope reduce_all_add residual, and
