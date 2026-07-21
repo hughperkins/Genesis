@@ -1,0 +1,69 @@
+name: Metal FEM fix verify (test_deformable_uv_textures)
+
+on:
+  push:
+    branches:
+      - hp/fem-pcg-lowcontention-reduce
+  workflow_dispatch:
+
+# Verify the low-contention PCG reduction fix clears the macOS Metal GPU hang.
+# Baseline (origin/main, before this fix) wedges test_deformable_uv_textures on the
+# macos-15 Paravirtual GPU (RhiResult=-1 / Compilation failed on a later kernel; see
+# doc/metal_genesis_ci_bug_exp.md). This runs the exact failing test on Metal, 3 reps.
+# Uses the pinned quadrants==1.1.3 (native f32 atomics) - the config the hang manifests in.
+
+jobs:
+  verify:
+    name: uv_textures-r${{ matrix.rep }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+    env:
+      HF_HUB_DOWNLOAD_TIMEOUT: "60"
+      GS_CACHE_FILE_PATH: ".cache/genesis"
+      GS_ENABLE_NDARRAY: "1"
+      GS_TORCH_FORCE_CPU_DEVICE: "1"
+      QD_OFFLINE_CACHE: "1"
+      QD_OFFLINE_CACHE_CLEANING_POLICY: "never"
+      QD_OFFLINE_CACHE_FILE_PATH: ".cache/quadrants"
+      QD_ENABLE_METAL: "1"
+      QD_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (editable)
+        run: |
+          python -m pip install --upgrade pip setuptools pkg-info wheel
+          pip3 install torch --upgrade --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,render,usd]"
+          pip install "matplotlib<3.11"
+          python -c "import quadrants as qd; print('quadrants', qd.__version__)"
+          python -c "import genesis, pathlib; p=pathlib.Path(genesis.__file__).parent/'engine/solvers/fem_solver.py'; print('FIX_PRESENT' if 'pcg_reduce' in p.read_text() else 'FIX_MISSING')"
+      - name: Run failing test on Metal (watchdog)
+        timeout-minutes: 60
+        shell: bash --noprofile --norc {0}
+        run: |
+          set +e
+          run_limit() {
+            local secs=$1; shift
+            "$@" & local pid=$!
+            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) & local wd=$!
+            wait "$pid" 2>/dev/null; local rc=$?
+            kill -9 "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+            return $rc
+          }
+          run_limit 2400 python -m pytest "tests/rendering/test_dynamic_meshes.py::test_deformable_uv_textures" \
+            --backend gpu -x -q -p no:cacheprovider > t.log 2>&1
+          rc=$?
+          verdict="UNKNOWN"
+          if [ "$rc" = "137" ]; then verdict="WEDGE(TIMEOUT/HANG)"
+          elif grep -qiE 'RhiResult=-1|Compilation failed|kIOGPUCommandBuffer|Caused GPU Hang' t.log; then verdict="WEDGE(gpu-error)"
+          elif [ "$rc" = "0" ] && grep -qE '1 passed|passed' t.log; then verdict="PASS"
+          else verdict="FAIL(rc=$rc)"; fi
+          echo "########## FEM_FIX_VERIFY rep=${{ matrix.rep }}: $verdict (rc=$rc) ##########"
+          echo "---- pytest tail ----"; tail -60 t.log
+          exit 0
