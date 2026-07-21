@@ -204,9 +204,12 @@ class FEMSolver(Solver):
         # Scratch for the PCG scalar reductions (pTAp, rTr_new, rTz_new). Reducing all
         # n_vertices per-vertex contributions into one scalar via atomic_add hangs the macOS
         # Metal Paravirtual GPU under high atomic contention (doc/metal_genesis_ci_bug_exp.md
-        # §27). Spreading the atomics across many slots keeps per-address contention low; a
-        # small serial combine then sums the slots into the scalar.
-        self._pcg_reduce_slots = min(2048, max(1, self.n_vertices))
+        # sec 27). Instead do a two-stage reduction: scatter into pcg_reduce slots, then
+        # combine slots into the scalar. ~sqrt(n_vertices) slots makes both stages see only
+        # ~sqrt(n_vertices)-way contention (far below the hang threshold) while keeping both
+        # stages fully parallel (a serial combine on a batch-sized grid bottlenecks a single
+        # GPU thread and is measurably slower - see cluster benchmark).
+        self._pcg_reduce_slots = min(1024, max(32, int(self.n_vertices**0.5) + 1)) if self.n_vertices > 0 else 1
         pcg_reduce = qd.types.struct(
             pTAp=gs.qd_float,
             rTr_new=gs.qd_float,
@@ -763,11 +766,16 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def init_pcg_solve(self):
+        S = self._pcg_reduce_slots
         for i_b in range(self._B):
             self.batch_pcg_active[i_b] = self.batch_active[i_b]
-        # Same low-contention slotted reduction as one_pcg_iter for the rTr / rTz funnels
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr = 0.0
+            self.pcg_state[i_b].rTz = 0.0
+        # Same two-stage low-contention reduction as one_pcg_iter for the rTr / rTz funnels
         # (reuses the rTr_new / rTz_new scratch slots; disjoint in time from one_pcg_iter).
-        for i_b, s in qd.ndrange(self._B, self._pcg_reduce_slots):
+        for i_b, s in qd.ndrange(self._B, S):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_reduce[i_b, s].rTr_new = 0.0
@@ -779,23 +787,18 @@ class FEMSolver(Solver):
             self.pcg_state_v[i_b, i_v].r = self.elements_v_energy[i_b, i_v].force
             self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
             self.pcg_state_v[i_b, i_v].p = self.pcg_state_v[i_b, i_v].z
-            slot = i_v % self._pcg_reduce_slots
+            slot = i_v % S
             qd.atomic_add(
                 self.pcg_reduce[i_b, slot].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r)
             )
             qd.atomic_add(
                 self.pcg_reduce[i_b, slot].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z)
             )
-        for i_b in range(self._B):
+        for i_b, s in qd.ndrange(self._B, S):
             if not self.batch_pcg_active[i_b]:
                 continue
-            rTr = 0.0
-            rTz = 0.0
-            for s in range(self._pcg_reduce_slots):
-                rTr += self.pcg_reduce[i_b, s].rTr_new
-                rTz += self.pcg_reduce[i_b, s].rTz_new
-            self.pcg_state[i_b].rTr = rTr
-            self.pcg_state[i_b].rTz = rTz
+            qd.atomic_add(self.pcg_state[i_b].rTr, self.pcg_reduce[i_b, s].rTr_new)
+            qd.atomic_add(self.pcg_state[i_b].rTz, self.pcg_reduce[i_b, s].rTz_new)
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -805,9 +808,11 @@ class FEMSolver(Solver):
     def one_pcg_iter(self):
         self.compute_Ap()
 
-        # compute pTAp via a low-contention slotted reduction (see init_element_fields):
-        # scatter per-vertex contributions across pcg_reduce slots, then sum the slots.
-        for i_b, s in qd.ndrange(self._B, self._pcg_reduce_slots):
+        S = self._pcg_reduce_slots
+
+        # compute pTAp via a two-stage low-contention reduction (see init_element_fields):
+        # scatter per-vertex contributions across S slots, then combine slots into the scalar.
+        for i_b, s in qd.ndrange(self._B, S):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_reduce[i_b, s].pTAp = 0.0
@@ -815,23 +820,26 @@ class FEMSolver(Solver):
             if not self.batch_pcg_active[i_b]:
                 continue
             qd.atomic_add(
-                self.pcg_reduce[i_b, i_v % self._pcg_reduce_slots].pTAp,
+                self.pcg_reduce[i_b, i_v % S].pTAp,
                 self.pcg_state_v[i_b, i_v].p.dot(self.pcg_state_v[i_b, i_v].Ap),
             )
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            pTAp = 0.0
-            for s in range(self._pcg_reduce_slots):
-                pTAp += self.pcg_reduce[i_b, s].pTAp
-            self.pcg_state[i_b].pTAp = pTAp
+            self.pcg_state[i_b].pTAp = 0.0
+        for i_b, s in qd.ndrange(self._B, S):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            qd.atomic_add(self.pcg_state[i_b].pTAp, self.pcg_reduce[i_b, s].pTAp)
 
-        # compute alpha, then reset the reduction slots for rTr_new / rTz_new
+        # compute alpha, reset rTr_new / rTz_new scalars and slots
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
-        for i_b, s in qd.ndrange(self._B, self._pcg_reduce_slots):
+            self.pcg_state[i_b].rTr_new = 0.0
+            self.pcg_state[i_b].rTz_new = 0.0
+        for i_b, s in qd.ndrange(self._B, S):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_reduce[i_b, s].rTr_new = 0.0
@@ -844,25 +852,19 @@ class FEMSolver(Solver):
             self.pcg_state_v[i_b, i_v].x += self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].p
             self.pcg_state_v[i_b, i_v].r -= self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].Ap
             self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
-            slot = i_v % self._pcg_reduce_slots
+            slot = i_v % S
             qd.atomic_add(
                 self.pcg_reduce[i_b, slot].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r)
             )
             qd.atomic_add(
                 self.pcg_reduce[i_b, slot].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z)
             )
-
         # combine rTr_new / rTz_new slots into the scalars
-        for i_b in range(self._B):
+        for i_b, s in qd.ndrange(self._B, S):
             if not self.batch_pcg_active[i_b]:
                 continue
-            rTr_new = 0.0
-            rTz_new = 0.0
-            for s in range(self._pcg_reduce_slots):
-                rTr_new += self.pcg_reduce[i_b, s].rTr_new
-                rTz_new += self.pcg_reduce[i_b, s].rTz_new
-            self.pcg_state[i_b].rTr_new = rTr_new
-            self.pcg_state[i_b].rTz_new = rTz_new
+            qd.atomic_add(self.pcg_state[i_b].rTr_new, self.pcg_reduce[i_b, s].rTr_new)
+            qd.atomic_add(self.pcg_state[i_b].rTz_new, self.pcg_reduce[i_b, s].rTz_new)
 
         # check convergence
         for i_b in range(self._B):
