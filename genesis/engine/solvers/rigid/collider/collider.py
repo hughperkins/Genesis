@@ -128,6 +128,13 @@ class Collider:
             except ValueError:
                 self._contact_data = None
 
+        # A partial reset only invalidates the contact warm-start cache, which is consumed once per step by
+        # detection(). Rather than re-scanning the full (max_pairs, B, 3) buffer once per state setter, the setters
+        # accumulate the envs to invalidate here and a single masked_fill is issued at the next detection(). See
+        # '_defer_warmstart_reset' / '_flush_warmstart_reset'.
+        self._pending_warmstart_reset = False
+        self._pending_warmstart_mask: torch.Tensor | None = None
+
         # Make sure that the initial state is clean
         self.clear()
 
@@ -749,6 +756,19 @@ class Collider:
         self._contact_data_cache.clear()
         if gs.use_zerocopy and self._contact_data is not None:
             envs_idx = slice(None) if envs_idx is None else envs_idx
+
+            # Hot path: a partial reset (the collider.reset issued by every per-env state setter) only invalidates
+            # the contact warm-start, which detection() consumes once per step. Defer the (max_pairs, B, 3)
+            # masked_fill so several setters for one env reset collapse into a single flush there, instead of
+            # re-scanning the full candidate-pair buffer per setter. Skipped when the buffers must be cleared now
+            # (cache_only=False, e.g. clear()) or gradients are tracked (checkpointing reads the cache directly).
+            if cache_only and not self._solver._requires_grad:
+                self._defer_warmstart_reset(envs_idx)
+                return
+
+            # Eager path: apply any deferred reset first so its envs are not lost.
+            self._flush_warmstart_reset()
+
             if not cache_only:
                 first_time = qd_to_torch(self._collider_state.first_time, copy=False)
                 if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
@@ -840,6 +860,38 @@ class Collider:
             fn = kernel_collider_clear
         fn(envs_idx, self._solver.dyn_state, self._collider_state, self._solver.dyn_info, self._solver.rigid_config)
 
+    def _defer_warmstart_reset(self, envs_idx) -> None:
+        # Accumulate the envs whose contact warm-start must be zeroed before the next detection(). Only touches the
+        # 1-D (B,) pending mask (no sync, no scan of the full candidate-pair buffer), so it stays cheap even when
+        # several setters invalidate the same envs within one step.
+        mask = self._pending_warmstart_mask
+        if mask is None:
+            mask = torch.zeros(self._solver._B, dtype=torch.bool, device=gs.device)
+            self._pending_warmstart_mask = mask
+        if isinstance(envs_idx, slice):
+            mask.fill_(True)
+        elif isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            mask |= envs_idx
+        else:
+            mask[envs_idx] = True
+        self._pending_warmstart_reset = True
+
+    def _flush_warmstart_reset(self) -> None:
+        # Zero the contact warm-start for every env deferred since the last flush, in a single masked_fill. Called
+        # at the start of detection() (the sole consumer of the warm-start), so the deferred layout is observably
+        # identical to clearing eagerly in each setter.
+        if not self._pending_warmstart_reset:
+            return
+        mask = self._pending_warmstart_mask
+        normal = qd_to_torch(self._collider_state.contact_cache.normal, copy=False)
+        penetration = qd_to_torch(self._collider_state.contact_cache.penetration, copy=False)
+        normal.masked_fill_(mask[None, :, None], 0.0)
+        penetration.masked_fill_(mask[None, :], 0.0)
+        if gs.backend == gs.metal:
+            torch.mps.synchronize()
+        mask.fill_(False)
+        self._pending_warmstart_reset = False
+
     def _call_multicontact(self):
         narrowphase._func_narrowphase_multicontact(
             self._solver.geoms_init_AABB,
@@ -859,6 +911,9 @@ class Collider:
         )
 
     def detection(self) -> None:
+        # Apply any warm-start invalidation deferred by state setters before broad/narrow phase read the cache.
+        self._flush_warmstart_reset()
+
         rigid_solver.kernel_update_geom_aabbs(
             self._solver.geoms_init_AABB, self._solver.dyn_state, self._solver.rigid_config
         )
