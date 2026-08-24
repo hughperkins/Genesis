@@ -615,6 +615,9 @@ class ConstraintState:
     prev_active: qd.Tensor
     qfrc_constraint: qd.Tensor
     qacc: qd.Tensor
+    # Per-lane M^-1 scratch for the cooperative noslip sweep, shape (n_dofs, NOSLIP_COOP_T, _B). Empty tensor unless
+    # enable_coop_noslip. Lets concurrent lanes each compute their row's M^-1 J^T without clobbering a shared buffer.
+    noslip_minv: qd.Tensor
     qacc_ws: qd.Tensor
     qacc_prev: qd.Tensor
     cost_ws: qd.Tensor
@@ -855,6 +858,12 @@ def get_constraint_state(constraint_solver, solver, collider):
         nt_H_cone_free_diag=V(
             dtype=gs.qd_float,
             shape=maybe_shape((_B, solver.n_dofs_), solver.rigid_config.enable_cone_free_hessian_reuse),
+        ),
+        # Per-lane scratch for kernel_noslip_coop. The 32 must match noslip.NOSLIP_COOP_T. Empty unless the cooperative
+        # noslip path is enabled, so the scalar / non-GPU paths pay nothing.
+        noslip_minv=V(
+            dtype=gs.qd_float,
+            shape=maybe_shape((solver.n_dofs_, 32, _B), solver.rigid_config.enable_coop_noslip),
         ),
         # Allocated last to preserve the allocation order of the tensors above (see the warning at the top).
         island=get_island_state(solver, collider),
@@ -2635,6 +2644,11 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # tensor layouts they expect, eg (_B, len_constraints_) for Jaref / efc_D / ... which unlocks coalesced cross-lane
     # reads.
     enable_cooperative_constraint_kernels: bool = False
+    # Cooperative (warp-per-env) matrix-free noslip: replaces the scalar one-thread-per-env friction sweep with a
+    # block-per-env Jacobi sweep (kernel_noslip_coop), so a single env's sweep uses a whole warp instead of one lane.
+    # Non-bit-identical (Jacobi reorders the Gauss-Seidel updates). GPU-only; requires the whole-env sweep (per-island
+    # solve off) and allocates the per-lane ConstraintState.noslip_minv scratch.
+    enable_coop_noslip: bool = False
     # Purely descriptive layout flag: True whenever the layout-flippable constraint-state tensors are physically
     # batch-first, i.e. enable_cooperative_constraint_kernels or serialized execution (env loop outermost, so per-env
     # rows must be contiguous). Consumers that only need iteration order to follow the physical layout (ndrange axes,
