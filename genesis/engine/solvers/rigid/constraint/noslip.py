@@ -593,35 +593,32 @@ def func_dot_row_lane(
 def func_coop_zero_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState):
     i_d = tid
     while i_d < n_dofs:
-        constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
+        constraint_state.noslip_qfrc[i_d, i_b] = gs.qd_float(0.0)
         i_d += T
 
 
 @qd.func
 def func_coop_accum_qfrc(tid, T, i_b, n_rows, constraint_state: array_class.ConstraintState):
-    """qfrc_constraint += J^T f. Done on a single lane with a plain (layout-aware) subscript accumulate: the scatter
-    target qfrc_constraint is batch-first (dof_vec_layout) under the cooperative path, and an atomic on that
-    layout-remapped element does not scatter correctly, so we accumulate serially here (race-free) and keep the
-    expensive M^-1 blocks / sweep cooperative."""
-    if tid == 0:
-        for i_c in range(n_rows):
-            force = constraint_state.efc_force[i_c, i_b]
-            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-                constraint_state.qfrc_constraint[i_d, i_b] = (
-                    constraint_state.qfrc_constraint[i_d, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
-                )
+    """noslip_qfrc += J^T f, cooperatively over rows. The scatter target is the DEFAULT-layout noslip_qfrc (not the
+    batch-first qfrc_constraint), so the per-dof atomic_add scatters to the right element."""
+    i_c = tid
+    while i_c < n_rows:
+        force = constraint_state.efc_force[i_c, i_b]
+        for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+            i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+            qd.atomic_add(constraint_state.noslip_qfrc[i_d, i_b], constraint_state.jac[i_c, i_d, i_b] * force)
+        i_c += T
 
 
 @qd.func
 def func_coop_solve_qacc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
-    """qacc = M^-1 qfrc_constraint, cooperatively over mass blocks (each block owned by its first dof's lane)."""
+    """qacc = M^-1 noslip_qfrc, cooperatively over mass blocks (each block owned by its first dof's lane)."""
     i_d = tid
     while i_d < n_dofs:
         if i_d == rigid_info.dofs_mass_block_start[i_d]:
-            constraint_state.qacc[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
+            constraint_state.qacc[i_d, i_b] = constraint_state.noslip_qfrc[i_d, i_b]
             for j_d in range(i_d + 1, rigid_info.dofs_mass_block_end[i_d]):
-                constraint_state.qacc[j_d, i_b] = constraint_state.qfrc_constraint[j_d, i_b]
+                constraint_state.qacc[j_d, i_b] = constraint_state.noslip_qfrc[j_d, i_b]
             func_solve_mass_block(i_d, i_b, constraint_state.qacc, rigid_info)
         i_d += T
 
@@ -638,12 +635,14 @@ def func_coop_add_smooth(tid, T, i_b, n_dofs, constraint_state: array_class.Cons
 def func_coop_finish_copy(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState, dyn_state: array_class.DynState):
     i_d = tid
     while i_d < n_dofs:
+        qfrc = constraint_state.noslip_qfrc[i_d, i_b]
         constraint_state.qacc[i_d, i_b] = constraint_state.qacc[i_d, i_b] + dyn_state.dofs.acc_smooth[i_d, i_b]
         dyn_state.dofs.acc[i_d, i_b] = constraint_state.qacc[i_d, i_b]
-        dyn_state.dofs.qf_constraint[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
-        dyn_state.dofs.force[i_d, i_b] = (
-            dyn_state.dofs.qf_smooth[i_d, i_b] + constraint_state.qfrc_constraint[i_d, i_b]
-        )
+        dyn_state.dofs.qf_constraint[i_d, i_b] = qfrc
+        dyn_state.dofs.force[i_d, i_b] = dyn_state.dofs.qf_smooth[i_d, i_b] + qfrc
+        # Mirror into the canonical qfrc_constraint (batch-first) for any post-noslip consumer (subscript write is
+        # layout-aware; disjoint dofs per lane, so no atomics needed here).
+        constraint_state.qfrc_constraint[i_d, i_b] = qfrc
         i_d += T
 
 
