@@ -20,6 +20,16 @@ NOSLIP_COOP_T = 32
 NOSLIP_COOP_OMEGA = float(os.environ.get("GS_NOSLIP_COOP_OMEGA", "0.1"))
 NOSLIP_COOP_ITERS = int(os.environ.get("GS_NOSLIP_COOP_ITERS", "0"))
 
+# Colored Gauss-Seidel noslip (kernel_noslip_color). The rows are graph-colored so same-color rows touch disjoint mass
+# blocks and update in parallel, while colors are swept in order -- this is true Gauss-Seidel (not Jacobi), so it is
+# stable at omega=1 (no damping) unlike the coop Jacobi sweep above. NOSLIP_COLOR_OMEGA defaults to 1.0; keep it 1.0
+# unless deliberately probing damping. NOSLIP_COLOR_MAXC caps the greedy coloring's color count (== the first axis of
+# ConstraintState.color_block_used); a scene needing more colors than this overflows (guarded: overflowing rows keep
+# color -1 and n_colors is set to -1 as a host-checkable sentinel). Same cache caveat as the coop knobs: these bake in
+# as qd.static, so vary them only with a dedicated QD_OFFLINE_CACHE_FILE_PATH.
+NOSLIP_COLOR_OMEGA = float(os.environ.get("GS_NOSLIP_COLOR_OMEGA", "1.0"))
+NOSLIP_COLOR_MAXC = int(os.environ.get("GS_NOSLIP_COLOR_MAXC", "64"))
+
 
 @qd.func
 def func_solve_mass_block(i_d0, i_b, vec: qd.Tensor, rigid_info: array_class.RigidInfo):
@@ -651,8 +661,11 @@ def func_coop_finish_copy(tid, T, i_b, n_dofs, constraint_state: array_class.Con
 
 
 @qd.func
-def func_noslip_update_frictionloss_lane(i_c, i_b, i_lane, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
-    """Jacobi 1x1 dry-friction update: A_diag = J M^-1 J^T, res = J qacc - aref, project into [-fl, fl]."""
+def func_noslip_update_frictionloss_lane(i_c, i_b, i_lane, omega, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
+    """1x1 dry-friction update: A_diag = J M^-1 J^T, res = J qacc - aref, project into [-fl, fl].
+
+    omega under-relaxes the projected step (omega=1 is the plain Gauss-Seidel step used by the colored sweep; the coop
+    Jacobi sweep passes omega<1 for stability)."""
     func_apply_Minv_rows_lane(
         i_c, i_c, i_b, i_lane, constraint_state.jac_dofs_idx, 1.0, 0.0,
         constraint_state.noslip_minv, constraint_state.jac, constraint_state.jac_n_dofs, rigid_info,
@@ -672,14 +685,16 @@ def func_noslip_update_frictionloss_lane(i_c, i_b, i_lane, constraint_state: arr
         f = -fl
     elif f > fl:
         f = fl
-    # Under-relaxed Jacobi update. The projected target f stays in [-fl, fl] and old is in [-fl, fl], so the convex
-    # blend does too (omega in [0, 1]).
-    constraint_state.efc_force[i_c, i_b] = old + qd.static(NOSLIP_COOP_OMEGA) * (f - old)
+    # Under-relaxed update. The projected target f stays in [-fl, fl] and old is in [-fl, fl], so the convex blend
+    # does too (omega in [0, 1]); omega=1 recovers the exact projected step.
+    constraint_state.efc_force[i_c, i_b] = old + omega * (f - old)
 
 
 @qd.func
-def func_noslip_update_collision_pair_lane(j_efc, i_b, i_lane, EPS, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
-    """Jacobi 2x2 pyramid-pair update: symmetric block A recomputed matrix-free, forces projected onto the pyramid."""
+def func_noslip_update_collision_pair_lane(j_efc, i_b, i_lane, EPS, omega, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
+    """2x2 pyramid-pair update: symmetric block A recomputed matrix-free, forces projected onto the pyramid.
+
+    omega under-relaxes the projected pair (omega=1 = plain Gauss-Seidel step for the colored sweep; coop Jacobi < 1)."""
     Ac = qd.Vector.zero(gs.qd_float, 4)
     res = qd.Vector.zero(gs.qd_float, 2)
     old_force = qd.Vector.zero(gs.qd_float, 2)
@@ -728,10 +743,10 @@ def func_noslip_update_collision_pair_lane(j_efc, i_b, i_lane, EPS, constraint_s
             constraint_state.efc_force[j_efc, i_b] = mid + y
             constraint_state.efc_force[j_efc + 1, i_b] = mid - y
     # Under-relax the projected pair toward the pre-update forces (both endpoints lie in the pyramid, which is convex,
-    # so the blend stays feasible) before the cost-change safeguard evaluates the (now damped) step.
-    om = qd.static(NOSLIP_COOP_OMEGA)
-    constraint_state.efc_force[j_efc, i_b] = old_force[0] + om * (constraint_state.efc_force[j_efc, i_b] - old_force[0])
-    constraint_state.efc_force[j_efc + 1, i_b] = old_force[1] + om * (constraint_state.efc_force[j_efc + 1, i_b] - old_force[1])
+    # so the blend stays feasible) before the cost-change safeguard evaluates the (now damped) step. omega=1 is a no-op
+    # blend (the exact projected step) for the colored Gauss-Seidel sweep.
+    constraint_state.efc_force[j_efc, i_b] = old_force[0] + omega * (constraint_state.efc_force[j_efc, i_b] - old_force[0])
+    constraint_state.efc_force[j_efc + 1, i_b] = old_force[1] + omega * (constraint_state.efc_force[j_efc + 1, i_b] - old_force[1])
     # Reject a step that raised the cost (mirrors the scalar sweep's safeguard).
     func_cost_change(i_b, j_efc, Ac, old_force, res, EPS, constraint_state.efc_force, 2)
 
@@ -786,11 +801,175 @@ def kernel_noslip_coop(
                 i_c = tid
                 while i_c < n_rows:
                     if i_c >= ne and i_c < ne + nf:
-                        func_noslip_update_frictionloss_lane(i_c, i_b, tid, constraint_state, rigid_info)
+                        func_noslip_update_frictionloss_lane(i_c, i_b, tid, qd.static(NOSLIP_COOP_OMEGA), constraint_state, rigid_info)
                     elif i_c >= const_start and i_c < const_end and (i_c - const_start) % 2 == 0:
-                        func_noslip_update_collision_pair_lane(i_c, i_b, tid, EPS, constraint_state, rigid_info)
+                        func_noslip_update_collision_pair_lane(i_c, i_b, tid, EPS, qd.static(NOSLIP_COOP_OMEGA), constraint_state, rigid_info)
                     i_c += _T
                 qd.simt.block.sync()
+
+            # --- dual finish: refresh qacc / qfrc from the final forces, then map to dof state ---
+            func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
+            qd.simt.block.sync()
+            func_coop_accum_qfrc(tid, _T, i_b, n_rows, constraint_state)
+            qd.simt.block.sync()
+            func_coop_solve_qacc(tid, _T, i_b, n_dofs, constraint_state, rigid_info)
+            qd.simt.block.sync()
+            func_coop_finish_copy(tid, _T, i_b, n_dofs, constraint_state, dyn_state)
+
+
+# ======================================================================================================================
+# Colored Gauss-Seidel (warp-per-env) matrix-free noslip.
+#
+# Same warp-per-env layout as the coop Jacobi kernel above, but instead of updating every row from one frozen qacc, the
+# rows are graph-colored so that same-color rows touch disjoint mass blocks. Each iteration sweeps the colors in order:
+# refresh qacc from the current forces, then update all rows of the current color in parallel (disjoint dofs => the
+# parallel update equals the sequential one), then move to the next color. Sweeping colors in order makes the pass true
+# Gauss-Seidel (each color sees earlier colors' updated forces), which is stable at omega=1 -- no under-relaxation, so
+# it tracks the scalar sweep far more tightly than the damped Jacobi variant. Still non-bit-identical (the rows are
+# visited in color order, not index order). The coloring is recomputed every step on lane 0 (cheap relative to the
+# sweep; a later pass can parallelize it or reuse it across steps when the contact set is unchanged).
+# ======================================================================================================================
+
+
+@qd.func
+def func_color_clear(tid, T, i_b, n_dofs, n_rows, constraint_state: array_class.ConstraintState):
+    """Reset the greedy-coloring workspace: color_block_used[*, *, i_b] = 0 and row_color[*, i_b] = -1. Lane-strided."""
+    MAXC = qd.static(NOSLIP_COLOR_MAXC)
+    total = MAXC * n_dofs
+    i = tid
+    while i < total:
+        c = i // n_dofs
+        i_d = i % n_dofs
+        constraint_state.color_block_used[c, i_d, i_b] = gs.qd_int(0)
+        i += T
+    i_c = tid
+    while i_c < n_rows:
+        constraint_state.row_color[i_c, i_b] = gs.qd_int(-1)
+        i_c += T
+
+
+@qd.func
+def func_color_assign(
+    i_b, ne, nf, const_start, const_end, n_rows,
+    constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo,
+):
+    """Greedy graph-coloring of this env's noslip rows on a single lane (caller guards tid == 0).
+
+    Coloring atoms are the dry-friction rows (1x1) and the collision pyramid bases j_efc (2x2, sharing dof support with
+    j_efc + 1, so the base's support represents both). Two atoms conflict iff they touch a common mass block (first dof
+    = dofs_mass_block_start). Rows are walked in index order; each atom takes the lowest color whose touched mass blocks
+    are all free, then claims them. Equality / joint-limit rows keep color -1 (the sweep skips them, matching the scalar
+    kernel, which only updates friction + collision rows). On overflow (> NOSLIP_COLOR_MAXC colors) n_colors is set to
+    -1 as a host-checkable sentinel."""
+    MAXC = qd.static(NOSLIP_COLOR_MAXC)
+    max_color = gs.qd_int(-1)
+    overflow = False
+    for i_c in range(n_rows):
+        is_friction = i_c >= ne and i_c < ne + nf
+        is_pair_base = i_c >= const_start and i_c < const_end and (i_c - const_start) % 2 == 0
+        if is_friction or is_pair_base:
+            chosen = gs.qd_int(-1)
+            for c in range(MAXC):
+                if chosen < 0:
+                    ok = True
+                    for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                        i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                        blk = rigid_info.dofs_mass_block_start[i_d]
+                        if constraint_state.color_block_used[c, blk, i_b] == 1:
+                            ok = False
+                    if ok:
+                        chosen = c
+            if chosen < 0:
+                overflow = True
+                chosen = MAXC - 1  # clamp so the marking below stays in bounds; the sentinel flags the failure
+            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                blk = rigid_info.dofs_mass_block_start[i_d]
+                constraint_state.color_block_used[chosen, blk, i_b] = gs.qd_int(1)
+            constraint_state.row_color[i_c, i_b] = chosen
+            if is_pair_base:
+                constraint_state.row_color[i_c + 1, i_b] = chosen
+            if chosen > max_color:
+                max_color = chosen
+    if overflow:
+        constraint_state.n_colors[i_b] = gs.qd_int(-1)
+    else:
+        constraint_state.n_colors[i_b] = max_color + 1
+
+
+@qd.kernel(fastcache=True)
+def kernel_noslip_color(
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Colored Gauss-Seidel matrix-free noslip. One block of NOSLIP_COOP_T lanes per env.
+
+    Whole-env sweep only (per-island solve must be off). Lane 0 greedily colors the rows by disjoint mass-block support;
+    then each iteration sweeps the colors in order, refreshing qacc = acc_smooth + M^-1 J^T f before each color and
+    updating that color's rows in parallel (omega = NOSLIP_COLOR_OMEGA, default 1.0). Gauss-Seidel across colors, so no
+    damping is needed for stability. Non-bit-identical vs the scalar kernel_noslip (row reorder).
+
+    This is the full-refresh-between-colors form: it recomputes qacc once per color (simple, reuses the coop helpers).
+    The per-color refresh dominates the cost and is the target of a later incremental-propagation optimization.
+    """
+    _B = constraint_state.jac.shape[2]
+    _T = qd.static(32)  # == NOSLIP_COOP_T
+
+    qd.loop_config(name="noslip_color", block_dim=_T)
+    for i_flat in range(_B * _T):
+        tid = i_flat % _T
+        i_b = i_flat // _T
+
+        n_dofs = constraint_state.qfrc_constraint.shape[0]
+        n_rows = constraint_state.n_constraints[i_b]
+        ne = constraint_state.n_constraints_equality[i_b]
+        nf = constraint_state.n_constraints_frictionloss[i_b]
+        const_start = ne + nf
+        const_end = const_start + qd.static(rigid_config.rows_per_contact) * collider_state.n_contacts[i_b]
+        EPS = rigid_info.EPS[None]
+
+        n_coop_iters = rigid_info.noslip_iterations[None]
+        if qd.static(NOSLIP_COOP_ITERS > 0):
+            n_coop_iters = qd.static(NOSLIP_COOP_ITERS)
+
+        if n_rows > 0:
+            # --- color the rows: lane-strided clear, then greedy assignment on lane 0 ---
+            func_color_clear(tid, _T, i_b, n_dofs, n_rows, constraint_state)
+            qd.simt.block.sync()
+            if tid == 0:
+                func_color_assign(i_b, ne, nf, const_start, const_end, n_rows, constraint_state, rigid_info)
+            qd.simt.block.sync()
+            n_colors = constraint_state.n_colors[i_b]
+
+            for i_iter in range(n_coop_iters):
+                for c in range(n_colors):
+                    # refresh qacc from ALL current forces so color c sees earlier colors' updates this sweep
+                    func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
+                    qd.simt.block.sync()
+                    func_coop_accum_qfrc(tid, _T, i_b, n_rows, constraint_state)
+                    qd.simt.block.sync()
+                    func_coop_solve_qacc(tid, _T, i_b, n_dofs, constraint_state, rigid_info)
+                    qd.simt.block.sync()
+                    func_coop_add_smooth(tid, _T, i_b, n_dofs, constraint_state, dyn_state)
+                    qd.simt.block.sync()
+
+                    # update only color c's rows (disjoint dofs => race-free), omega=1 by default
+                    i_c = tid
+                    while i_c < n_rows:
+                        if constraint_state.row_color[i_c, i_b] == c:
+                            if i_c >= ne and i_c < ne + nf:
+                                func_noslip_update_frictionloss_lane(
+                                    i_c, i_b, tid, qd.static(NOSLIP_COLOR_OMEGA), constraint_state, rigid_info
+                                )
+                            elif i_c >= const_start and i_c < const_end and (i_c - const_start) % 2 == 0:
+                                func_noslip_update_collision_pair_lane(
+                                    i_c, i_b, tid, EPS, qd.static(NOSLIP_COLOR_OMEGA), constraint_state, rigid_info
+                                )
+                        i_c += _T
+                    qd.simt.block.sync()
 
             # --- dual finish: refresh qacc / qfrc from the final forces, then map to dof state ---
             func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
