@@ -591,34 +591,25 @@ def func_dot_row_lane(
 
 @qd.func
 def func_coop_accum_partials(tid, T, i_b, n_dofs, n_rows, constraint_state: array_class.ConstraintState):
-    """Each lane accumulates its rows' J^T f into its OWN private column of noslip_minv (no cross-lane contention, no
-    atomics -- qd.atomic_add mis-behaves on this backend/dtype). noslip_minv is the per-lane M^-1 scratch, which is
-    free here (the sweep overwrites it only after this refresh). A subsequent reduce sums the columns into noslip_qfrc.
-    """
-    # Zero this lane's private column over all dofs (the row scatter below only touches a subset).
-    for i_d in range(n_dofs):
-        constraint_state.noslip_minv[i_d, tid, i_b] = gs.qd_float(0.0)
-    i_c = tid
-    while i_c < n_rows:
-        force = constraint_state.efc_force[i_c, i_b]
-        for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-            i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-            constraint_state.noslip_minv[i_d, tid, i_b] = (
-                constraint_state.noslip_minv[i_d, tid, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
-            )
-        i_c += T
+    """DIAGNOSTIC: single-lane accumulate directly into noslip_qfrc (isolates the noslip_qfrc buffer/finish plumbing
+    from multi-lane concurrency)."""
+    if tid == 0:
+        for i_d in range(n_dofs):
+            constraint_state.noslip_qfrc[i_d, i_b] = gs.qd_float(0.0)
+        for i_c in range(n_rows):
+            force = constraint_state.efc_force[i_c, i_b]
+            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                constraint_state.noslip_qfrc[i_d, i_b] = (
+                    constraint_state.noslip_qfrc[i_d, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
+                )
 
 
 @qd.func
 def func_coop_reduce_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState):
-    """Sum the per-lane partial columns of noslip_minv into noslip_qfrc[:, i_b] (cooperative over dofs)."""
-    i_d = tid
-    while i_d < n_dofs:
-        s = gs.qd_float(0.0)
-        for lane in range(T):
-            s += constraint_state.noslip_minv[i_d, lane, i_b]
-        constraint_state.noslip_qfrc[i_d, i_b] = s
-        i_d += T
+    """DIAGNOSTIC no-op (accum already wrote noslip_qfrc directly)."""
+    if tid < 0:
+        constraint_state.noslip_qfrc[0, i_b] = gs.qd_float(0.0)
 
 
 @qd.func
