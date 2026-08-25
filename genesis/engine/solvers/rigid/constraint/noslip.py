@@ -599,14 +599,18 @@ def func_coop_zero_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.Const
 
 @qd.func
 def func_coop_accum_qfrc(tid, T, i_b, n_rows, constraint_state: array_class.ConstraintState):
-    """qfrc_constraint += J^T f, cooperatively over rows (atomic into shared per-dof accumulators)."""
-    i_c = tid
-    while i_c < n_rows:
-        force = constraint_state.efc_force[i_c, i_b]
-        for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-            i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-            qd.atomic_add(constraint_state.qfrc_constraint[i_d, i_b], constraint_state.jac[i_c, i_d, i_b] * force)
-        i_c += T
+    """qfrc_constraint += J^T f. Done on a single lane with a plain (layout-aware) subscript accumulate: the scatter
+    target qfrc_constraint is batch-first (dof_vec_layout) under the cooperative path, and an atomic on that
+    layout-remapped element does not scatter correctly, so we accumulate serially here (race-free) and keep the
+    expensive M^-1 blocks / sweep cooperative."""
+    if tid == 0:
+        for i_c in range(n_rows):
+            force = constraint_state.efc_force[i_c, i_b]
+            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                constraint_state.qfrc_constraint[i_d, i_b] = (
+                    constraint_state.qfrc_constraint[i_d, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
+                )
 
 
 @qd.func
