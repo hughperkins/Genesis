@@ -591,36 +591,44 @@ def func_dot_row_lane(
 
 @qd.func
 def func_coop_accum_partials(tid, T, i_b, n_dofs, n_rows, constraint_state: array_class.ConstraintState):
-    """DIAGNOSTIC: single-lane accumulate directly into noslip_qfrc (isolates the noslip_qfrc buffer/finish plumbing
-    from multi-lane concurrency)."""
-    if tid == 0:
-        for i_d in range(n_dofs):
-            constraint_state.noslip_qfrc[i_d, i_b] = gs.qd_float(0.0)
-        for i_c in range(n_rows):
-            force = constraint_state.efc_force[i_c, i_b]
-            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-                constraint_state.noslip_qfrc[i_d, i_b] = (
-                    constraint_state.noslip_qfrc[i_d, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
-                )
+    """Each lane accumulates its rows' J^T f into its OWN private column of noslip_minv (no cross-lane contention, no
+    atomics -- qd.atomic_add mis-behaves on this backend/dtype). noslip_minv is the per-lane M^-1 scratch, free here
+    (the sweep overwrites it only after this refresh). A subsequent reduce sums the columns into qfrc_constraint."""
+    for i_d in range(n_dofs):
+        constraint_state.noslip_minv[i_d, tid, i_b] = gs.qd_float(0.0)
+    i_c = tid
+    while i_c < n_rows:
+        force = constraint_state.efc_force[i_c, i_b]
+        for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+            i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+            constraint_state.noslip_minv[i_d, tid, i_b] = (
+                constraint_state.noslip_minv[i_d, tid, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
+            )
+        i_c += T
 
 
 @qd.func
 def func_coop_reduce_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState):
-    """DIAGNOSTIC no-op (accum already wrote noslip_qfrc directly)."""
-    if tid < 0:
-        constraint_state.noslip_qfrc[0, i_b] = gs.qd_float(0.0)
+    """Sum the per-lane partial columns of noslip_minv into qfrc_constraint[:, i_b] (cooperative over dofs; each dof is
+    written by exactly one lane, so the layout-aware subscript write needs no atomics)."""
+    i_d = tid
+    while i_d < n_dofs:
+        s = gs.qd_float(0.0)
+        for lane in range(T):
+            s += constraint_state.noslip_minv[i_d, lane, i_b]
+        constraint_state.qfrc_constraint[i_d, i_b] = s
+        i_d += T
 
 
 @qd.func
 def func_coop_solve_qacc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo):
-    """qacc = M^-1 noslip_qfrc, cooperatively over mass blocks (each block owned by its first dof's lane)."""
+    """qacc = M^-1 qfrc_constraint, cooperatively over mass blocks (each block owned by its first dof's lane)."""
     i_d = tid
     while i_d < n_dofs:
         if i_d == rigid_info.dofs_mass_block_start[i_d]:
-            constraint_state.qacc[i_d, i_b] = constraint_state.noslip_qfrc[i_d, i_b]
+            constraint_state.qacc[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
             for j_d in range(i_d + 1, rigid_info.dofs_mass_block_end[i_d]):
-                constraint_state.qacc[j_d, i_b] = constraint_state.noslip_qfrc[j_d, i_b]
+                constraint_state.qacc[j_d, i_b] = constraint_state.qfrc_constraint[j_d, i_b]
             func_solve_mass_block(i_d, i_b, constraint_state.qacc, rigid_info)
         i_d += T
 
@@ -637,14 +645,11 @@ def func_coop_add_smooth(tid, T, i_b, n_dofs, constraint_state: array_class.Cons
 def func_coop_finish_copy(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState, dyn_state: array_class.DynState):
     i_d = tid
     while i_d < n_dofs:
-        qfrc = constraint_state.noslip_qfrc[i_d, i_b]
+        qfrc = constraint_state.qfrc_constraint[i_d, i_b]
         constraint_state.qacc[i_d, i_b] = constraint_state.qacc[i_d, i_b] + dyn_state.dofs.acc_smooth[i_d, i_b]
         dyn_state.dofs.acc[i_d, i_b] = constraint_state.qacc[i_d, i_b]
         dyn_state.dofs.qf_constraint[i_d, i_b] = qfrc
         dyn_state.dofs.force[i_d, i_b] = dyn_state.dofs.qf_smooth[i_d, i_b] + qfrc
-        # Mirror into the canonical qfrc_constraint (batch-first) for any post-noslip consumer (subscript write is
-        # layout-aware; disjoint dofs per lane, so no atomics needed here).
-        constraint_state.qfrc_constraint[i_d, i_b] = qfrc
         i_d += T
 
 
