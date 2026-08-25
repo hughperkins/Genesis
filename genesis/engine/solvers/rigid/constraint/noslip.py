@@ -726,7 +726,7 @@ def kernel_noslip_coop(
     (Jacobi). Non-bit-identical vs the scalar Gauss-Seidel kernel_noslip.
     """
     _B = constraint_state.jac.shape[2]
-    _T = qd.static(NOSLIP_COOP_T)
+    _T = qd.static(32)  # == NOSLIP_COOP_T; literal avoids a quadrants pure-violation warning on the module global
 
     qd.loop_config(name="noslip_coop", block_dim=_T)
     for i_flat in range(_B * _T):
