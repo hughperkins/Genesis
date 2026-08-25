@@ -10,11 +10,14 @@ import genesis.utils.array_class as array_class
 NOSLIP_COOP_T = 32
 
 # Cooperative noslip is a Jacobi sweep (all rows updated from the same per-iteration qacc), which -- unlike the scalar
-# Gauss-Seidel sweep -- can diverge for stiff contact systems. Under-relaxation (omega < 1) damps each force update to
-# keep the iteration stable; because every coop iteration is ~T-way parallel we can also afford more of them. Both are
-# tunable per run without a rebuild (genesis kernels JIT at runtime): GS_NOSLIP_COOP_OMEGA and GS_NOSLIP_COOP_ITERS
-# (0 = use the scene's noslip_iterations).
-NOSLIP_COOP_OMEGA = float(os.environ.get("GS_NOSLIP_COOP_OMEGA", "1.0"))
+# Gauss-Seidel sweep -- diverges for stiff contact systems without damping. Under-relaxation (omega < 1) is REQUIRED
+# for stability: measured on table_bus bs=50 (clean-cache A/B), omega=1.0 blows up, 0.25 partially diverges, and 0.1 is
+# stable and tracks the scalar sweep (settled-trajectory |.| sum 124k vs 121k). Default 0.1. Because every coop
+# iteration is ~T-way parallel we can also afford more of them. Both knobs are tunable per run without a rebuild
+# (genesis kernels JIT): GS_NOSLIP_COOP_OMEGA and GS_NOSLIP_COOP_ITERS (0 = use the scene's noslip_iterations).
+# NOTE: vary these only with a dedicated compile cache (QD_OFFLINE_CACHE_FILE_PATH) -- they bake into the kernel as
+# qd.static constants/branches, and reusing a shared cache across values serves stale kernels.
+NOSLIP_COOP_OMEGA = float(os.environ.get("GS_NOSLIP_COOP_OMEGA", "0.1"))
 NOSLIP_COOP_ITERS = int(os.environ.get("GS_NOSLIP_COOP_ITERS", "0"))
 
 
