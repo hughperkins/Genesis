@@ -759,10 +759,9 @@ def kernel_noslip_coop(
         const_end = const_start + qd.static(rigid_config.rows_per_contact) * collider_state.n_contacts[i_b]
         EPS = rigid_info.EPS[None]
 
+        n_coop_iters = rigid_info.noslip_iterations[None]
         if qd.static(NOSLIP_COOP_ITERS > 0):
             n_coop_iters = qd.static(NOSLIP_COOP_ITERS)
-        else:
-            n_coop_iters = rigid_info.noslip_iterations[None]
 
         if n_rows > 0:
             for i_iter in range(n_coop_iters):
