@@ -1,3 +1,5 @@
+import os
+
 import quadrants as qd
 
 import genesis as gs
@@ -6,6 +8,14 @@ import genesis.utils.array_class as array_class
 # Block (warp) width of the cooperative noslip kernel: one block of this many lanes cooperates on a single env's
 # matrix-free friction sweep. MUST match the lane dimension of ConstraintState.noslip_minv in array_class.py.
 NOSLIP_COOP_T = 32
+
+# Cooperative noslip is a Jacobi sweep (all rows updated from the same per-iteration qacc), which -- unlike the scalar
+# Gauss-Seidel sweep -- can diverge for stiff contact systems. Under-relaxation (omega < 1) damps each force update to
+# keep the iteration stable; because every coop iteration is ~T-way parallel we can also afford more of them. Both are
+# tunable per run without a rebuild (genesis kernels JIT at runtime): GS_NOSLIP_COOP_OMEGA and GS_NOSLIP_COOP_ITERS
+# (0 = use the scene's noslip_iterations).
+NOSLIP_COOP_OMEGA = float(os.environ.get("GS_NOSLIP_COOP_OMEGA", "1.0"))
+NOSLIP_COOP_ITERS = int(os.environ.get("GS_NOSLIP_COOP_ITERS", "0"))
 
 
 @qd.func
@@ -648,13 +658,16 @@ def func_noslip_update_frictionloss_lane(i_c, i_b, i_lane, constraint_state: arr
         func_dot_row(i_c, i_b, constraint_state.jac_dofs_idx, constraint_state.qacc, constraint_state.jac, constraint_state.jac_n_dofs)
         - constraint_state.aref[i_c, i_b]
     )
-    f = constraint_state.efc_force[i_c, i_b] - res / A_diag
+    old = constraint_state.efc_force[i_c, i_b]
+    f = old - res / A_diag
     fl = constraint_state.efc_frictionloss[i_c, i_b]
     if f < -fl:
         f = -fl
     elif f > fl:
         f = fl
-    constraint_state.efc_force[i_c, i_b] = f
+    # Under-relaxed Jacobi update. The projected target f stays in [-fl, fl] and old is in [-fl, fl], so the convex
+    # blend does too (omega in [0, 1]).
+    constraint_state.efc_force[i_c, i_b] = old + qd.static(NOSLIP_COOP_OMEGA) * (f - old)
 
 
 @qd.func
@@ -707,6 +720,11 @@ def func_noslip_update_collision_pair_lane(j_efc, i_b, i_lane, EPS, constraint_s
         else:
             constraint_state.efc_force[j_efc, i_b] = mid + y
             constraint_state.efc_force[j_efc + 1, i_b] = mid - y
+    # Under-relax the projected pair toward the pre-update forces (both endpoints lie in the pyramid, which is convex,
+    # so the blend stays feasible) before the cost-change safeguard evaluates the (now damped) step.
+    om = qd.static(NOSLIP_COOP_OMEGA)
+    constraint_state.efc_force[j_efc, i_b] = old_force[0] + om * (constraint_state.efc_force[j_efc, i_b] - old_force[0])
+    constraint_state.efc_force[j_efc + 1, i_b] = old_force[1] + om * (constraint_state.efc_force[j_efc + 1, i_b] - old_force[1])
     # Reject a step that raised the cost (mirrors the scalar sweep's safeguard).
     func_cost_change(i_b, j_efc, Ac, old_force, res, EPS, constraint_state.efc_force, 2)
 
@@ -741,8 +759,13 @@ def kernel_noslip_coop(
         const_end = const_start + qd.static(rigid_config.rows_per_contact) * collider_state.n_contacts[i_b]
         EPS = rigid_info.EPS[None]
 
+        if qd.static(NOSLIP_COOP_ITERS > 0):
+            n_coop_iters = qd.static(NOSLIP_COOP_ITERS)
+        else:
+            n_coop_iters = rigid_info.noslip_iterations[None]
+
         if n_rows > 0:
-            for i_iter in range(rigid_info.noslip_iterations[None]):
+            for i_iter in range(n_coop_iters):
                 # --- refresh qacc = acc_smooth + M^-1 J^T f ---
                 func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
                 qd.simt.block.sync()
