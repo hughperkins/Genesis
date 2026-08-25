@@ -615,8 +615,9 @@ class ConstraintState:
     prev_active: qd.Tensor
     qfrc_constraint: qd.Tensor
     qacc: qd.Tensor
-    # Per-lane M^-1 scratch for the cooperative noslip sweep, shape (n_dofs, NOSLIP_COOP_T, _B). Empty tensor unless
-    # enable_coop_noslip. Lets concurrent lanes each compute their row's M^-1 J^T without clobbering a shared buffer.
+    # Per-lane M^-1 scratch for the warp-per-env noslip sweeps, shape (n_dofs, NOSLIP_COOP_T, _B). Empty tensor unless
+    # enable_coop_noslip or enable_color_noslip (both the Jacobi and colored kernels use it). Lets concurrent lanes each
+    # compute their row's M^-1 J^T without clobbering a shared buffer.
     noslip_minv: qd.Tensor
     # Colored-noslip scratch (kernel_noslip_color). Empty unless enable_color_noslip.
     #  - row_color[i_c, i_b]: greedy graph-color of constraint row i_c, or -1 for rows the sweep skips (equality/limit).
@@ -872,7 +873,10 @@ def get_constraint_state(constraint_solver, solver, collider):
         # noslip path is enabled, so the scalar / non-GPU paths pay nothing.
         noslip_minv=V(
             dtype=gs.qd_float,
-            shape=maybe_shape((solver.n_dofs_, 32, _B), solver.rigid_config.enable_coop_noslip),
+            shape=maybe_shape(
+                (solver.n_dofs_, 32, _B),
+                solver.rigid_config.enable_coop_noslip or solver.rigid_config.enable_color_noslip,
+            ),
         ),
         # Colored-noslip scratch (kernel_noslip_color). Empty unless the colored path is enabled. row_color matches
         # efc_force's serial (per-env-contiguous) layout since they are indexed identically in the sweep. The 64 must
