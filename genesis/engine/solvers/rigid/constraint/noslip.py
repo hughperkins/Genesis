@@ -590,24 +590,35 @@ def func_dot_row_lane(
 
 
 @qd.func
-def func_coop_zero_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState):
-    i_d = tid
-    while i_d < n_dofs:
-        constraint_state.noslip_qfrc[i_d, i_b] = gs.qd_float(0.0)
-        i_d += T
-
-
-@qd.func
-def func_coop_accum_qfrc(tid, T, i_b, n_rows, constraint_state: array_class.ConstraintState):
-    """noslip_qfrc += J^T f, cooperatively over rows. The scatter target is the DEFAULT-layout noslip_qfrc (not the
-    batch-first qfrc_constraint), so the per-dof atomic_add scatters to the right element."""
+def func_coop_accum_partials(tid, T, i_b, n_dofs, n_rows, constraint_state: array_class.ConstraintState):
+    """Each lane accumulates its rows' J^T f into its OWN private column of noslip_minv (no cross-lane contention, no
+    atomics -- qd.atomic_add mis-behaves on this backend/dtype). noslip_minv is the per-lane M^-1 scratch, which is
+    free here (the sweep overwrites it only after this refresh). A subsequent reduce sums the columns into noslip_qfrc.
+    """
+    # Zero this lane's private column over all dofs (the row scatter below only touches a subset).
+    for i_d in range(n_dofs):
+        constraint_state.noslip_minv[i_d, tid, i_b] = gs.qd_float(0.0)
     i_c = tid
     while i_c < n_rows:
         force = constraint_state.efc_force[i_c, i_b]
         for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
             i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-            qd.atomic_add(constraint_state.noslip_qfrc[i_d, i_b], constraint_state.jac[i_c, i_d, i_b] * force)
+            constraint_state.noslip_minv[i_d, tid, i_b] = (
+                constraint_state.noslip_minv[i_d, tid, i_b] + constraint_state.jac[i_c, i_d, i_b] * force
+            )
         i_c += T
+
+
+@qd.func
+def func_coop_reduce_qfrc(tid, T, i_b, n_dofs, constraint_state: array_class.ConstraintState):
+    """Sum the per-lane partial columns of noslip_minv into noslip_qfrc[:, i_b] (cooperative over dofs)."""
+    i_d = tid
+    while i_d < n_dofs:
+        s = gs.qd_float(0.0)
+        for lane in range(T):
+            s += constraint_state.noslip_minv[i_d, lane, i_b]
+        constraint_state.noslip_qfrc[i_d, i_b] = s
+        i_d += T
 
 
 @qd.func
@@ -768,10 +779,10 @@ def kernel_noslip_coop(
 
         if n_rows > 0:
             for i_iter in range(n_coop_iters):
-                # --- refresh qacc = acc_smooth + M^-1 J^T f ---
-                func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
+                # --- refresh qacc = acc_smooth + M^-1 J^T f (per-lane partial accumulate, then cross-lane reduce) ---
+                func_coop_accum_partials(tid, _T, i_b, n_dofs, n_rows, constraint_state)
                 qd.simt.block.sync()
-                func_coop_accum_qfrc(tid, _T, i_b, n_rows, constraint_state)
+                func_coop_reduce_qfrc(tid, _T, i_b, n_dofs, constraint_state)
                 qd.simt.block.sync()
                 func_coop_solve_qacc(tid, _T, i_b, n_dofs, constraint_state, rigid_info)
                 qd.simt.block.sync()
@@ -789,9 +800,9 @@ def kernel_noslip_coop(
                 qd.simt.block.sync()
 
             # --- dual finish: refresh qacc / qfrc from the final forces, then map to dof state ---
-            func_coop_zero_qfrc(tid, _T, i_b, n_dofs, constraint_state)
+            func_coop_accum_partials(tid, _T, i_b, n_dofs, n_rows, constraint_state)
             qd.simt.block.sync()
-            func_coop_accum_qfrc(tid, _T, i_b, n_rows, constraint_state)
+            func_coop_reduce_qfrc(tid, _T, i_b, n_dofs, constraint_state)
             qd.simt.block.sync()
             func_coop_solve_qacc(tid, _T, i_b, n_dofs, constraint_state, rigid_info)
             qd.simt.block.sync()
