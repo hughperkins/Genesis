@@ -618,10 +618,6 @@ class ConstraintState:
     # Per-lane M^-1 scratch for the cooperative noslip sweep, shape (n_dofs, NOSLIP_COOP_T, _B). Empty tensor unless
     # enable_coop_noslip. Lets concurrent lanes each compute their row's M^-1 J^T without clobbering a shared buffer.
     noslip_minv: qd.Tensor
-    # Cooperative-noslip J^T f accumulator with the DEFAULT (dof-major) layout, so the cross-row scatter can use
-    # atomics. qfrc_constraint is batch-first (dof_vec_layout) under the cooperative path, where an atomic on the
-    # layout-remapped element mis-scatters; this buffer sidesteps that. Empty unless enable_coop_noslip.
-    noslip_qfrc: qd.Tensor
     qacc_ws: qd.Tensor
     qacc_prev: qd.Tensor
     cost_ws: qd.Tensor
@@ -868,11 +864,6 @@ def get_constraint_state(constraint_solver, solver, collider):
         noslip_minv=V(
             dtype=gs.qd_float,
             shape=maybe_shape((solver.n_dofs_, 32, _B), solver.rigid_config.enable_coop_noslip),
-        ),
-        # Default layout (no batch-first flip) so the cooperative J^T f scatter can atomic_add correctly.
-        noslip_qfrc=V(
-            dtype=gs.qd_float,
-            shape=maybe_shape((solver.n_dofs_, _B), solver.rigid_config.enable_coop_noslip),
         ),
         # Allocated last to preserve the allocation order of the tensors above (see the warning at the top).
         island=get_island_state(solver, collider),
