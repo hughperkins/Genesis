@@ -803,15 +803,38 @@ def make_nonconvex_spacecraft(n_envs, solver=None, gjk=None, **scene_kwargs):
 
 
 def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
-    # Table-bussing digital twin: a fixed 18-DOF bimanual robot posed over a work table, with a clutter of dining
-    # objects dropped and settling on the tabletop -- a contact-rich mesh-collision workload with a high-DOF
-    # articulated system held in place. Every asset is already on the pinned HF dataset (dual_arms_primitives is the
-    # all-primitive, mesh-free stand-in robot; work_table.glb and the mug/cup/apple/donut clutter are public), so
-    # this benchmark needs no additional asset upload.
+    # Table-bussing digital twin: a fixed 18-DOF bimanual robot posed over a work table, with realistic dining
+    # clutter (plates, bowls, a dish tray, cutlery, food and recycling bins) dropped and settling on the tabletop --
+    # a contact-rich mesh-collision workload with a high-DOF articulated system held in place. Ported from the
+    # internal 'table_bussing' digital-twin scene: the proprietary Marvin bimanual robot is stood in for by the
+    # all-primitive 'dual_arms_primitives' URDF, but every other object is the original asset. All are on the pinned
+    # public HF dataset, so this benchmark needs no additional asset upload.
     STEP_DT = 1.0 / 30.0
-    # work_table.glb sits with its top face ~0.54 above the mesh origin at the default scale (cf. test_mesh_repair,
-    # which places the table at z=-0.54 so its top lands at z~0), so at pos z=0 the tabletop is at z~0.54.
-    TABLE_TOP_Z = 0.54
+    # Objects drop from just above the (scaled) tabletop; the per-object stagger keeps them from overlapping at
+    # spawn (several share xy, e.g. the dish tray body and side), which would explode the loose solver on contact.
+    DROP_Z = 0.80
+
+    # (kind, path under 'table_bussing/', euler, spot). A 3-tuple spot is a fixed 3D pose (the bins); a 2-tuple gets
+    # 'DROP_Z + stagger' appended.
+    OBJECTS = (
+        ("urdf", "gray_recycle_bin/gray_recycle_bin.urdf", (90.0, 0.0, 0.0), (0.85, -0.45, 1.05)),
+        ("urdf", "green_trash_bin/green_trash_bin.urdf", (90.0, 0.0, 0.0), (0.85, 0.45, 1.05)),
+        ("mesh", "plate/teal_plate.glb", (90.0, 0.0, 0.0), (0.45, -0.35)),
+        ("mesh", "plate/sage_plate.glb", (90.0, 0.0, 0.0), (0.45, 0.35)),
+        ("urdf", "yellow_plastic_bowl/yellow_plastic_bowl.urdf", (90.0, 0.0, 0.0), (0.60, -0.20)),
+        ("urdf", "yellow_plastic_bowl/yellow_plastic_bowl.urdf", (90.0, 0.0, 0.0), (0.60, 0.0)),
+        ("urdf", "yellow_plastic_bowl/yellow_plastic_bowl.urdf", (90.0, 0.0, 0.0), (0.60, 0.20)),
+        ("mesh", "bread/bread.glb", (90.0, 0.0, 0.0), (0.35, -0.15)),
+        ("urdf", "coffee_jar/coffee_jar.urdf", (90.0, 0.0, 0.0), (0.80, 0.0)),
+        ("urdf", "coffee_bean/coffee_bean_simple.urdf", (0.0, 0.0, 0.0), (0.75, 0.15)),
+        ("urdf", "white_dish_tray_thick/dish_tray_body.urdf", (90.0, 0.0, -90.0), (0.45, 0.0)),
+        ("urdf", "white_dish_tray_thick/dish_tray_side_120.urdf", (90.0, 0.0, 0.0), (0.45, 0.0)),
+        ("urdf", "fork/fork.urdf", (90.0, 0.0, -90.0), (0.30, 0.10)),
+        ("urdf", "spoon/spoon.urdf", (90.0, 0.0, -90.0), (0.30, 0.25)),
+        ("urdf", "tomato/tomato.urdf", (90.0, 0.0, 0.0), (0.70, -0.35)),
+        ("urdf", "crumpled_paper/crumpled_paper.urdf", (0.0, 0.0, 0.0), (0.70, 0.35)),
+        ("mesh", "board_eraser/board_eraser.glb", (90.0, 0.0, 0.0), (0.30, -0.30)),
+    )
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=STEP_DT, substeps=10),
@@ -827,32 +850,26 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
 
     scene.add_entity(gs.morphs.Plane())
 
+    # work_table.glb bakes its part layout into glTF node transforms; the non-uniform scale (matching the original
+    # digital twin) is applied by the mesh morph, lifting the tabletop well above the plane so the clutter settles.
     table_path = get_hf_dataset(pattern="work_table.glb")
     scene.add_entity(
-        gs.morphs.Mesh(file=f"{table_path}/work_table.glb", pos=(0.5, 0.0, 0.0), fixed=True),
+        gs.morphs.Mesh(
+            file=f"{table_path}/work_table.glb", scale=(1.14, 1.0, 1.445), pos=(0.597, 0.0, 0.0), fixed=True
+        ),
         vis_mode="collision",
     )
 
     robot_path = get_hf_dataset(pattern="dual_arms_primitives.urdf")
     robot = scene.add_entity(
-        gs.morphs.URDF(file=f"{robot_path}/dual_arms_primitives.urdf", pos=(0.0, 0.0, TABLE_TOP_Z + 0.5), fixed=True),
+        gs.morphs.URDF(file=f"{robot_path}/dual_arms_primitives.urdf", pos=(0.0, 0.0, 1.08), fixed=True),
     )
 
-    # Dining clutter to bus off the table: auto-decomposed (CoACD) mug/cup/apple/donut in a 4x4 grid in front of the
-    # robot, staggered in height so none overlap at spawn, then dropped so they settle on the tabletop.
-    assets = (("mug_1", "output.xml"), ("cup_2", "model.xml"), ("apple_15", "model.xml"), ("donut_0", "output.xml"))
-    asset_files = {name: f"{get_hf_dataset(pattern=f'{name}/*')}/{name}/{xml}" for name, xml in assets}
-    for i in range(16):
-        gx, gy = i % 4, i // 4
-        name = assets[(gx + gy) % len(assets)][0]
-        scene.add_entity(
-            gs.morphs.MJCF(
-                file=asset_files[name],
-                pos=(0.30 + 0.11 * gx, -0.17 + 0.11 * gy, TABLE_TOP_Z + 0.06 + 0.02 * i),
-                euler=(90.0, 0.0, 0.0),
-            ),
-            vis_mode="collision",
-        )
+    twin_path = get_hf_dataset(pattern="table_bussing/**/*")
+    for k, (kind, rel, euler, spot) in enumerate(OBJECTS):
+        pos = spot if len(spot) == 3 else (*spot, DROP_Z + 0.04 * k)
+        morph = gs.morphs.URDF if kind == "urdf" else gs.morphs.Mesh
+        scene.add_entity(morph(file=f"{twin_path}/table_bussing/{rel}", pos=pos, euler=euler), vis_mode="collision")
 
     time_start = time.time()
     scene.build(n_envs=n_envs)
