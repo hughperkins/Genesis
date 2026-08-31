@@ -862,7 +862,7 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
 
     robot_path = get_hf_dataset(pattern="dual_arms_primitives.urdf")
     robot = scene.add_entity(
-        gs.morphs.URDF(file=f"{robot_path}/dual_arms_primitives.urdf", pos=(0.0, 0.0, 1.08), fixed=True),
+        gs.morphs.URDF(file=f"{robot_path}/dual_arms_primitives.urdf", pos=(0.0, 0.0, 1.13), fixed=True),
     )
 
     twin_path = get_hf_dataset(pattern="table_bussing/**/*")
@@ -875,9 +875,17 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
     scene.build(n_envs=n_envs)
     compile_time = time.time() - time_start
 
-    # Hold every actuated DOF at its initial pose so the arms stay posed over the table instead of collapsing.
+    # Fold both arms forward and down so the bimanual robot reaches over the tabletop; its rest pose sticks the
+    # arms straight out sideways (a floating bar), which does not read as a robot working over the table. Only the
+    # shoulder/elbow angles matter (dof layout: right arm 0..8, left arm 9..17; the last two dofs per arm are the
+    # gripper fingers, left open). The left arm mirrors the right with the elbow sign flipped for its chirality.
+    arm_pose = np.zeros(robot.n_dofs, dtype=np.float32)
+    arm_pose[[1, 2, 3]] = (-1.5708, 1.5708, 1.0)
+    arm_pose[[10, 11, 12]] = (-1.5708, 1.5708, -1.0)
+    arm_pose = torch.tensor(arm_pose, dtype=gs.tc_float, device=gs.device).repeat(n_envs, 1)
     robot.set_dofs_kp(np.full((robot.n_dofs,), 100.0, dtype=np.float32))
-    robot.control_dofs_position(torch.zeros((n_envs, robot.n_dofs), dtype=gs.tc_float, device=gs.device))
+    robot.set_dofs_position(arm_pose)
+    robot.control_dofs_position(arm_pose)
 
     def step():
         scene.step()
