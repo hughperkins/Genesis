@@ -201,6 +201,15 @@ def get_file_morph_options(**kwargs):
     return {**options, **kwargs}
 
 
+def get_bench_hibernation_options():
+    # Benchmark-only hook: GS_BENCH_HIBERNATE=1 opts a scene into hibernation so its cost (vs the default
+    # use_hibernation=False) can be measured. use_contact_island is left at its default (True); hibernation is
+    # still auto-gated off by the solver for single-island scenes (see RigidSolver._build_static_config).
+    if os.environ.get("GS_BENCH_HIBERNATE") == "1":
+        return dict(use_hibernation=True)
+    return dict()
+
+
 # ---------------------------------------------------------------------------
 # Scene factories
 #
@@ -332,6 +341,7 @@ def make_g1_fall(n_envs, solver=None, gjk=None, accessors=False, **scene_kwargs)
             iterations=10,
             tolerance=1e-5,
             ls_iterations=20,
+            **get_bench_hibernation_options(),
             **(dict(constraint_solver=solver) if solver is not None else {}),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
         ),
@@ -618,6 +628,7 @@ def make_dex_hand(n_envs, solver=None, gjk=None, **scene_kwargs):
         ),
         rigid_options=gs.options.RigidOptions(
             max_collision_pairs=200,
+            **get_bench_hibernation_options(),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
         ),
         **{"show_viewer": False, "show_FPS": False, **scene_kwargs},
