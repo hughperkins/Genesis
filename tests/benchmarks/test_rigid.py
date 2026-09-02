@@ -830,6 +830,7 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
             noslip_iterations=5,
             max_collision_pairs=256,
             max_contacts=1024,
+            **get_bench_hibernation_options(),
             **(dict(constraint_solver=solver) if solver is not None else {}),
             **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
         ),
