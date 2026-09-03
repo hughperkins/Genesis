@@ -920,7 +920,9 @@ def run_benchmark(step_fn, *, n_envs, meta):
             qd.sync()
             time_start = time.time()
             is_recording = True
-    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
+    # Keep this as a float: truncating to int quantizes fps to whole-number steps (~0.6% at ~175 fps), which is
+    # larger than the run-to-run spread and makes any variance / CI measured across repeats meaningless.
+    runtime_fps = num_steps * max(n_envs, 1) / time_elapsed
     realtime_factor = runtime_fps * meta.step_dt
 
     return dict(compile_time=meta.compile_time, runtime_fps=runtime_fps, realtime_factor=realtime_factor)
