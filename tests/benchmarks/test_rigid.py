@@ -802,7 +802,7 @@ def make_nonconvex_spacecraft(n_envs, solver=None, gjk=None, **scene_kwargs):
     )
 
 
-def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
+def _build_table_bussing_scene(n_envs, solver=None, gjk=None, **scene_kwargs):
     # Table-bussing digital twin: a fixed 18-DOF bimanual robot posed over a work table, with realistic dining
     # clutter (plates, bowls, a dish tray, cutlery, food and recycling bins) dropped and settling on the tabletop --
     # a contact-rich mesh-collision workload with a high-DOF articulated system held in place. Ported from the
@@ -887,6 +887,14 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
     robot.set_dofs_position(arm_pose)
     robot.control_dofs_position(arm_pose)
 
+    return scene, robot, STEP_DT, compile_time, arm_pose
+
+
+def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
+    scene, _robot, step_dt, compile_time, _arm_pose = _build_table_bussing_scene(
+        n_envs, solver=solver, gjk=gjk, **scene_kwargs
+    )
+
     def step():
         scene.step()
 
@@ -895,7 +903,51 @@ def make_table_bussing(n_envs, solver=None, gjk=None, **scene_kwargs):
         step,
         SceneMeta(
             compile_time=compile_time,
-            step_dt=STEP_DT,
+            step_dt=step_dt,
+            duration_warmup=20.0,
+            duration_record=5.0,
+        ),
+    )
+
+
+def make_table_bussing_forever(n_envs, solver=None, gjk=None, **scene_kwargs):
+    # Like table_bussing, but every env is periodically reset to its spawn state so the clutter never comes fully to
+    # rest scene-wide: it perpetually re-drops and re-settles. Reset times are drawn independently PER ENV (not a
+    # shared/global reset), so at steady state the batch is a decorrelated mix of just-dropped (active) and settled
+    # envs rather than all going quiet together.
+    scene, robot, step_dt, compile_time, arm_pose = _build_table_bussing_scene(
+        n_envs, solver=solver, gjk=gjk, **scene_kwargs
+    )
+
+    # get_state()/set_state() carry the full rigid state and, under hibernation, set_state also wakes the reset envs'
+    # bodies -- a bare pose write would leave a hibernated body frozen.
+    init_state = scene.get_state()
+
+    reset_steps_max = max(1, round(2.0 / step_dt))  # 2 s of sim time == 60 steps at dt = 1/30
+    rng = np.random.default_rng(0)
+    # Per-env countdown to the next reset, staggered from step 0 so the envs start decorrelated rather than all
+    # firing together. Kept host-side (one int per env) so the schedule costs no device sync; only the small list of
+    # due-env indices crosses to the GPU each step it fires.
+    countdown = rng.integers(1, reset_steps_max + 1, size=n_envs)
+
+    def step():
+        countdown[:] -= 1  # in-place (slice store), so 'countdown' stays a free var, not a step()-local
+        due = np.nonzero(countdown <= 0)[0]
+        if due.size:
+            envs_idx = torch.as_tensor(due, dtype=gs.tc_int, device=gs.device)
+            scene.reset(init_state, envs_idx=envs_idx)
+            # set_state zeros ctrl_force and flips ctrl_mode to FORCE on the reset envs, so re-arm the PD position
+            # hold (at the folded arm pose) there or the freshly reset arms would go limp and collapse.
+            robot.control_dofs_position(arm_pose[: due.size], envs_idx=envs_idx)
+            countdown[due] = rng.integers(1, reset_steps_max + 1, size=due.size)
+        scene.step()
+
+    return (
+        scene,
+        step,
+        SceneMeta(
+            compile_time=compile_time,
+            step_dt=step_dt,
             duration_warmup=20.0,
             duration_record=5.0,
         ),
@@ -1080,6 +1132,12 @@ def table_bussing(solver, n_envs, gjk):
     return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
 
 
+@pytest.fixture
+def table_bussing_forever(solver, n_envs, gjk):
+    _, step_fn, meta = make_table_bussing_forever(n_envs, solver=solver, gjk=gjk)
+    return run_benchmark(step_fn, n_envs=n_envs, meta=meta)
+
+
 # ---------------------------------------------------------------------------
 # Parametrized benchmark test
 # ---------------------------------------------------------------------------
@@ -1098,6 +1156,8 @@ BENCHMARKS_FIELD = [
     ("nonconvex_spacecraft", None, None, 64, gs.cpu),
     ("table_bussing", None, None, 50, gs.cpu),
     ("table_bussing", None, None, 50, gs.gpu),
+    ("table_bussing_forever", None, None, 50, gs.cpu),
+    ("table_bussing_forever", None, None, 50, gs.gpu),
 ]
 
 # Reduced subset, run on the 'ndarray' dtype only.
